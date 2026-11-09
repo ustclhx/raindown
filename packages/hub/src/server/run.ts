@@ -40,6 +40,7 @@ import {
   type InboxService,
   startInbox,
 } from '../inbox/index.ts'
+import { createKbRoutes } from '../kb/index.ts'
 import { createTaskRoutes } from '../ledger/routes.ts'
 import { type LedgerStore, openLedger } from '../ledger/store.ts'
 import {
@@ -353,6 +354,8 @@ export async function runHub(input: RunHubOptions): Promise<Result<RunningHub>> 
           }),
         },
         { path: '/', app: createSupervisorToolRoutes(tools) },
+        // 任务绑定的知识读取（add-worker-credential-isolation D3）：只接受派工令牌。
+        { path: '/', app: createKbRoutes({ home: options.home }) },
         { path: '/', app: createUiLoginCodeRoutes(uiSessions) },
         {
           path: '/',

@@ -64,6 +64,8 @@ const nodeMatchers = NODE_ENDPOINTS.map((n) => ({ name: n, match: matcher(n) }))
 const taskShow = matcher('tasks-show')
 const eventGet = matcher('events-get')
 const policyCheck = matcher('policy-check')
+/** 任务绑定的知识读取（add-worker-credential-isolation D3）：范围由路由按凭证的 workspace 计算。 */
+const kbReads = (['kb-search', 'kb-get', 'kb-query'] as const).map(matcher)
 
 /** 任务级 scope：user 可调试任意任务；节点只能操作自己持有未过期活动租约的任务。 */
 export function checkTaskScope(
@@ -217,7 +219,12 @@ export function hubAuth(options: HubAuthOptions = {}): MiddlewareHandler {
       const report =
         c.req.method === 'POST' ? /^\/v1\/tasks\/([^/]+)\/report$/.exec(c.req.path) : null
       // 事件范围由路由读取事件后按凭证的任务与 workspace 校验。
-      if (eventGet(c) || (c.req.method === 'GET' && c.req.path === '/v1/binding')) {
+      // 知识读取的可见范围由路由按凭证绑定的 workspace 过滤。
+      if (
+        eventGet(c) ||
+        kbReads.some((m) => m(c)) ||
+        (c.req.method === 'GET' && c.req.path === '/v1/binding')
+      ) {
         await next()
         return
       }

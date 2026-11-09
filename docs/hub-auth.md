@@ -87,6 +87,9 @@ user token 降级时不能声明上述任何一个（不区分大小写，包括
 | `POST /v1/hub/rebuild` | ✓ | 403 `user_only` | 403 `scope_denied` | 403 |
 | `/v1/hub/tokens`（签发、列出、撤销） | ✓ | 403 `user_only` | 403 `scope_denied` | 403 |
 | `POST /v1/ui/login-code`（`raindown ui` 申请 Web 登录码） | ✓ | 403 `user_only` | 403 `scope_denied` | 403 |
+| `POST /v1/kb/search`、`/v1/kb/get`、`/v1/kb/query`（任务绑定的 `kb_search`、`kb_get`、`kb_query`） | 403 `scope_denied` | 403 `scope_denied`（唤醒绑定 token 同样 403 `scope_denied`） | 403 `scope_denied` | 403 |
+
+只接受任务绑定令牌（`fls_`）的接口：`POST /v1/kb/search|get|query`，可见范围按令牌绑定任务的 workspace 计算，见下文"worker 派工绑定凭证"。
 
 remote token 一列的 403 都是 `remote_not_allowed`。
 
@@ -155,11 +158,34 @@ workspace、lease 与 attempt；`--actor`、`--task` 和环境变量都不能声
 补发响应丢失时，下次续约仍带旧指纹，因而会再次补发；旧凭证仍不可用。明文凭证不写入续约请求。
 续约不带指纹（旧节点，或凭证文件尚未写好）而中枢已有该租约的当前凭证时**不轮换**：轮换会让 worker 进行中的 MCP 调用拿到 401。
 
-任务凭证只允许读取本任务详情、向本任务的 `POST /v1/tasks/:id/report` 上报，以及
-`GET /v1/binding` 查询可信绑定（`{kind: "task", task: {actor, task_id, workspace, lease_id, attempt}}`）。
+任务凭证只允许读取本任务详情、向本任务的 `POST /v1/tasks/:id/report` 上报、
+`GET /v1/binding` 查询可信绑定（`{kind: "task", task: {actor, task_id, workspace, lease_id, attempt}}`），
+以及经 `POST /v1/kb/search`、`/v1/kb/get`、`/v1/kb/query` 读取知识。
 绑定查询沿用标准的 `{ok: true, data: ...}` 响应封装；wake 凭证得到 `kind: "wake"` 与其绑定。
 任务凭证访问其他任务或调用建任务、回复任务、收件箱操作、密钥与节点协议等接口，一律返回 403 `forbidden`。
-只读知识操作由任务绑定 MCP 在本地执行，不经中枢 HTTP。
+
+### 知识读取经中枢（add-worker-credential-isolation D3）
+
+任务绑定 MCP 的 `kb_search`、`kb_get`、`kb_query` 经中枢执行，worker 侧进程不读取 raindown-home 的 `brain/` 与 `state/`
+（隔离落地后它们对 worker 不可读）。路由与 CLI 的 `raindown kb search|get|query` 使用同一个 core 实现，输出结构相同：
+
+| 接口 | 请求体 | 响应 data |
+|---|---|---|
+| `POST /v1/kb/search` | `{query, limit?, type?, includeJournal?}`：`query` 最长 500 字，`limit` 1–100（默认 20） | 同 `kb_search` |
+| `POST /v1/kb/get` | `{id}`：相对 `brain/` 的条目标识，最长 512 字，不能以 `/` 开头，不能含 `.`/`..` 开头的段、反斜杠或控制字符 | 同 `kb_get` |
+| `POST /v1/kb/query` | `{filters}`：1–20 条 `key=value`，每条最长 500 字 | 同 `kb_query` |
+
+- **只接受任务绑定令牌**：user 令牌（含降级为 AI 身份）、绑定令牌（含 `node:*`）、唤醒绑定令牌一律 403 `scope_denied`。
+  无绑定与唤醒绑定的 MCP 会话仍在本地读取。令牌每次请求按账本重核，任务结束、租约失效或中枢重启后 401 `unauthorized`。
+- **可见范围**由中枢按令牌绑定任务的 workspace 计算，请求中不能声明：本 workspace 加 `ws/global`。条目归属取 frontmatter 的
+  `owner` 与 `workspace`（都没有即 global）；任一归属不在范围内、或归属不是字符串时不返回。`kb/get` 对不可见的条目返回与
+  不存在相同的 404 `not_found`，不泄露存在性。journal 按记录标题行 `## HH:MM:SS · 操作者 · ws/<id>` 过滤，只保留未标
+  workspace 与本 workspace 的记录；去掉记录后不再命中的 journal 不返回，片段按剩下的正文重算。
+  这比本地读取更严：可见条目的结果、字段与顺序与 CLI 相同，只是少了别的 workspace 的条目。
+- 参数不合法 400 `invalid_arguments`，请求体最大 32 KiB。
+- MCP 只用派工令牌文件（`RAINDOWN_LEASE_TOKEN_FILE`）访问中枢；没有该文件时返回 `lease_token_required`，不改用其他中枢凭证。
+  中枢没有该路由（旧中枢对派工令牌访问未知接口返回 403 `forbidden`）时返回 `hub_kb_unsupported`，**不回退到本地读取**
+  （回退会让 worker 重新需要读取 raindown-home，隔离失效）。因此升级顺序是**先升级中枢，再升级节点与 CLI**。
 
 节点把 `dispatch_token` 写入 `run/tasks/<task>/dispatch-tokens/<lease>.token`（目录 0700、文件 0600；位于 `state/` 之外，见 `docs/executors.md` 的「`run/` 目录」），
 仅通过 `ExecutorContext.leaseTokenFile` 向适配器交付路径，供后续受管 MCP 配置使用；明文不放进 argv、env 或活动日志。

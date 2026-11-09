@@ -1,0 +1,17 @@
+{
+  "$id": "https://raindown.local/schemas/protocol/kb-get.request.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "条目标识：相对 brain/ 的路径，不含 .md"
+    }
+  },
+  "required": [
+    "id"
+  ],
+  "title": "POST /v1/kb/get 请求体"
+}

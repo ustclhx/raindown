@@ -11,6 +11,14 @@ import {
 import { policyDecisionSchema } from '../policy/decide.ts'
 import { policyVersionSchema } from '../policy/version.ts'
 import { workspaceRef } from '../schema/common.ts'
+import {
+  kbGetOutput,
+  kbGetRequest,
+  kbQueryOutput,
+  kbQueryRequest,
+  kbSearchOutput,
+  kbSearchRequest,
+} from '../schema/search.ts'
 import { taskAttempt } from './attempts.ts'
 import { actor, capability, leaseId, nodeId, taskId, timestamp } from './common.ts'
 import {
@@ -1475,6 +1483,29 @@ export const ENDPOINTS = {
     path: '/v1/events/:id',
     auth: true,
     response: eventGetData,
+  },
+  // 任务绑定的知识读取（add-worker-credential-isolation D3）：只接受任务绑定令牌，按任务所属 workspace 过滤。
+  // 只读，但用 POST 携带 JSON 请求体（kb_query 的条件是数组）。
+  'kb-search': {
+    method: 'POST',
+    path: '/v1/kb/search',
+    auth: true,
+    request: kbSearchRequest,
+    response: kbSearchOutput,
+  },
+  'kb-get': {
+    method: 'POST',
+    path: '/v1/kb/get',
+    auth: true,
+    request: kbGetRequest,
+    response: kbGetOutput,
+  },
+  'kb-query': {
+    method: 'POST',
+    path: '/v1/kb/query',
+    auth: true,
+    request: kbQueryRequest,
+    response: kbQueryOutput,
   },
   'tasks-cancel': {
     method: 'POST',

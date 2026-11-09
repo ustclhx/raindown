@@ -7,8 +7,17 @@ import { raindownPaths } from '../home.ts'
 import { fail, ok, type Result } from '../result.ts'
 import type { GetOutput, QueryOutput, SearchInput, SearchOutput } from '../schema/search.ts'
 import { type Database, openDatabase, type SqlValue } from '../sqlite.ts'
+import {
+  decodeScopes,
+  encodeScopes,
+  entryScopes,
+  filterJournalBody,
+  type KbVisibility,
+  scopesVisible,
+} from './visibility.ts'
 
-const INDEX_VERSION = 1
+// 2：entries 增加 scope 列（条目归属的 workspace，用于任务绑定读取的可见范围）。
+const INDEX_VERSION = 2
 const JOURNAL_FILE = /^\d{4}-\d{2}-\d{2}\.md$/
 
 function scalar(value: unknown): string | undefined {
@@ -62,7 +71,7 @@ function ensureSchema(db: Database): void {
     DROP TABLE IF EXISTS entries;
     CREATE TABLE entries (
       id TEXT PRIMARY KEY, file TEXT NOT NULL, hash TEXT NOT NULL, mtime REAL NOT NULL,
-      type TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL
+      type TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL, scope TEXT NOT NULL
     );
     CREATE TABLE fields (entry_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL);
     CREATE INDEX fields_lookup ON fields (key, value, entry_id);
@@ -132,9 +141,13 @@ export async function syncIndex(home: string): Promise<Result<undefined>> {
         const title = textField(entry.frontmatter, 'title', entry.id)
         const summary = textField(entry.frontmatter, 'summary')
         const fields = fieldsOf(entry.frontmatter)
+        // journal 的归属按记录在读取时过滤，文件本身记为 global。
+        const scope = entry.id.startsWith('journal/')
+          ? ''
+          : encodeScopes(entryScopes(entry.frontmatter))
         index
-          .prepare('INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?, ?)')
-          .run(entry.id, entry.file, hash, mtime, type, title, summary)
+          .prepare('INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(entry.id, entry.file, hash, mtime, type, title, summary, scope)
         index
           .prepare(
             'INSERT INTO search (id, title, summary, body, field_values) VALUES (?, ?, ?, ?, ?)',
@@ -168,8 +181,22 @@ function excerpt(text: string, query: string): string {
     .trim()}${text.length > start + 160 ? '…' : ''}`
 }
 
-/** 每次检索前同步；FTS 输入统一引用为短语，短查询使用 LIKE。score 越大越相关。 */
-export async function searchIndex(home: string, input: SearchInput): Promise<Result<SearchOutput>> {
+/** 文本是否包含查询词（不区分大小写）；与 trigram 短语匹配、LIKE 子串匹配的语义一致。 */
+const containsQuery = (text: string, query: string) =>
+  text.toLowerCase().includes(query.toLowerCase())
+
+/**
+ * 每次检索前同步；FTS 输入统一引用为短语，短查询使用 LIKE。score 越大越相关。
+ *
+ * 给出 `visibility`（任务绑定经中枢读取，D3）时：不可见的条目在 SQL 中排除；journal 去掉不可见的记录后
+ * 若不再包含查询词则不返回，片段按过滤后的正文重算。为了在过滤后仍能取满 `limit`，先取全部命中再截断，
+ * 排序与不带可见范围时相同。
+ */
+export async function searchIndex(
+  home: string,
+  input: SearchInput,
+  visibility?: KbVisibility,
+): Promise<Result<SearchOutput>> {
   const synced = await syncIndex(home)
   if (!synced.ok) return synced
   const db = await openDatabase(join(raindownPaths(home).state, 'index.db'))
@@ -192,28 +219,42 @@ export async function searchIndex(home: string, input: SearchInput): Promise<Res
       params.push(input.type)
     }
     if (input.includeJournal === false) conditions.push("e.type != 'journal'")
-    params.push(input.limit ?? 20)
-    const rows = db
+    const limit = input.limit ?? 20
+    if (!visibility) params.push(limit)
+    let rows = db
       .prepare(`
-      SELECT e.id, e.type, e.title, e.summary, s.body, s.field_values,
+      SELECT e.id, e.type, e.title, e.summary, e.scope, s.body, s.field_values,
         ${short ? '1.0' : '-bm25(search, 0, 5, 2, 1, 1)'} AS score,
         ${short ? "''" : "snippet(search, -1, '', '', '…', 40)"} AS snippet
       FROM search s JOIN entries e ON e.id = s.id
       WHERE ${conditions.join(' AND ')}
-      ORDER BY (e.type = 'journal'), score DESC, e.id LIMIT ?
+      ORDER BY (e.type = 'journal'), score DESC, e.id${visibility ? '' : ' LIMIT ?'}
     `)
       .all(...params) as (SearchOutput['results'][number] & {
+      scope: string
       body: string
       field_values: string
     })[]
+    if (visibility) {
+      rows = rows
+        .filter((row) => scopesVisible(decodeScopes(row.scope), visibility))
+        .flatMap((row) => {
+          if (!row.id.startsWith('journal/')) return [row]
+          const body = filterJournalBody(row.body, visibility)
+          if (body === row.body) return [row]
+          // 去掉了别的 workspace 的记录：只按剩下的正文判断是否命中，片段也只从剩下的正文中取。
+          if (![row.title, row.summary, body].some((v) => containsQuery(v, query))) return []
+          return [{ ...row, body, snippet: short ? '' : excerpt(body, query) }]
+        })
+        .slice(0, limit)
+    }
     return ok({
-      results: rows.map(({ body, field_values, ...row }) => ({
+      results: rows.map(({ body, field_values, scope: _scope, ...row }) => ({
         ...row,
         snippet: short
           ? excerpt(
-              [row.title, row.summary, body, field_values].find((v) =>
-                v.toLowerCase().includes(query.toLowerCase()),
-              ) ?? body,
+              [row.title, row.summary, body, field_values].find((v) => containsQuery(v, query)) ??
+                body,
               query,
             )
           : row.snippet.replace(/\s+/g, ' ').trim(),
@@ -226,8 +267,12 @@ export async function searchIndex(home: string, input: SearchInput): Promise<Res
   }
 }
 
-/** 多条件 AND；同一字段可以重复指定以匹配数组中的多个值。 */
-export async function queryIndex(home: string, filters: string[]): Promise<Result<QueryOutput>> {
+/** 多条件 AND；同一字段可以重复指定以匹配数组中的多个值。给出 `visibility` 时只返回可见的条目。 */
+export async function queryIndex(
+  home: string,
+  filters: string[],
+  visibility?: KbVisibility,
+): Promise<Result<QueryOutput>> {
   const parsed = filters.map((filter) => /^([^=\s]+)=(.+)$/s.exec(filter))
   if (filters.length === 0 || parsed.some((p) => !p?.[2]?.trim())) {
     return fail('usage', 'invalid_filter', '过滤条件必须为 key=value，且键和值不能为空')
@@ -240,12 +285,15 @@ export async function queryIndex(home: string, filters: string[]): Promise<Resul
       () => 'EXISTS (SELECT 1 FROM fields f WHERE f.entry_id = e.id AND f.key = ? AND f.value = ?)',
     )
     const params = parsed.flatMap((p) => [p?.[1] as string, p?.[2] as string])
+    const rows = db
+      .prepare(
+        `SELECT id, type, title, summary, scope FROM entries e WHERE ${conditions.join(' AND ')} ORDER BY id`,
+      )
+      .all(...params) as (QueryOutput['results'][number] & { scope: string })[]
     return ok({
-      results: db
-        .prepare(
-          `SELECT id, type, title, summary FROM entries e WHERE ${conditions.join(' AND ')} ORDER BY id`,
-        )
-        .all(...params) as QueryOutput['results'],
+      results: rows
+        .filter((row) => !visibility || scopesVisible(decodeScopes(row.scope), visibility))
+        .map(({ scope: _scope, ...row }) => row),
     })
   } catch (err) {
     return fail('failure', 'query_failed', `字段查询失败：${(err as Error).message}`)
@@ -254,8 +302,16 @@ export async function queryIndex(home: string, filters: string[]): Promise<Resul
   }
 }
 
-/** 从文件读取完整条目，不依赖索引缓存；journal 返回合成的基本元数据。 */
-export async function getEntry(home: string, id: string): Promise<Result<GetOutput>> {
+/**
+ * 从文件读取完整条目，不依赖索引缓存；journal 返回合成的基本元数据。
+ * 给出 `visibility` 时：不可见的条目与不存在的条目返回同样的 not_found（不泄露存在性），
+ * journal 只保留可见的记录。
+ */
+export async function getEntry(
+  home: string,
+  id: string,
+  visibility?: KbVisibility,
+): Promise<Result<GetOutput>> {
   const read = await readBrainEntries(home)
   if (!read.ok) return read
   let entry = read.data.entries.find((e) => e.id === id)
@@ -269,12 +325,23 @@ export async function getEntry(home: string, id: string): Promise<Result<GetOutp
       )
     }
   }
-  if (!entry) return fail('failure', 'not_found', `未找到条目：${id}`)
+  if (
+    !entry ||
+    (visibility &&
+      !entry.id.startsWith('journal/') &&
+      !scopesVisible(entryScopes(entry.frontmatter), visibility))
+  ) {
+    return fail('failure', 'not_found', `未找到条目：${id}`)
+  }
+  const body =
+    visibility && entry.id.startsWith('journal/')
+      ? filterJournalBody(entry.body, visibility)
+      : entry.body
   return ok({
     id: entry.id,
     type: textField(entry.frontmatter, 'type'),
     frontmatter: entry.frontmatter,
-    body: entry.body,
+    body,
     file: entry.file,
   })
 }

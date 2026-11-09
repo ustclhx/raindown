@@ -1,0 +1,35 @@
+{
+  "$id": "https://raindown.local/schemas/protocol/kb-search.request.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500,
+      "description": "检索短语"
+    },
+    "limit": {
+      "default": 20,
+      "description": "最多返回的条目数",
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "maximum": 100
+    },
+    "type": {
+      "description": "仅检索指定类型",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "includeJournal": {
+      "default": true,
+      "description": "是否包含工作日志",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "query"
+  ],
+  "title": "POST /v1/kb/search 请求体"
+}
