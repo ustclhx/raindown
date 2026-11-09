@@ -1044,7 +1044,8 @@ isolation:
   codex-orca 的终端命令也不必为每个参数再做 shell 引号；转义只涉及两个字符，由注入测试（引号、括号、反斜杠、`)(allow default`）
   与 macOS 上的实测（路径含 `we"ird) (allow default\x` 时 `sandbox-exec -f … /bin/cat` 仍然拒绝受保护文件）覆盖。
 - Orca 端口（审查第一轮 M2）：节点以只读方式解析（`packages/node/src/orca-ports.ts`），不连接 Orca、不运行 orca 命令：
-  从 Orca 运行时目录的 app 控制套接字名 `o-<app pid>-<runtimeId>.sock` 取 pid（只看目录项名字与类型），再用
+  从 Orca 运行时目录的 app 控制套接字名 `o-<app pid>-<runtimeId>.sock` 取 pid（只看目录项名字与类型），用 `ps -o comm= -p <pid>`
+  确认它确实是 Orca app 进程（pid 可能已被回收给其他进程，不是时不使用，审查第二轮 N3），再用
   `lsof -nP -a -p <pid> -iTCP -sTCP:LISTEN -Fn` 读取该进程的监听端口。没有 Orca 运行时目录时视为本机没有 Orca（不拒绝端口，探针该项跳过）；
   目录存在但找不到 app 套接字、lsof 失败或没有监听端口（例如 Orca 未运行）时为“未解析”：不生成端口规则，worker 照常启动，
   但探针把 `connect.orca_port` 记为**失败**（不是跳过），该执行器不能显示为已施加，doctor 的修复提示写明“Orca 本机端口未解析”。
@@ -1084,6 +1085,9 @@ isolation:
 
 - 外层 seatbelt 下同一执行器的 harness 凭证（CODEX_HOME 中链接到 `~/.codex/auth.json` 的登录凭证、`~/.claude`）与其他任务的会话记录仍可读（design D2、Risks）。
 - 同一用户的进程环境变量可读、可以互相发信号，seatbelt 拦不住（见「隔离实测」第 6 点）。
+- **持久化写入（未解决，4.6）**：`allow default` 下 worker 仍能写入之后在沙箱外执行的文件（shell 启动文件、登记仓库共享的 `.git/hooks` 与
+  `.git/config`、`~/.gitconfig`、用户可写的 PATH 目录、`~/.ssh/config` 等），由沙箱外的进程执行后即脱离隔离。真实开启（4.5）之前必须先完成 4.6，
+  见 design 的 Risks。
 - worker 内的 `raindown mcp` 进程同样在沙箱内：`raindown` 可执行文件、bun 与 Raindown 仓库必须位于 raindown-home 之外，否则任务绑定的 MCP 无法启动（4.5 验收时确认）。
 
 ### 回滚

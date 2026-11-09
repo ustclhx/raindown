@@ -103,6 +103,16 @@ seatbelt 的规则后者优先，允许项写得最窄（具体文件，而不�
 - [同用户仍能通过 ptrace 或调试接口观察节点进程] → seatbelt 在 `allow default` 下不会默认拒绝，配置中显式拒绝 `mach-priv-task-port` 与 `mach-task-name`，探针覆盖。独立用户方案天然隔离。
 - [同用户进程的环境变量可读、可以互相发信号，seatbelt 拦不住] → 节点凭证不经环境变量传递（D4）；信号只能让任务失败，不能提权。在文档中写明边界。
 - [外层 seatbelt 下同一执行器的 harness 凭证与其他任务的会话记录可读] → 写入文档；按任务分 CODEX_HOME 留待后续。
+- [`allow default` 下 worker 能写入之后在沙箱外执行的文件，借此脱离隔离（PR #98 第二轮审查 N1）] 例如：
+  - shell 启动文件 `~/.zshenv`、`~/.zshrc`、`~/.zprofile`、`~/.bash*`（codex-orca 的外层 shell 与用户自己的终端都会执行）；
+  - 登记仓库共享的 `.git/hooks/*` 与 `.git/config`（Orca、用户在沙箱外运行 git 时执行 hook 或读取 `core.fsmonitor`、`core.hooksPath` 等）；
+  - `~/.gitconfig`、`~/.config/git/`；
+  - 用户可写的 PATH 目录（`~/.bun/bin`、`~/.local/bin`、`/opt/homebrew/bin` 中可写的部分）；
+  - `~/.ssh/config`；
+  - `~/Library/LaunchAgents`（已拒绝）。
+
+  → 真实开启（4.5）之前由 4.6 解决，二选一：写入白名单（默认 `deny file-write*`，只放行工作目录、harness 目录、临时目录、缓存目录与主仓库 `.git`
+  中 worktree 必需的部分），或至少对上述持久化位置写拒绝；探针增加“写 shell 启动文件”一项（只在临时 home 上测试）。
 
 ## Migration Plan
 

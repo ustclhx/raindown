@@ -31,9 +31,19 @@ describe('Orca 端口解析', () => {
     expect(await resolveOrcaPorts(join(root, 'user'))).toEqual([])
   })
 
-  test('从 app 控制套接字名取 pid，再用 lsof 读取监听端口', async () => {
+  const orcaPs = async () => ({
+    code: 0,
+    stdout: '/Applications/Orca.app/Contents/MacOS/Orca\n',
+  })
+
+  test('从 app 控制套接字名取 pid，确认是 Orca 进程后用 lsof 读取监听端口', async () => {
     const calls: string[][] = []
+    const psCalls: string[][] = []
     const ports = await resolveOrcaPorts('/u', {
+      ps: async (args) => {
+        psCalls.push([...args])
+        return orcaPs()
+      },
       readDir: async () => [
         socket('o-4242-ab12.sock'),
         socket('o-4242-ab12.sock.lock', false),
@@ -47,7 +57,29 @@ describe('Orca 端口解析', () => {
     })
     expect(ports).toEqual([10129, 60211])
     expect(calls).toEqual([['-nP', '-a', '-p', '4242', '-iTCP', '-sTCP:LISTEN', '-Fn']])
+    expect(psCalls).toEqual([['-o', 'comm=', '-p', '4242']])
   })
+
+  test.each([
+    ['pid 已被回收给其他进程', { code: 0, stdout: '/usr/bin/vim\n' }],
+    ['进程不存在', { code: 1, stdout: '' }],
+  ])(
+    '套接字名中的 pid 不是 Orca app（%s）：不使用该 pid，按未解析处理（审查第二轮 N3）',
+    async (_n, psResult) => {
+      const lsofCalls: string[][] = []
+      await expect(
+        resolveOrcaPorts('/u', {
+          readDir: async () => [socket('o-4242-ab12.sock')],
+          ps: async () => psResult,
+          lsof: async (args) => {
+            lsofCalls.push([...args])
+            return { code: 0, stdout: 'n*:10129\n' }
+          },
+        }),
+      ).rejects.toThrow('没有找到')
+      expect(lsofCalls).toEqual([])
+    },
+  )
 
   test.each([
     ['没有 app 套接字', [socket('other.sock')], { code: 0, stdout: '' }, '没有 app 控制套接字'],
@@ -55,7 +87,11 @@ describe('Orca 端口解析', () => {
     ['lsof 失败', [socket('o-1-x.sock')], { code: 2, stdout: '' }, 'lsof 失败'],
   ])('%s：抛错（调用方按未解析处理）', async (_name, entries, lsofResult, message) => {
     await expect(
-      resolveOrcaPorts('/u', { readDir: async () => entries, lsof: async () => lsofResult }),
+      resolveOrcaPorts('/u', {
+        readDir: async () => entries,
+        ps: orcaPs,
+        lsof: async () => lsofResult,
+      }),
     ).rejects.toThrow(message)
   })
 

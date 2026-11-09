@@ -195,9 +195,12 @@ export {
 } from './node.ts'
 export {
   defaultLsof,
+  defaultPs,
   LSOF,
   type LsofRunner,
   type OrcaPortOptions,
+  PS,
+  type PsRunner,
   parseLsofPorts,
   resolveOrcaPorts,
 } from './orca-ports.ts'

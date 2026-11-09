@@ -31,6 +31,7 @@
   - 审查第一轮（PR #98）：受保护路径全部祖先目录写拒绝（防改名绕过）；配置移到 worker 读写都被拒绝的 `state/tasks/<任务>/isolation.sb`；
     Orca 端口只读解析（套接字名取 pid + lsof），未解析时探针记为失败；探针新增 `rename.protected_ancestor`、`write.own_profile` 两个必过项，
     施加时按执行器分别运行；未隔离旧终端拒绝重挂接时关闭；`spawnClaudeCodeProcess` 启动失败不崩溃；非 macOS 打开开关时 doctor 提示未施加。
+- [ ] 4.6 （4.5 的前置）持久化写入（design Risks，PR #98 第二轮审查 N1）：在“写入白名单（默认 `deny file-write*`，放行工作目录、harness 目录、临时目录、缓存目录与主仓库 `.git` 中 worktree 必需的部分）”与“至少对 shell 启动文件、共享 `.git/hooks` 与 `.git/config`、`~/.gitconfig`、`~/.config/git`、用户可写 PATH 目录、`~/.ssh/config` 写拒绝”之间选定方案并实现；探针新增“写 shell 启动文件”一项（只在临时 home 上测试）。验证：darwin 上真实 `sandbox-exec` 的回归测试；Codex 与 Claude Code 在白名单下的工具链冒烟
 - [ ] 4.5 真实验收（征得用户同意后在本机执行）：dev 角色跑一个 product-res 任务，worker 内 `cat ~/raindown-home/state/hub.token`、写 `config/policies.yaml`、读其他任务令牌全部失败，`raindown_report` 与 `kb_search` 正常，任务正常完成
 
 ## 5. harness 沙箱开启时的隔离
