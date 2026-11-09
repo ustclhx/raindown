@@ -35,11 +35,24 @@
   - 用户 2026-11-09 选定写入白名单（design D2）。`IsolationSpec` 增加 `allow_write_literals`、`write_carve_outs*`、`allow_write_git*`，
     `allow_write` 改为白名单语义；SBPL 在 `(allow default)` 之后 `(deny file-write*)`，受保护项拒绝仍写在最后。
   - claude-sdk 施加时改用 Raindown 管理的 `CLAUDE_CONFIG_DIR`（`run/executors/claude-sdk/claude-config/`，用户设置与扩展只读链接），
-    `CLAUDE_SECURESTORAGE_CONFIG_DIR` 保持原钥匙串条目，`CLAUDE_CODE_TMPDIR` 改到本用户 `TMPDIR`。
-  - 登记仓库 `.git` 的最小写集合由 darwin 上真实 `sandbox-exec` + git 实测确定（`packages/core/test/isolation-write-allowlist.test.ts`）。
+    `CLAUDE_SECURESTORAGE_CONFIG_DIR` 保持原钥匙串条目，`CLAUDE_CODE_TMPDIR` 改到本用户 `TMPDIR`（第一轮审查后改为按任务的目录与任务私有临时目录，见下）。
+  - 登记仓库 `.git` 的最小写集合曾由 darwin 上真实 `sandbox-exec` + git 实测确定；第一轮审查后被独立 clone 取代（见下），登记仓库的 `.git` 整体只读。
   - 探针新增必过项 `write.shell_startup`、`write.git_hooks`（只在探针自建的 `run/isolation-probe-<hex>/` 中操作），以及 `write.git_objects`（按角色读写类别）。
   - 新配置 `isolation.extra_write`（绝对路径；不能是受保护路径、持久化位置、用户主目录或其祖先），doctor 显示。
-  - Codex 与 Claude Code 在白名单下的真实工具链冒烟未做（不运行真实 harness），留给 4.5 验收；已知风险见 docs/executors.md「写白名单」。
+  - PR #99 第一轮审查（用户批准第一步方案：Orca 方案 (b)、codex-exec / claude-sdk 写类角色同样用独立 clone、`dissociate` 缺省 false、known_hosts 记为限制）：
+    - H1、H2、M4：施加时写类任务在独立 clone `run/tasks/<任务>/repo`（`git clone --shared`，不硬链接对象）中运行，登记仓库的 `.git` 整体只读；
+      clone 的 `.git/config` 由节点写入并记录 sha256（节点每次运行 git 前核对），config、hooks、`info/`、`modules/`、alternates 不可写；
+      codex-orca 的 Orca worktree 只作终端宿主，setup 在 clone 中以 worker 的 seatbelt 配置运行；迁移与回滚（取回分支）见 docs。
+    - H3、M1：施加时用独立的 `codex-home-sealed`，内部白名单；`auth.json` 链接本身拒绝写；节点刷新凭证不可行，登记 Risks。
+    - M2：按任务私有的 `tmp/`、`cache/` 与环境变量，共享临时与缓存目录移出白名单；launchd plist 设 `BUN_RUNTIME_TRANSPILER_CACHE_PATH=0`。
+    - M3：钥匙串只放行 `login.keychain-db` 与 `.sb-*`（claude-sdk）。M5：claude-sdk 配置目录按任务。M6：codex-orca 预置项目信任。
+    - L1：`extra_write` 大小写折叠与 NFD，拒绝登记仓库、PATH 目录、Application Support；持久化位置整体拒绝写。L2：随独立 clone 消失。
+    - L3：文档与 dev 角色模板写明推送与新建分支的做法。L4：审查元数据存 `state/review-meta/`。L5：`job-creation`、`user-preference-write`、`lsopen`、`appleevent-send`。
+    - 探针新增必过项 `write.registered_git`，另有 `write.shared_tmp`。
+  - **留给 4.5 真实验收确认**（不运行真实 harness，未验证）：Codex 在独立 CODEX_HOME 内部白名单下能否正常启动、刷新凭证与使用 `tmp/arg0`；
+    Claude Code 在按任务配置目录与 `CLAUDE_SECURESTORAGE_CONFIG_DIR` 下能否取到钥匙串凭证与刷新；预置信任能否消除信任弹窗；
+    仓库 setup（`bun install`）在冷的任务缓存下的耗时；husky 等写 `core.hooksPath` 的工具；工具写 `~/Library/Application Support` 等位置的失败（按 docs 排查追加）；
+    经 cfprefsd 的偏好设置写入未拦住（Risks）。
 - [ ] 4.5 真实验收（征得用户同意后在本机执行）：dev 角色跑一个 product-res 任务，worker 内 `cat ~/raindown-home/state/hub.token`、写 `config/policies.yaml`、读其他任务令牌全部失败，`raindown_report` 与 `kb_search` 正常，任务正常完成
 
 ## 5. harness 沙箱开启时的隔离

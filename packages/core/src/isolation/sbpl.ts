@@ -8,7 +8,8 @@ import type { IsolationSpec } from './spec.ts'
  * 结构：`(version 1)(allow default)`，之后依次是
  * 0. `(deny file-write*)`：写入是白名单（tasks 4.6），只有下面放行的位置可写；
  * 1. 最窄允许项（本任务工作目录、派工令牌、harness 目录、中枢端口、显式放行的套接字）与写白名单
- *    （临时、缓存、设备文件等），之后在白名单内挖掉登记仓库的 git 目录与 harness 配置，再放行 worktree 必需的 git 部分；
+ *    （本任务私有目录、harness 运行状态、设备文件等），之后在白名单内挖掉登记仓库的 git 目录与 harness 配置，
+ *    再放行本任务独立 clone 的 `.git`；最后是持久化位置的拒绝与派生任务、偏好设置等拒绝（审查第一轮）；
  * 2. 显式拒绝：`deny_read`、`deny_write`、`deny_children_except`、受保护路径全部祖先目录的写（防改名绕过）、
  *    Orca unix 套接字、已解析的 Orca 端口、跨进程调试。
  *
@@ -71,6 +72,30 @@ const rule = (action: 'allow' | 'deny', ops: string, filters: readonly string[])
 const subpaths = (paths: readonly string[]) => paths.map((p) => `(subpath ${sbplString(p)})`)
 const literals = (paths: readonly string[]) => paths.map((p) => `(literal ${sbplString(p)})`)
 
+/**
+ * 正则过滤器（写白名单中的登录钥匙串、harness 运行状态文件）：正则由 core 生成（路径前缀已转义），
+ * 这里再校验一次——必须以 `^/` 开头，不能含双引号与控制字符（SBPL 的 `#"…"` 字面量不能转义双引号）。
+ */
+export function sbplRegex(src: string): string {
+  if (CONTROL_CHARS.test(src) || src.includes('"') || !src.startsWith('^/'))
+    throw new ProfileError(
+      'isolation_profile_invalid_path',
+      `正则不合法（须以 ^/ 开头，不能含双引号或控制字符），拒绝生成 seatbelt 配置：${JSON.stringify(src)}`,
+    )
+  return `(regex #"${src}")`
+}
+
+/**
+ * 持久化与外部启动通道（审查第一轮 L5）：派生 launchd 任务、写偏好设置、经 LaunchServices 打开应用、发送 AppleEvents。
+ * 只验证了本机 sandbox 能解析这些操作名；`user-preference-write` 拦不住经 cfprefsd 的 `defaults write`（实测，见 docs）。
+ */
+export const DENY_LAUNCH_OPERATIONS = [
+  'job-creation',
+  'user-preference-write',
+  'lsopen',
+  'appleevent-send',
+] as const
+
 /** 终端从设备（`/dev/ttys<N>`）：数目不定，用固定正则放行；不接受任何外部输入。 */
 export const TTY_DEVICE_REGEX = '(regex #"^/dev/ttys[0-9]+$")'
 
@@ -99,6 +124,7 @@ export function protectedAncestors(spec: IsolationSpec): string[] {
     // 白名单内挖掉的位置（git 目录、.git 指针文件、harness 配置）：改名其祖先（例如工作目录）后同样能绕过（tasks 4.6）。
     ...spec.write_carve_outs,
     ...spec.write_carve_out_literals,
+    ...spec.deny_write_except.map((d) => d.path),
   ])
     for (const a of ancestors(p)) set.add(a)
   for (const d of spec.deny_children_except) {
@@ -128,6 +154,7 @@ export function renderSeatbeltProfile(spec: IsolationSpec): Result<string> {
       ...rule('allow', 'file-write*', [
         ...subpaths(spec.allow_write),
         ...literals(spec.allow_write_literals),
+        ...spec.allow_write_regex.map(sbplRegex),
         ...(spec.allow_write_literals.length > 0 ? [TTY_DEVICE_REGEX] : []),
       ]),
       ...rule(
@@ -146,15 +173,22 @@ export function renderSeatbeltProfile(spec: IsolationSpec): Result<string> {
         ...subpaths(spec.write_carve_outs),
         ...literals(spec.write_carve_out_literals),
       ]),
-      ';; 1b. 登记仓库 .git 中 worktree 必需的部分（写类角色）；hooks、config 等不在内，并在下面再次拒绝',
-      ...rule('allow', 'file-write*', [
-        ...subpaths(spec.allow_write_git),
-        ...literals(spec.allow_write_git_literals),
-      ]),
+      ';; 1b. 本任务独立 clone 的 .git（写类角色）；config、hooks、alternates 等在下面再次拒绝。登记仓库的 .git 整体只读',
+      ...rule('allow', 'file-write*', subpaths(spec.allow_write_git)),
       '',
       ';; 2. 受保护资源：读写拒绝（以目录为单位，新增文件自动覆盖）；写在白名单之后，白名单不能重新放开',
       ...rule('deny', 'file-read*', subpaths(spec.deny_read)),
       ...rule('deny', 'file-write*', subpaths(spec.deny_write)),
+      ';; 2a. 持久化位置（shell 启动文件、~/.ssh、~/.gitconfig 等）：纵深防御，追加的白名单也不能放开；只保留已放行的单个文件',
+      ...rule(
+        'deny',
+        'file-write*',
+        spec.deny_write_except.map((d) =>
+          d.except.length === 0
+            ? `(subpath ${sbplString(d.path)})`
+            : `(require-all (subpath ${sbplString(d.path)})${d.except.map((e) => ` (require-not (literal ${sbplString(e)}))`).join('')})`,
+        ),
+      ),
       '',
       ';; 3. 目录下除保留子目录以外的全部内容（目录本身可见）',
       ...spec.deny_children_except.flatMap((d) =>
@@ -191,6 +225,9 @@ export function renderSeatbeltProfile(spec: IsolationSpec): Result<string> {
           )
         return `(deny ${op} (target others))`
       }),
+      '',
+      ';; 7. 派生 launchd 任务、写偏好设置、经 LaunchServices 打开应用、发送 AppleEvents（审查第一轮 L5）',
+      ...DENY_LAUNCH_OPERATIONS.map((op) => `(deny ${op})`),
     ]
     return ok(`${lines.join('\n')}\n`)
   } catch (err) {

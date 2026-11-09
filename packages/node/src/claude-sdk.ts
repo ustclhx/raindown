@@ -1,6 +1,5 @@
 import { spawn } from 'node:child_process'
 import { readFile, realpath } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type {
   CanUseTool,
@@ -25,6 +24,7 @@ import {
   type DeliveredReply,
   effectiveRoleKind,
   fail,
+  type HarnessPath,
   HUB_TOKEN_FILE_ENV,
   loadRoles,
   loadWorkspaces,
@@ -53,9 +53,9 @@ import {
 import { z } from 'zod'
 import {
   CLAUDE_CONFIG_DENY_WRITE,
-  CLAUDE_CONFIG_HOME,
   claudeIsolatedEnv,
   prepareClaudeConfigDir,
+  removeClaudeConfigDir,
   userClaudeConfigDir,
 } from './claude-config.ts'
 import {
@@ -96,6 +96,7 @@ import {
   prepareReview,
   reviewPromptSection,
 } from './review-prep.ts'
+import { prepareSealedWorkdir, rollbackSealedClone } from './sealed-workdir.ts'
 import {
   effectiveCredentialIsolation,
   prepareSeatbelt,
@@ -103,6 +104,7 @@ import {
   seatbeltApplies,
   seatbeltFailureMessage,
 } from './seatbelt.ts'
+import { prepareTaskScratch, removeTaskScratch } from './task-scratch.ts'
 import { resolveContractCwd } from './workdir.ts'
 
 /**
@@ -645,6 +647,8 @@ export function createClaudeSdkExecutor(options: ClaudeSdkExecutorOptions): Exec
       /** 审查任务的准备结果（D10）；结束时移除 worktree。 */
       let review: PreparedReview | undefined
       let reviewCleaned: Promise<void> | undefined
+      /** 施加了外层 seatbelt：结束时删除本任务私有的临时与缓存目录（审查第一轮 M2）。 */
+      let scratchApplied = false
       const cleanupReview = () => {
         if (review) reviewCleaned ??= review.cleanup()
         return reviewCleaned ?? Promise.resolve()
@@ -714,7 +718,13 @@ export function createClaudeSdkExecutor(options: ClaudeSdkExecutorOptions): Exec
             // 已经结束的查询再 close 可能抛出，忽略。
           }
           queue.close()
-          settle(r)
+          if (!scratchApplied) return settle(r)
+          // 临时与缓存目录每次执行结束删除；按任务的 Claude 配置目录只在任务完成或取消时删除（恢复会话需要它，M5）。
+          const terminal = r.ok && (r.data.outcome === 'done' || r.data.outcome === 'cancelled')
+          void Promise.all([
+            removeTaskScratch(options.home, ctx.taskId),
+            terminal ? removeClaudeConfigDir(options.home, ctx.taskId) : undefined,
+          ]).finally(() => settle(r))
         }
         if (!q || loopClosed) {
           finalize()
@@ -1125,7 +1135,7 @@ export function createClaudeSdkExecutor(options: ClaudeSdkExecutorOptions): Exec
           )
           return
         }
-        // 不上报任务分支：本适配器不创建专用分支或 worktree，工作目录当前分支通常是 main 或用户的检出，
+        // 未施加外层 seatbelt 时不上报任务分支（施加时写类会话在本任务的独立 clone 中运行，见下方并在那里上报）：本适配器不创建专用分支或 worktree，工作目录当前分支通常是 main 或用户的检出，
         // 不是本任务拥有的分支（push_to: task_branch、gh_scope --head 会据此放行；见 docs/executors.md）。
         if (finished) return
         // 不加载项目设置时，把项目约定文件的纯文本追加到系统提示词（不含 hooks 与权限规则）。
@@ -1144,30 +1154,68 @@ export function createClaudeSdkExecutor(options: ClaudeSdkExecutorOptions): Exec
           !supervisor.data &&
           seatbeltApplies(credentialIsolation, role.data, options.isolation)
         ) {
-          // 写白名单（4.6）：Claude Code 改用 Raindown 管理的配置目录，用户自己的 ~/.claude 与 ~/.claude.json 不可写。
+          // 写白名单（4.6、审查第一轮 M5）：Claude Code 改用按任务的配置目录，用户自己的 ~/.claude 与 ~/.claude.json 不可写。
           const configDir = await prepareClaudeConfigDir(
             options.home,
+            ctx.taskId,
             userClaudeConfigDir(env.data, options.isolation.userHome),
           )
           if (finished) return
-          const prepared = configDir.ok
-            ? await prepareSeatbelt(options.isolation, {
+          const harnessPaths: HarnessPath[] = configDir.ok
+            ? [{ path: configDir.data, access: 'write', denyWrite: CLAUDE_CONFIG_DENY_WRITE }]
+            : []
+          scratchApplied = true
+          // 写类会话（审查以外）在本任务的独立 clone 中运行，登记仓库的 .git 对 worker 只读（审查第一轮 H1、H2、M4）。
+          const sealed = kind === 'write' && !review
+          let prepared: Result<{ prefix: string[]; scratchEnv: Record<string, string> }>
+          if (!configDir.ok) prepared = configDir
+          else if (sealed) {
+            const repo = await realpath(sessionCtx.cwd).catch(() => sessionCtx.cwd)
+            const workdir = await prepareSealedWorkdir(options.isolation, {
+              home: options.home,
+              taskId: ctx.taskId,
+              executor: CLAUDE_SDK_EXECUTOR,
+              repo,
+              branch: ctx.taskId,
+              ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
+              ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
+              harnessPaths,
+              allowKeychain: true,
+              env: env.data,
+              status,
+            })
+            if (workdir.ok) {
+              sessionCtx = { ...sessionCtx, cwd: workdir.data.dir }
+              await ctx.reportBranch?.({ branch: ctx.taskId, worktree: workdir.data.dir, repo })
+            }
+            prepared = workdir
+          } else {
+            const scratchEnv = await prepareTaskScratch(options.home, ctx.taskId).catch(
+              (err: Error) => err,
+            )
+            if (scratchEnv instanceof Error)
+              prepared = fail('failure', 'task_scratch_failed', scratchEnv.message)
+            else {
+              const r = await prepareSeatbelt(options.isolation, {
                 home: options.home,
                 taskId: ctx.taskId,
                 executor: CLAUDE_SDK_EXECUTOR,
-                executorHome: CLAUDE_CONFIG_HOME,
                 cwd: sessionCtx.cwd,
                 access: kind === 'read' ? 'read' : 'write',
                 ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
                 ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
-                harnessPaths: [
-                  { path: configDir.data, access: 'write', denyWrite: CLAUDE_CONFIG_DENY_WRITE },
-                ],
+                harnessPaths,
+                allowKeychain: true,
               })
-            : configDir
+              prepared = r.ok ? ok({ prefix: r.data.prefix, scratchEnv }) : r
+            }
+          }
           if (finished) return
           if (prepared.ok && configDir.ok)
-            isolatedEnv = claudeIsolatedEnv(env.data, configDir.data, await realpath(tmpdir()))
+            isolatedEnv = {
+              ...prepared.data.scratchEnv,
+              ...claudeIsolatedEnv(env.data, configDir.data, prepared.data.scratchEnv.TMPDIR ?? ''),
+            }
           if (!prepared.ok) {
             await cleanupReview()
             finish(
@@ -1181,6 +1229,12 @@ export function createClaudeSdkExecutor(options: ClaudeSdkExecutorOptions): Exec
             return
           }
           seatbelt = prepared.data.prefix
+        } else if (!supervisor.data && kind === 'write' && !review) {
+          // 回滚（开关已关闭）：之前施加时建立的独立 clone，先把任务分支取回登记仓库再删除，之后照旧在合同目录中运行。
+          const rolled = await rollbackSealedClone(options.home, ctx.taskId, {
+            ...(options.isolation?.gitEnv ? { env: options.isolation.gitEnv } : {}),
+          })
+          if (rolled) status(rolled)
         }
         const options_ = buildOptions({
           ...(instructions ? { projectInstructions: instructions } : {}),

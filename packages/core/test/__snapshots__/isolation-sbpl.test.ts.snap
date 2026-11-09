@@ -15,10 +15,10 @@ exports[`SBPL 生成 快照：allow default + 默认写拒绝 + 写白名单 + �
   (subpath "/Users/u/work"))
 (allow file-write*
   (subpath "/Users/u/work")
-  (subpath "/Users/u/.cache")
-  (subpath "/private/tmp")
+  (subpath "/Users/u/raindown-home/run/tasks/t-1")
   (literal "/dev/null")
   (literal "/Users/u/.codex/auth.json")
+  (regex #"^/Users/u/Library/Keychains/login\\.keychain-db(\\.sb-[^/]+)?$")
   (regex #"^/dev/ttys[0-9]+$"))
 (allow network-outbound
   (remote ip "localhost:7477"))
@@ -28,11 +28,9 @@ exports[`SBPL 生成 快照：allow default + 默认写拒绝 + 写白名单 + �
   (subpath "/Users/u/repo/.git")
   (subpath "/Users/u/raindown-home/run/executors/codex-exec/codex-home/config.toml")
   (literal "/Users/u/work/.git"))
-;; 1b. 登记仓库 .git 中 worktree 必需的部分（写类角色）；hooks、config 等不在内，并在下面再次拒绝
+;; 1b. 本任务独立 clone 的 .git（写类角色）；config、hooks、alternates 等在下面再次拒绝。登记仓库的 .git 整体只读
 (allow file-write*
-  (subpath "/Users/u/repo/.git/objects")
-  (subpath "/Users/u/repo/.git/worktrees/work")
-  (literal "/Users/u/repo/.git/packed-refs"))
+  (subpath "/Users/u/clone/.git"))
 
 ;; 2. 受保护资源：读写拒绝（以目录为单位，新增文件自动覆盖）；写在白名单之后，白名单不能重新放开
 (deny file-read*
@@ -44,6 +42,10 @@ exports[`SBPL 生成 快照：allow default + 默认写拒绝 + 写白名单 + �
   (subpath "/Users/u/Library/Application Support/orca")
   (subpath "/Users/u/Library/LaunchAgents")
   (subpath "/Users/u/raindown-home/run/tasks/t-1/dispatch-tokens"))
+;; 2a. 持久化位置（shell 启动文件、~/.ssh、~/.gitconfig 等）：纵深防御，追加的白名单也不能放开；只保留已放行的单个文件
+(deny file-write*
+  (require-all (subpath "/Users/u/.codex") (require-not (literal "/Users/u/.codex/auth.json")))
+  (subpath "/Users/u/.zshenv"))
 
 ;; 3. 目录下除保留子目录以外的全部内容（目录本身可见）
 (deny file-read* file-write*
@@ -79,5 +81,11 @@ exports[`SBPL 生成 快照：allow default + 默认写拒绝 + 写白名单 + �
 ;; 6. 跨进程调试（allow default 下默认允许 attach 同用户的非 hardened 进程）
 (deny mach-priv-task-port (target others))
 (deny mach-task-name (target others))
+
+;; 7. 派生 launchd 任务、写偏好设置、经 LaunchServices 打开应用、发送 AppleEvents（审查第一轮 L5）
+(deny job-creation)
+(deny user-preference-write)
+(deny lsopen)
+(deny appleevent-send)
 "
 `;

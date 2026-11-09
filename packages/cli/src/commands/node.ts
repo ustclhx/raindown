@@ -54,6 +54,7 @@ export const nodeStartCommand = defineCommand({
       resolveOrcaPorts: orcaPorts,
       // 写白名单之外追加的可写目录（tasks 4.6）；worker 与探针用同一份。
       extraWrite: nodeConfig.data.isolation.extra_write,
+      dissociate: nodeConfig.data.isolation.dissociate,
     }
     if (isolation.enforce && !seatbeltActive(isolation))
       console.error(

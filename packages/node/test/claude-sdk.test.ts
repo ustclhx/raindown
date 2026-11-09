@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -49,6 +50,7 @@ import {
 } from '../src/index.ts'
 import { seatbeltApplies } from '../src/seatbelt.ts'
 import { type Bench, bench, ManualClock } from './harness.ts'
+import { initTestRepo } from './sealed-helpers.ts'
 import { waitFor } from './wait.ts'
 
 /**
@@ -2024,13 +2026,16 @@ describe('外层 seatbelt（worker-credential-isolation 4.4）', () => {
     const cwd = join(root, 'repo')
     mkdirSync(join(home, 'state'), { recursive: true })
     mkdirSync(cwd)
+    // 写类会话在本任务的独立 clone 中运行（审查第一轮，第一步方案）：合同目录先变成 git 仓库（临时 HOME）。
+    const gitEnv = initTestRepo(cwd)
     const isolation = {
       enforce: true,
       platform: 'darwin' as const,
       userHome: join(root, 'user'),
       env: {},
+      gitEnv,
     }
-    return { root, home, cwd, isolation }
+    return { root, home, cwd, isolation, clone: join(home, 'run/tasks/t-1/repo') }
   }
   async function runOnce(
     over: Partial<ClaudeSdkExecutorOptions>,
@@ -2084,17 +2089,34 @@ describe('外层 seatbelt（worker-credential-isolation 4.4）', () => {
     expect(typeof options?.spawnClaudeCodeProcess).toBe('function')
     const profile = join(s.home, 'state/tasks/t-1/isolation.sb')
     const text = readFileSync(profile, 'utf8')
-    expect(text).toContain(`(subpath ${JSON.stringify(s.cwd)})`)
-    // 写白名单（4.6）：Claude Code 改用 Raindown 管理的配置目录；其中的设置与扩展、用户自己的 ~/.claude 不可写。
-    const configDir = join(s.home, 'run/executors/claude-sdk/claude-config')
+    // 写类会话在本任务的独立 clone 中运行；登记仓库（合同目录）的 .git 只读，clone 的 .git 可写（配置、hooks 除外）。
+    expect(options?.cwd).toBe(s.clone)
+    expect(text).toContain(`(subpath ${JSON.stringify(s.clone)})`)
+    expect(text).toContain(`(subpath ${JSON.stringify(join(s.clone, '.git', 'hooks'))})`)
+    expect(text).not.toContain(`(subpath ${JSON.stringify(s.cwd)})`)
+    // 写白名单（4.6、M5）：Claude Code 改用按任务的配置目录；其中的设置与扩展、用户自己的 ~/.claude 不可写。
+    const configDir = join(s.home, 'run/tasks/t-1/claude-config')
     expect(options?.env?.CLAUDE_CONFIG_DIR).toBe(configDir)
     expect(options?.env?.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe('')
-    expect(options?.env?.CLAUDE_CODE_TMPDIR).toBeTruthy()
+    // 临时与缓存目录是本任务私有目录（M2）；登录钥匙串文件放行（M3）。
+    expect(options?.env?.CLAUDE_CODE_TMPDIR).toBe(join(s.home, 'run/tasks/t-1/tmp'))
+    expect(options?.env?.TMPDIR).toBe(join(s.home, 'run/tasks/t-1/tmp'))
+    expect(options?.env?.BUN_INSTALL_CACHE_DIR).toBe(join(s.home, 'run/tasks/t-1/cache/bun'))
+    expect(text).toContain('login\\.keychain-db')
+    // 完成后删除任务私有的临时与缓存目录与按任务的配置目录。
+    expect(existsSync(join(s.home, 'run/tasks/t-1/tmp'))).toBe(false)
+    expect(existsSync(configDir)).toBe(false)
     expect(text).toContain('(deny file-write*)\n')
     expect(text).toContain(`(subpath ${JSON.stringify(configDir)})`)
     for (const name of ['settings.json', 'hooks', 'commands', 'skills', 'plugins'])
       expect(text).toContain(`(subpath ${JSON.stringify(join(configDir, name))})`)
-    expect(text).not.toContain(`(subpath ${JSON.stringify(join(s.root, 'user/.claude'))})`)
+    // 用户自己的 ~/.claude 不在写白名单内，并且作为持久化位置在最后整体拒绝写（L1）。
+    const allowWrite =
+      text.split('(allow file-write*')[1]?.split('(allow network-outbound')[0] ?? ''
+    expect(allowWrite).not.toContain(join(s.root, 'user/.claude'))
+    expect(text.split(';; 2a.')[1]).toContain(
+      `(subpath ${JSON.stringify(join(s.root, 'user/.claude'))})`,
+    )
     // 用户主目录本身不在写白名单内。
     expect(text).not.toContain(`(subpath ${JSON.stringify(join(s.root, 'user'))})`)
     expect(ex.adapterCapabilities.credential_isolation).toEqual({

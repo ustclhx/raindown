@@ -112,8 +112,12 @@ export const nodeIsolationSchema = z
       .default([])
       .meta({
         description:
-          '外层 seatbelt 写白名单之外追加的可写目录（tasks 4.6），例如新工具的缓存目录；只接受绝对路径，不能是受保护路径、持久化位置（shell 启动文件、~/.ssh、~/.gitconfig 等）、用户主目录或它们的祖先',
+          '外层 seatbelt 写白名单之外追加的可写目录（tasks 4.6）；只接受绝对路径，不能是受保护路径、持久化位置（shell 启动文件、~/.ssh、~/.gitconfig 等）、登记仓库、PATH 中的目录、~/Library/Application Support、用户主目录或它们的祖先',
       }),
+    dissociate: z.boolean().default(false).meta({
+      description:
+        '施加外层 seatbelt 时任务的独立 clone 完整复制对象（git clone --no-hardlinks），不经 alternates 引用登记仓库；缺省 false（git clone --shared）',
+    }),
   })
   .meta({ title: 'Node worker isolation' })
 
@@ -138,10 +142,12 @@ export const nodeConfigSchema = z
       description:
         '在 concurrency 之外为 supervisor 预留的执行槽（add-m1-supervisor D12）：普通槽满时仍为它们领取任务',
     }),
-    isolation: nodeIsolationSchema.default({ enforce: false, extra_write: [] }).meta({
-      description:
-        'worker 凭证隔离（add-worker-credential-isolation）；缺省不施加（enforce: false）',
-    }),
+    isolation: nodeIsolationSchema
+      .default({ enforce: false, extra_write: [], dissociate: false })
+      .meta({
+        description:
+          'worker 凭证隔离（add-worker-credential-isolation）；缺省不施加（enforce: false）',
+      }),
   })
   .meta({ title: 'Raindown node config', description: 'config/node.yaml' })
 export type NodeConfig = z.infer<typeof nodeConfigSchema>

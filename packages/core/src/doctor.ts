@@ -559,7 +559,13 @@ export async function isolationSwitchChecks(
   const checks: DoctorCheck[] = []
   const extra = config.data.isolation.extra_write
   if (extra.length > 0) {
-    const checked = await normalizeExtraWrite(extra, userHome, [home])
+    const workspaces = await loadWorkspaces(home)
+    const checked = await normalizeExtraWrite(extra, {
+      userHome,
+      protectedPaths: [home],
+      registeredRepos: workspaces.ok ? workspaces.data.workspaces.flatMap((w) => w.repos) : [],
+      pathEnv: process.env.PATH,
+    })
     checks.push(
       checked.ok
         ? {

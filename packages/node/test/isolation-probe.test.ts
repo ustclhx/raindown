@@ -81,10 +81,6 @@ const probeOptions = (s: Awaited<ReturnType<typeof setup>>, executors = [codexEx
   userHome: s.userHome,
   env: {},
   tmpDir: s.tmp,
-  // 写白名单（4.6）：测试根目录本身在系统临时目录内，临时与缓存目录改为测试内的子目录，
-  // 使探针自建的模拟 home 与临时仓库位于白名单之外。
-  tmpDirs: [s.tmp],
-  cacheDirs: [join(s.userHome, '.cache')],
   macosVersion: async () => '15.1',
   now: () => new Date('2026-11-09T00:00:00.000Z'),
 })
@@ -282,6 +278,12 @@ describe('模拟已隔离（注入的文件系统接口拒绝受保护项）', (
         kind: 'create_file',
         expected: 'deny',
         target: '/h/run/isolation-probe-p/repo/.git/hooks/post-checkout',
+      },
+      {
+        item: 'write.registered_git',
+        kind: 'write_new',
+        expected: 'deny',
+        target: '/h/run/isolation-probe-p/repo/.git/objects',
       },
       { item: 'connect.orca_port', kind: 'tcp_connect', expected: 'deny', skip: '未解析' },
       { item: 'debug.process', kind: 'process_debug', expected: 'deny', unverified: '未验证' },

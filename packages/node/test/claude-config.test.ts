@@ -40,28 +40,28 @@ function setup() {
 describe('prepareClaudeConfigDir', () => {
   test('建立 0700 目录，只读链接用户目录中存在的设置与扩展；幂等；来源消失时删除链接', async () => {
     const s = setup()
-    const r = await prepareClaudeConfigDir(s.home, s.user)
+    const r = await prepareClaudeConfigDir(s.home, 't-1', s.user)
     if (!r.ok) throw new Error(r.error.message)
-    expect(r.data).toBe(claudeConfigDir(s.home))
+    expect(r.data).toBe(claudeConfigDir(s.home, 't-1'))
     expect(statSync(r.data).mode & 0o777).toBe(0o700)
     expect(readlinkSync(join(r.data, 'settings.json'))).toBe(join(s.user, 'settings.json'))
     expect(readlinkSync(join(r.data, 'skills'))).toBe(join(s.user, 'skills'))
     expect(() => lstatSync(join(r.data, 'CLAUDE.md'))).toThrow()
     // 幂等。
-    expect((await prepareClaudeConfigDir(s.home, s.user)).ok).toBe(true)
+    expect((await prepareClaudeConfigDir(s.home, 't-1', s.user)).ok).toBe(true)
     rmSync(join(s.user, 'skills'), { recursive: true })
-    expect((await prepareClaudeConfigDir(s.home, s.user)).ok).toBe(true)
+    expect((await prepareClaudeConfigDir(s.home, 't-1', s.user)).ok).toBe(true)
     expect(() => lstatSync(join(r.data, 'skills'))).toThrow()
   })
 
   test('同名条目是普通文件时不覆盖；隔离目录是符号链接或与来源相同时拒绝', async () => {
     const s = setup()
-    const dir = claudeConfigDir(s.home)
+    const dir = claudeConfigDir(s.home, 't-1')
     mkdirSync(dir, { recursive: true })
     writeFileSync(join(dir, 'settings.json'), '{"hooks":{}}')
-    const r = await prepareClaudeConfigDir(s.home, s.user)
+    const r = await prepareClaudeConfigDir(s.home, 't-1', s.user)
     expect(!r.ok && r.error.code).toBe('claude_config_failed')
-    const same = await prepareClaudeConfigDir(s.home, dir)
+    const same = await prepareClaudeConfigDir(s.home, 't-1', dir)
     expect(same.ok).toBe(false)
   })
 
@@ -73,7 +73,7 @@ describe('prepareClaudeConfigDir', () => {
     expect(userClaudeConfigDir({ CLAUDE_CONFIG_DIR: '/c' }, '/u')).toBe('/c')
   })
 
-  test('隔离环境变量：钥匙串条目按用户原来的配置目录计算，临时目录不用 /tmp/claude-<uid>', () => {
+  test('隔离环境变量：钥匙串条目按用户原来的配置目录计算，临时目录总是本任务私有目录（忽略用户的 CLAUDE_CODE_TMPDIR）', () => {
     expect(claudeIsolatedEnv({}, '/r/cfg', '/t')).toEqual({
       CLAUDE_CONFIG_DIR: '/r/cfg',
       CLAUDE_SECURESTORAGE_CONFIG_DIR: '',
@@ -88,6 +88,6 @@ describe('prepareClaudeConfigDir', () => {
         '/r',
         '/t',
       ),
-    ).toMatchObject({ CLAUDE_SECURESTORAGE_CONFIG_DIR: '/s', CLAUDE_CODE_TMPDIR: '/x' })
+    ).toMatchObject({ CLAUDE_SECURESTORAGE_CONFIG_DIR: '/s', CLAUDE_CODE_TMPDIR: '/t' })
   })
 })

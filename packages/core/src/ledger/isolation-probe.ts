@@ -94,6 +94,8 @@ export const PROBE_REQUIRED_DENY_ITEMS = [
   // tasks 4.6 写白名单：白名单之外（模拟的 shell 启动文件）与登记仓库的 .git/hooks 不可写。
   'write.shell_startup',
   'write.git_hooks',
+  // 审查第一轮 H1：登记仓库的 .git 对 worker 整体只读（worker 在本任务的独立 clone 中工作）。
+  'write.registered_git',
 ] as const
 
 /**

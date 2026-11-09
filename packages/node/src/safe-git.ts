@@ -1,6 +1,8 @@
 import { lstat, readFile, realpath } from 'node:fs/promises'
-import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { runTasksDir } from '@raindown/core'
 import { type CommandRunner, execRunner } from './codex-orca/orca.ts'
+import { SEALED_CLONE_DIR, sealedConfigHash, verifySealedClone } from './sealed-clone.ts'
 
 /**
  * 节点自己在 worker 目录里运行 git 的"安全 git"（add-m1-supervisor D15，tasks 5.6 审查第 1 条）。
@@ -33,6 +35,11 @@ export type GitLocation = {
   commonDir: string
   /** 所属的登记仓库（realpath）。 */
   repo: string
+  /**
+   * 本任务的独立 clone（审查第一轮，第一步方案）：节点写入的 `.git/config` 的 sha256。给出时每次运行 git 前核对，
+   * 不一致（worker 设法改动了配置）即不运行。
+   */
+  sealedConfigSha256?: string
 }
 
 export type LocationResult = ({ ok: true } & GitLocation) | { ok: false; reason: string }
@@ -75,9 +82,32 @@ async function repoCommonDir(repo: string): Promise<{ repo: string; common: stri
 export async function verifyGitLocation(
   dir: string,
   registeredRepos: readonly string[],
+  opts: { home?: string } = {},
 ): Promise<LocationResult> {
   const workTree = await real(dir)
   if (!workTree) return { ok: false, reason: 'cwd_unresolved' }
+  // 本任务的独立 clone：只认 `<home>/run/tasks/<任务>/repo`，并按节点记录核对（.git 是真实目录、config 的 sha256、alternates）。
+  if (opts.home) {
+    const tasks = await real(runTasksDir(opts.home))
+    if (tasks && basename(workTree) === SEALED_CLONE_DIR && dirname(dirname(workTree)) === tasks) {
+      const sealed = await verifySealedClone(opts.home, basename(dirname(workTree)))
+      if (!sealed.ok) return { ok: false, reason: sealed.error.code }
+      const repos = (await Promise.all(registeredRepos.map(repoCommonDir))).filter(
+        (r): r is { repo: string; common: string } => r !== undefined,
+      )
+      if (!repos.some((r) => r.repo === sealed.data.repo))
+        return { ok: false, reason: 'repo_not_registered' }
+      const gitDir = join(workTree, '.git')
+      return {
+        ok: true,
+        workTree,
+        gitDir,
+        commonDir: gitDir,
+        repo: sealed.data.repo,
+        sealedConfigSha256: sealed.data.config_sha256,
+      }
+    }
+  }
   const repos = (await Promise.all(registeredRepos.map(repoCommonDir))).filter(
     (r): r is { repo: string; common: string } => r !== undefined,
   )
@@ -195,8 +225,14 @@ export function createSafeGit(loc: GitLocation, o: SafeGitOptions = {}): SafeGit
     'core.hooksPath=/dev/null',
     '-c',
     'diff.external=',
+    '-c',
+    'protocol.ext.allow=never',
   ]
   const exec = async (args: readonly string[]): Promise<string | undefined> => {
+    if (loc.sealedConfigSha256 !== undefined) {
+      const current = await sealedConfigHash(loc.workTree)
+      if (current !== loc.sealedConfigSha256) return undefined
+    }
     try {
       const out = await runner('git', args, { cwd: loc.workTree, timeoutMs, env })
       return out.code === 0 ? out.stdout : undefined

@@ -109,8 +109,12 @@ export interface ProbePlanInput {
   shellStartupFile?: string
   /** 探针自建的临时仓库（按登记仓库同规则计算白名单）中 `.git/hooks/` 下的文件路径。缺省时该项记为跳过。 */
   gitHookFile?: string
-  /** 同一临时仓库的 `.git/objects/`：写类角色应可写（worktree 必需），只读角色应拒绝。 */
+  /** 探针工作目录（独立 clone 形状）的 `.git/objects/`：写类角色应可写，只读角色应拒绝。 */
   gitObjectsDir?: string
+  /** 模拟登记仓库的 `.git/objects/`：一律拒绝（审查第一轮 H1：登记仓库的 `.git` 对 worker 整体只读）。 */
+  registeredGitObjectsDir?: string
+  /** 共享的系统临时目录（`TMPDIR`）：拒绝（审查第一轮 M2，worker 改用按任务私有的临时目录）。 */
+  sharedTmp?: string
 }
 
 const isWithinPath = (parent: string, child: string) =>
@@ -249,6 +253,28 @@ export function buildProbePlan(input: ProbePlanInput): ProbePlan {
           skip: '没有提供探针的临时仓库',
         },
   )
+  items.push(
+    input.registeredGitObjectsDir
+      ? {
+          item: 'write.registered_git',
+          kind: 'write_new',
+          expected: 'deny',
+          target: input.registeredGitObjectsDir,
+        }
+      : {
+          item: 'write.registered_git',
+          kind: 'write_new',
+          expected: 'deny',
+          skip: '没有提供探针的模拟登记仓库',
+        },
+  )
+  if (input.sharedTmp)
+    items.push({
+      item: 'write.shared_tmp',
+      kind: 'write_new',
+      expected: 'deny',
+      target: input.sharedTmp,
+    })
   if (input.gitObjectsDir)
     items.push({
       item: 'write.git_objects',

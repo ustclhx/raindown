@@ -1,4 +1,5 @@
 export * from './capability.ts'
+export * from './orca-setup.ts'
 export * from './paths.ts'
 export * from './probe.ts'
 export * from './sbpl.ts'

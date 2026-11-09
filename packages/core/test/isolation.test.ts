@@ -59,10 +59,6 @@ function setup() {
     userHome,
     resolveOrcaPorts: () => [60211, 10129],
     env: {},
-    // 写白名单（4.6）中与本机有关的部分置空，清单内容可预期（写白名单本身见 isolation-write-allowlist.test.ts）。
-    tmpDirs: [],
-    cacheDirs: [],
-    uid: null,
   }
   return { root, real, home, userHome, work, base }
 }

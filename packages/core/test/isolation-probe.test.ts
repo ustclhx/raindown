@@ -179,6 +179,7 @@ const run = (
           'write.own_profile',
           'write.shell_startup',
           'write.git_hooks',
+          'write.registered_git',
         ] as const
       ).map((item) => ({
         item,

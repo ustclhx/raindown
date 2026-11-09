@@ -239,6 +239,7 @@ export {
   REVIEW_DIFF_FILE,
   REVIEW_REF_PREFIX,
   reviewDir,
+  reviewMetaPath,
   reviewRef,
 } from './review-prep.ts'
 export {

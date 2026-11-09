@@ -6,6 +6,7 @@ import {
   type HarnessPath,
   type IsolationLayer,
   type IsolationSpec,
+  loadWorkspaces,
   ok,
   type Result,
   type Role,
@@ -20,7 +21,8 @@ import { writeSeatbeltProfile } from './lease-token.ts'
  * 开关是节点级的 `config/node.yaml` 中 `isolation.enforce`（缺省 false）。关闭时各适配器不调用本模块的施加路径，
  * harness 的启动命令与之前逐字节一致；能力声明也与之前相同（`enforced: false`）。
  * 打开后（仅 macOS），角色沙箱设置的施加层为 `seatbelt` 时：节点计算隔离清单（`computeIsolationSpec`）、生成 SBPL
- * （`renderSeatbeltProfile`）写入 `run/tasks/<任务>/isolation.sb`（0600），以 `/usr/bin/sandbox-exec -f <配置>` 包裹 harness。
+ * （`renderSeatbeltProfile`）写入 `state/tasks/<任务>/isolation.sb`（0600），以 `/usr/bin/sandbox-exec -f <配置>` 包裹 harness。
+ * 写类角色另在本任务的独立 clone 中运行（`sealed-workdir.ts`、`sealed-clone.ts`，审查第一轮），worker 的临时与缓存目录改为本任务私有目录（`task-scratch.ts`）。
  * 任何一步失败都不启动 harness（不静默降级为未隔离运行）。
  */
 
@@ -46,9 +48,13 @@ export interface SeatbeltOptions {
   resolveOrcaPorts?: () => Promise<number[]> | number[]
   /** `config/node.yaml` 的 `isolation.extra_write`：追加到写白名单的目录（tasks 4.6）。 */
   extraWrite?: readonly string[]
-  /** 写白名单中的临时目录与缓存目录；缺省按本机计算，测试注入临时目录。 */
-  tmpDirs?: readonly string[]
-  cacheDirs?: readonly string[]
+  /**
+   * `config/node.yaml` 的 `isolation.dissociate`：独立 clone 完整复制对象（`--no-hardlinks`），不经 alternates 引用登记仓库。
+   * 缺省 false（`--shared`）。
+   */
+  dissociate?: boolean
+  /** 节点在沙箱外建立、回收独立 clone 时运行 git 的基础环境；缺省 process.env（测试注入临时 HOME）。 */
+  gitEnv?: NodeJS.ProcessEnv
 }
 
 /** 开关是否在本机生效：打开且运行在 macOS 上。 */
@@ -122,6 +128,16 @@ export interface SeatbeltLaunchInput {
   leaseTokenFile?: string
   hubUrl?: string
   harnessPaths?: readonly HarnessPath[]
+  /** 本任务的独立 clone（施加外层 seatbelt 的写类角色）：只有它的 `.git` 可写。 */
+  sealedClone?: string
+  /** 放行登录钥匙串文件（claude-sdk 刷新 OAuth 凭证，审查第一轮 M3）。 */
+  allowKeychain?: boolean
+}
+
+/** 全部 workspace 登记的仓库；读取失败时为空（不影响其他受保护项）。 */
+export async function registeredRepos(home: string): Promise<string[]> {
+  const loaded = await loadWorkspaces(home)
+  return loaded.ok ? [...new Set(loaded.data.workspaces.flatMap((w) => w.repos))] : []
 }
 
 /**
@@ -159,8 +175,10 @@ export async function prepareSeatbelt(
     ...(o.ageKeyFile !== undefined ? { ageKeyFile: o.ageKeyFile } : {}),
     ...(o.env ? { env: o.env } : {}),
     ...(o.extraWrite ? { extraWrite: o.extraWrite } : {}),
-    ...(o.tmpDirs ? { tmpDirs: o.tmpDirs } : {}),
-    ...(o.cacheDirs ? { cacheDirs: o.cacheDirs } : {}),
+    // 全部登记仓库的 .git 整体只读（审查第一轮 H1、H2、M4）。
+    registeredRepos: await registeredRepos(input.home),
+    ...(input.sealedClone !== undefined ? { sealedClone: input.sealedClone } : {}),
+    ...(input.allowKeychain ? { allowKeychain: true } : {}),
   })
   if (!spec.ok) return spec
   return writeSeatbeltLaunch(o, input.home, input.taskId, spec.data)

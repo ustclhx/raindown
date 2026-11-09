@@ -1064,6 +1064,7 @@ class LeaseRunner {
       // gitdir 必须指向登记仓库，否则不计算（computeDiffStat 内校验，所有 git 走安全 git）。
       return await computeDiffStat(dir, {
         registeredRepos: this.repos,
+        home: this.env.home,
         ...(this.env.envRunner ? { run: this.env.envRunner } : {}),
         env: this.env.envVars ?? executorEnv(),
       })
@@ -1075,6 +1076,7 @@ class LeaseRunner {
   private envReport(command: string | undefined, cwd: string): Promise<NodeEnvReport> {
     return nodeEnvReport(command, cwd, {
       registeredRepos: this.repos,
+      home: this.env.home,
       snapshot: this.snapshot,
       taskBranch: this.reportedBranch,
       ...(this.env.envRunner ? { run: this.env.envRunner } : {}),
@@ -1147,6 +1149,7 @@ class LeaseRunner {
         try {
           const r = await snapshotRepoResult(report.repo, {
             registeredRepos: this.repos,
+            home: this.env.home,
             ...(this.env.envRunner ? { run: this.env.envRunner } : {}),
             env: this.env.envVars ?? executorEnv(),
           })

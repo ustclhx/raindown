@@ -354,18 +354,44 @@ export async function prepareCodexHome(dir: string, authSource: string): Promise
 }
 
 /**
- * Raindown 管理的 CODEX_HOME 中拒绝写的条目（外层 seatbelt 写白名单，tasks 4.6）：会被 Codex 加载或执行的配置与扩展。
- * 同一 CODEX_HOME 也被未施加外层 seatbelt 的设置（workspace-write / read-only）使用，worker 改写 `config.toml`
- * （notify、MCP 服务器）或 `rules/` 就能让之后的 Codex 进程在外层 seatbelt 之外执行命令；节点每次启动前覆盖 config.toml
- * 也挡不住并发改写。其余运行状态（会话、日志、数据库）可写。
+ * 施加外层 seatbelt 的设置使用的独立 CODEX_HOME（审查第一轮 H3）：`run/executors/<执行器>/codex-home-sealed/`。
+ * 与 workspace-write / read-only 设置的 CODEX_HOME 不共享：共享时 worker 写入的 `.env`、`config.toml` 等会被之后
+ * 没有外层 seatbelt 的 Codex 进程加载。准备方式与普通 CODEX_HOME 相同（`prepareCodexHome`：覆盖 config.toml、清除扩展、链接 auth.json）。
  */
-export const CODEX_HOME_DENY_WRITE = ['config.toml', 'prompts', ...HOME_EXTENSIONS] as const
+export const SEALED_CODEX_HOME = 'codex-home-sealed'
+export const sealedCodexHome = (home: string, executor: 'codex-orca' | 'codex-exec') =>
+  join(executorRunDir(home, executor), SEALED_CODEX_HOME)
 
 /**
- * 外层 seatbelt 下 Codex 的 harness 目录：CODEX_HOME 可写（拒绝上面的条目），以及 `auth.json` 链接的目标单个文件可写
- * （Codex 刷新登录凭证时经链接写回用户的 `auth.json`；只放行这一个文件，不放行用户的 Codex 目录）。
+ * 独立 CODEX_HOME 内部也是白名单（H3）：只放行运行状态——会话记录、日志、缓存、临时目录（Codex 启动时在 `tmp/arg0/`
+ * 建 apply_patch 等别名链接，拒绝会使这些工具不可用；这个目录只被同样受隔离的 Codex 使用，见 docs）、
+ * 根目录的 `history.jsonl`、`version.json`、`internal_storage.json` 与 sqlite 状态库。
+ * `.env`、`config.toml`、`shell_snapshots/`、`prompts/`、`rules/`、`hooks.json`、`AGENTS*.md`、`skills/`、`plugins/`、
+ * `models_cache.json` 等会被加载或执行的文件都不在内。
+ */
+export const SEALED_CODEX_HOME_ALLOW = {
+  subpaths: ['sessions', 'archived_sessions', 'log', 'cache', 'tmp'],
+  files: ['history.jsonl', 'version.json', 'internal_storage.json'],
+  fileRegex: '[^/]+\\.sqlite(-wal|-shm|-journal)?',
+} as const
+
+/**
+ * 外层 seatbelt 下 Codex 的 harness 目录（独立 CODEX_HOME）：
+ * - 内部白名单见 `SEALED_CODEX_HOME_ALLOW`；
+ * - `auth.json` 链接本身拒绝写（不能被换成指向别处的链接或普通文件，审查第一轮 M1）；
+ * - 链接目标（用户的 `auth.json`）这一个文件可写：Codex 在进程内刷新登录凭证并经链接写回。worker 因此可以把它换成
+ *   攻击者账号的凭证（登记在 design Risks）；改由节点在沙箱外刷新需要 Codex 支持只读凭证，目前不可行（见 docs）。
  */
 export const codexHarnessPaths = (codexHome: string): HarnessPath[] => [
-  { path: codexHome, access: 'write', denyWrite: CODEX_HOME_DENY_WRITE },
+  {
+    path: codexHome,
+    access: 'write',
+    only: {
+      subpaths: [...SEALED_CODEX_HOME_ALLOW.subpaths],
+      files: [...SEALED_CODEX_HOME_ALLOW.files],
+      fileRegex: SEALED_CODEX_HOME_ALLOW.fileRegex,
+    },
+    denyWrite: ['auth.json'],
+  },
   { path: join(codexHome, 'auth.json'), access: 'write', literal: true },
 ]

@@ -111,6 +111,8 @@ const no = (reason: string): EnvCheck => ({ ok: false, reason })
 const YES: EnvCheck = { ok: true }
 
 export interface RepoEnvOptions {
+  /** raindown-home：给出时也接受本任务的独立 clone（`run/tasks/<任务>/repo`，按节点记录核对）。 */
+  home?: string
   /** workspace 登记的仓库路径（节点本地）；命令目录必须属于其中之一。 */
   registeredRepos: readonly string[]
   /** 租约开始时对登记仓库的快照；推送与 gh 检查都与它比对，缺失即不通过。 */
@@ -199,9 +201,9 @@ const single = (out: string | undefined): string | undefined => {
 /** 校验 gitdir 并创建安全 git；不通过时返回原因。 */
 async function open(
   cwd: string,
-  o: Pick<RepoEnvOptions, 'registeredRepos' | 'run' | 'env' | 'timeoutMs'>,
+  o: Pick<RepoEnvOptions, 'registeredRepos' | 'home' | 'run' | 'env' | 'timeoutMs'>,
 ): Promise<{ ok: true; loc: GitLocation; git: SafeGit } | { ok: false; reason: string }> {
-  const loc = await verifyGitLocation(cwd, o.registeredRepos)
+  const loc = await verifyGitLocation(cwd, o.registeredRepos, o.home ? { home: o.home } : {})
   if (!loc.ok) return loc
   return {
     ok: true,
@@ -220,7 +222,7 @@ async function open(
  */
 export async function snapshotRepo(
   repo: string,
-  o: Pick<RepoEnvOptions, 'registeredRepos' | 'run' | 'env' | 'timeoutMs'>,
+  o: Pick<RepoEnvOptions, 'registeredRepos' | 'home' | 'run' | 'env' | 'timeoutMs'>,
 ): Promise<RepoSnapshot | undefined> {
   const r = await snapshotRepoResult(repo, o)
   return r.ok ? r.snapshot : undefined
@@ -229,7 +231,7 @@ export async function snapshotRepo(
 /** 同 `snapshotRepo`，采不到时给出原因（供日志）。 */
 export async function snapshotRepoResult(
   repo: string,
-  o: Pick<RepoEnvOptions, 'registeredRepos' | 'run' | 'env' | 'timeoutMs'>,
+  o: Pick<RepoEnvOptions, 'registeredRepos' | 'home' | 'run' | 'env' | 'timeoutMs'>,
 ): Promise<{ ok: true; snapshot: RepoSnapshot } | { ok: false; reason: string }> {
   const opened = await open(repo, o)
   if (!opened.ok) return { ok: false, reason: opened.reason }
@@ -389,7 +391,7 @@ const STATUS_MAX = 200
  */
 export async function computeDiffStat(
   cwd: string,
-  o: Pick<RepoEnvOptions, 'registeredRepos' | 'run' | 'env' | 'timeoutMs'>,
+  o: Pick<RepoEnvOptions, 'registeredRepos' | 'home' | 'run' | 'env' | 'timeoutMs'>,
 ): Promise<string | undefined> {
   const opened = await open(cwd, o)
   if (!opened.ok) return undefined
@@ -454,7 +456,7 @@ export async function nodeEnvReport(
 ): Promise<NodeEnvReport> {
   const report: NodeEnvReport = {}
   try {
-    const loc = await verifyGitLocation(cwd, o.registeredRepos)
+    const loc = await verifyGitLocation(cwd, o.registeredRepos, o.home ? { home: o.home } : {})
     // gitdir 不指向登记仓库：不上报执行目录，环境字段判为不通过（只对推送 / gh 命令上报）。
     if (loc.ok) report.command_cwd = loc.workTree
     if (command === undefined) return report

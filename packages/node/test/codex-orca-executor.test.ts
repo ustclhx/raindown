@@ -45,6 +45,7 @@ import {
   tuiFixture,
 } from './codex-orca-helpers.ts'
 import { bench, ManualClock } from './harness.ts'
+import { initTestRepo } from './sealed-helpers.ts'
 import { waitFor as until } from './wait.ts'
 
 /**
@@ -2277,12 +2278,17 @@ describe('PR 直通的输入（harness-neutral 8.4）', () => {
 
 describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
   const HUB = 'http://127.0.0.1:7477'
-  const on = (home: OrcaHome): SeatbeltOptions => ({
-    enforce: true,
-    platform: 'darwin',
-    userHome: join(home.root, 'user'),
-    env: {},
-  })
+  // 施加时写类角色在本任务的独立 clone 中运行（审查第一轮，第一步方案）：登记仓库先变成 git 仓库（临时 HOME）。
+  const gitEnvs = new Map<string, NodeJS.ProcessEnv>()
+  const on = (home: OrcaHome): SeatbeltOptions => {
+    let gitEnv = gitEnvs.get(home.repo)
+    if (!gitEnv) {
+      gitEnv = initTestRepo(home.repo)
+      gitEnvs.set(home.repo, gitEnv)
+    }
+    return { enforce: true, platform: 'darwin', userHome: join(home.root, 'user'), env: {}, gitEnv }
+  }
+  const cloneOf = (home: OrcaHome) => join(home.home, 'run/tasks/t-orca-1/repo')
   const created = (s: Started) =>
     s.orca.ops('terminalCreate').map((c) => (c.input as { command: string }).command)
   /** 把临时目录换成占位符，便于快照。 */
@@ -2306,21 +2312,9 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
     expect(state).not.toHaveProperty('isolation_layer')
     await s.run.cancel()
   })
-
-  test('开关打开、bypass：sandbox-exec 只包住 codex，任务说明仍由外层 shell 读取', async () => {
+  test('开关打开、bypass：在独立 clone 中启动，Orca worktree 只作终端宿主；sandbox-exec 只包住 codex，任务说明仍由外层 shell 读取', async () => {
     const home = orcaHome()
     const leaseTokenFile = await token(home, 'l-1')
-    // 对照：另一个临时 home 中开关关闭时的命令（令牌路径按各自的 home 归一）。
-    const offHome = orcaHome()
-    const off = await start({}, (o) => o.show('working'), {
-      home: offHome,
-      leaseTokenFile: await token(offHome, 'l-1'),
-      hubUrl: HUB,
-    })
-    await ready(off)
-    await off.run.cancel()
-    const offCommand = norm(created(off)[0], offHome)
-    rmSync(offHome.root, { recursive: true, force: true })
     const s = await start({}, (o) => o.show('working'), {
       home,
       leaseTokenFile,
@@ -2330,25 +2324,42 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
     await ready(s)
     const [command] = created(s)
     const profile = join(home.home, 'state/tasks/t-orca-1/isolation.sb')
+    const clone = realpathSync(cloneOf(home))
     expect(norm(command, home)).toMatchSnapshot()
-    // 顺序：exec env … CODEX_HOME=… /usr/bin/sandbox-exec -f <配置> codex … "$(cat spec.md)"
+    // 顺序：cd <独立 clone> && exec env … CODEX_HOME=… /usr/bin/sandbox-exec -f <配置> codex … "$(cat spec.md)"
+    expect(command).toStartWith(`cd ${clone} && exec env `)
     const sandboxAt = command?.indexOf(`/usr/bin/sandbox-exec -f ${profile} codex `) ?? -1
     expect(sandboxAt).toBeGreaterThan(command?.indexOf('CODEX_HOME=') ?? Infinity)
     expect(command?.indexOf('exec env ')).toBeLessThan(sandboxAt)
     expect(command?.indexOf('"$(cat ')).toBeGreaterThan(sandboxAt)
     expect(command).toEndWith(`"$(cat ${join(home.home, 'state/tasks/t-orca-1/spec.md')})"`)
-    // 去掉前缀后与开关关闭时的命令相同（只多了 sandbox-exec -f <配置>）。
-    expect(norm(command?.replace(`/usr/bin/sandbox-exec -f ${profile} `, ''), home)).toBe(
-      offCommand,
+    // 独立的 CODEX_HOME（H3）、按任务私有的临时目录（M2）、预置项目信任（M6）。
+    expect(command).toContain(
+      `CODEX_HOME=${join(home.home, 'run/executors/codex-orca/codex-home-sealed')} `,
+    )
+    expect(command).toContain(`TMPDIR=${join(home.home, 'run/tasks/t-orca-1/tmp')} `)
+    expect(command).toContain(`-c 'projects={"${clone}"={trust_level="trusted"}}'`)
+    // 终端仍开在 Orca worktree（宿主）；Orca 的 setup 跳过，setup 在独立 clone 中运行。
+    const createInput = s.orca.ops('terminalCreate')[0]?.input as { worktreePath: string }
+    expect(createInput.worktreePath).toBe(home.worktree)
+    expect((s.orca.ops('worktreeCreate')[0]?.input as { setup?: string } | undefined)?.setup).toBe(
+      'skip',
     )
     expect(lstatSync(profile).mode & 0o777).toBe(0o600)
     const text = readFileSync(profile, 'utf8')
-    expect(text).toContain(`(subpath ${JSON.stringify(realpathSync(home.worktree))})`)
+    expect(text).toContain(`(subpath ${JSON.stringify(join(clone, '.git'))})`)
+    expect(text).toContain(`(subpath ${JSON.stringify(join(clone, '.git', 'config'))})`)
+    expect(text).toContain(`(subpath ${JSON.stringify(join(realpathSync(home.repo), '.git'))})`)
     expect(text).toContain(`(subpath ${JSON.stringify(realpathSync(leaseTokenFile))})`)
     const state = JSON.parse(
       readFileSync(join(home.home, 'state/tasks/t-orca-1/orca.json'), 'utf8'),
     )
-    expect(state.isolation_layer).toBe('seatbelt')
+    expect(state).toMatchObject({
+      isolation_layer: 'seatbelt',
+      layout: 'sealed',
+      worktree_path: clone,
+      host_worktree: home.worktree,
+    })
     await s.run.cancel()
   })
 
@@ -2369,7 +2380,7 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
     await s.run.cancel()
   })
 
-  test('开关打开：升级前（未隔离）启动的终端不重新挂接，按无法恢复处理', async () => {
+  test('开关打开：升级前（共享 worktree、未隔离）启动的终端关闭，迁移到独立 clone 后以隔离方式重启', async () => {
     const first = await start({}, (o) => o.show('question'))
     await ready(first)
     const home = h
@@ -2380,19 +2391,44 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
       isolation: on(home),
     })
     await ready(second)
-    expect(second.outcome()).toMatchObject({
-      ok: true,
-      data: { outcome: 'failed', result: { reason: 'isolation_not_applied' } },
-    })
-    expect(second.orca.ops('terminalCreate')).toEqual([])
-    expect(sends(second)).toEqual([])
-    // 审查第一轮 L1：顺手关闭该终端，下次派工以隔离方式重启。
+    expect(second.outcome()).toBeUndefined()
     expect(second.orca.ops('terminalClose')).toHaveLength(1)
+    expect(created(second)[0]).toContain('/usr/bin/sandbox-exec -f ')
     const state = JSON.parse(
       readFileSync(join(home.home, 'state/tasks/t-orca-1/orca.json'), 'utf8'),
     )
-    expect(state).not.toHaveProperty('handle')
+    expect(state).toMatchObject({
+      layout: 'sealed',
+      isolation_layer: 'seatbelt',
+      worktree_path: realpathSync(cloneOf(home)),
+      host_worktree: home.worktree,
+    })
     await first.run.cancel()
+    await second.run.cancel()
+  })
+
+  test('开关关闭后再次运行（回滚）：任务分支取回登记仓库，独立 clone 删除，回到 Orca worktree', async () => {
+    const home = orcaHome()
+    const first = await start({}, (o) => o.show('question'), {
+      home,
+      hubUrl: HUB,
+      isolation: on(home),
+    })
+    await ready(first)
+    await first.run.cancel()
+    expect(existsSync(cloneOf(home))).toBe(true)
+    const second = await start({}, (o) => o.show('question'), { home, hubUrl: HUB })
+    await ready(second)
+    expect(second.outcome()).toMatchObject({
+      ok: true,
+      data: { outcome: 'failed', result: { reason: 'isolation_layout_changed' } },
+    })
+    expect(existsSync(cloneOf(home))).toBe(false)
+    const state = JSON.parse(
+      readFileSync(join(home.home, 'state/tasks/t-orca-1/orca.json'), 'utf8'),
+    )
+    expect(state.worktree_path).toBe(home.worktree)
+    expect(state).not.toHaveProperty('layout')
   })
 
   test('开关打开：派工绑定已变化的未隔离旧终端关闭后以隔离方式重启（审查第一轮 L1）', async () => {

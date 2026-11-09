@@ -99,9 +99,6 @@ export interface IsolationProbeOptions {
   resolveOrcaPorts?: () => Promise<number[]> | number[]
   /** `config/node.yaml` 的 `isolation.extra_write`（与 worker 的隔离清单一致）。 */
   extraWrite?: readonly string[]
-  /** 写白名单中的临时目录、缓存目录（测试注入；缺省与 worker 相同）。 */
-  tmpDirs?: readonly string[]
-  cacheDirs?: readonly string[]
   launchWrapper?: ProbeLaunchWrapper
   /** 子进程的可执行文件（缺省为当前运行时，即 bun）。 */
   execPath?: string
@@ -118,37 +115,39 @@ const PROBE_LEASE = 'isolation-probe'
 /** 改名探针的临时目录名（位于探针临时任务目录下）。 */
 const RENAME_PROBE_DIR = 'rename-probe'
 /**
- * 写白名单探针（tasks 4.6）的临时目录 `run/isolation-probe-<hex>/`：位于写白名单之外（不在本任务私有目录、临时目录内），
- * 其中有模拟的用户主目录 `home/` 与模拟的登记仓库 `repo/.git`（探针工作目录是它的 linked worktree）。结束即删除。
+ * 写白名单探针（tasks 4.6、审查第一轮）的临时目录 `run/isolation-probe-<hex>/`：位于写白名单之外（不在本任务私有目录内），
+ * 其中有模拟的用户主目录 `home/` 与模拟的登记仓库 `repo/.git`。探针工作目录造成独立 clone 的形状（`.git` 是真实目录，
+ * `objects/info/alternates` 指向模拟登记仓库的对象库），按与 worker 相同的规则计算白名单。结束即删除。
  */
 export const PROBE_SCRATCH_PREFIX = 'isolation-probe-'
-const PROBE_WORKTREE = 'probe'
 
-/**
- * 造一个最小的模拟仓库（不运行 git）：`repo/.git/{HEAD,config,hooks/,objects/,refs/heads/,worktrees/probe/}`，
- * 并把 `cwd/.git` 写成指向 `worktrees/probe` 的指针文件，使隔离清单按 linked worktree 计算 git 写规则。
- */
-async function buildProbeRepo(scratch: string, cwd: string) {
-  const common = join(scratch, 'repo', '.git')
-  const wt = join(common, 'worktrees', PROBE_WORKTREE)
-  for (const d of [
-    join(common, 'hooks'),
-    join(common, 'objects'),
-    join(common, 'refs', 'heads'),
-    wt,
-  ])
+/** 最小的 git 目录（不运行 git）：`HEAD`、`config`、`hooks/`、`objects/`、`refs/heads/`。 */
+async function fakeGitDir(dir: string) {
+  for (const d of [join(dir, 'hooks'), join(dir, 'objects', 'info'), join(dir, 'refs', 'heads')])
     await mkdir(d, { recursive: true, mode: 0o700 })
-  await writeFile(join(common, 'HEAD'), 'ref: refs/heads/main\n', { mode: 0o600 })
-  await writeFile(join(common, 'config'), '[core]\n\trepositoryformatversion = 0\n', {
+  await writeFile(join(dir, 'HEAD'), 'ref: refs/heads/main\n', { mode: 0o600 })
+  await writeFile(join(dir, 'config'), '[core]\n\trepositoryformatversion = 0\n', {
     mode: 0o600,
   })
-  await writeFile(join(wt, 'HEAD'), 'ref: refs/heads/probe\n', { mode: 0o600 })
-  await writeFile(join(wt, 'commondir'), '../..\n', { mode: 0o600 })
-  await writeFile(join(wt, 'gitdir'), `${join(cwd, '.git')}\n`, { mode: 0o600 })
-  await writeFile(join(cwd, '.git'), `gitdir: ${wt}\n`, { mode: 0o600 })
+}
+
+/** 模拟登记仓库 `scratch/repo` 与独立 clone 形状的探针工作目录 `cwd`。 */
+async function buildProbeRepo(scratch: string, cwd: string) {
+  const repo = join(scratch, 'repo')
+  await fakeGitDir(join(repo, '.git'))
+  await fakeGitDir(join(cwd, '.git'))
+  await writeFile(
+    join(cwd, '.git', 'objects', 'info', 'alternates'),
+    `${join(repo, '.git', 'objects')}\n`,
+    { mode: 0o600 },
+  )
   return {
-    gitHookFile: join(common, 'hooks', 'post-checkout'),
-    gitObjectsDir: join(common, 'objects'),
+    repo,
+    plan: {
+      gitHookFile: join(cwd, '.git', 'hooks', 'post-checkout'),
+      gitObjectsDir: join(cwd, '.git', 'objects'),
+      registeredGitObjectsDir: join(repo, '.git', 'objects'),
+    },
   }
 }
 
@@ -179,6 +178,9 @@ export function probeTargets(executors: readonly ExecutorInfo[]): ProbeTarget[] 
 
 /** 与执行器实际使用的 CODEX_HOME 子目录一致（codex-exec 的只读角色单独一个目录）。 */
 function executorHomeFor(target: ProbeTarget): string | undefined {
+  // 施加外层 seatbelt 的设置（danger-full-access）使用独立的 CODEX_HOME（审查第一轮 H3）。
+  if (target.setting === 'danger-full-access' && target.executor.startsWith('codex-'))
+    return 'codex-home-sealed'
   if (target.executor === 'codex-exec')
     return target.setting === 'read-only' ? 'codex-read-home' : 'codex-home'
   if (target.executor === 'codex-orca') return 'codex-home'
@@ -386,8 +388,9 @@ async function runOne(
       ...(o.resolveOrcaPorts ? { resolveOrcaPorts: o.resolveOrcaPorts } : {}),
       ...(o.env ? { env: o.env } : {}),
       ...(o.extraWrite ? { extraWrite: o.extraWrite } : {}),
-      ...(o.tmpDirs ? { tmpDirs: o.tmpDirs } : {}),
-      ...(o.cacheDirs ? { cacheDirs: o.cacheDirs } : {}),
+      // 模拟登记仓库的 .git 整体只读；探针工作目录按独立 clone 计算（写类角色时其 .git 可写）。
+      registeredRepos: [repo.repo],
+      sealedClone: cwd,
     })
     if (!spec.ok) return failed(spec.error.code, spec.error.message)
     const probeSpec: IsolationSpec = {
@@ -410,7 +413,8 @@ async function runOne(
       hubUrl: o.hubUrl,
       orcaSockets: shared.sockets,
       shellStartupFile,
-      ...repo,
+      ...repo.plan,
+      sharedTmp: await realpath(tmpdir()),
     })
     const wrap = o.launchWrapper ?? identityLaunchWrapper
     const argv = await wrap(target, [o.execPath ?? process.execPath, PROBE_CHILD_SCRIPT], {

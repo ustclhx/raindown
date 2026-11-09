@@ -30,7 +30,7 @@
 ## Decisions
 
 ### D1. 统一的隔离描述，适配器选择施加层
-节点为每次派工生成 `IsolationSpec{deny_read[], deny_write[], allow_read[], allow_write[], allow_unix_sockets[], allow_local_ports[]}`。写入是白名单（4.6，见 D2）：`allow_write`（子树）与 `allow_write_literals`（单个文件）就是全部可写位置，`write_carve_outs*` 在其中再挖掉登记仓库的 git 目录与 harness 配置，`allow_write_git*` 再放行 worktree 必需的 git 部分；`deny_*` 受保护项最后写入，白名单不能重新放开它们。路径一律规范化为 realpath，这是正确性前提而不只是整洁：seatbelt 按真实路径匹配，未规范化的规则（例如 `/var/…` 而真实路径是 `/private/var/…`）会静默不生效。规范化在生成配置时做，不存在的路径按其最近的已存在祖先规范化后拼回。适配器把它落到三种施加层之一：
+节点为每次派工生成 `IsolationSpec{deny_read[], deny_write[], allow_read[], allow_write[], allow_unix_sockets[], allow_local_ports[]}`。写入是白名单（4.6，见 D2）：`allow_write`（子树）、`allow_write_literals`（单个文件）与 `allow_write_regex` 就是全部可写位置，`write_carve_outs*` 在其中再挖掉登记仓库的 git 目录与 harness 配置，`allow_write_git` 再放行本任务独立 clone 的 `.git`；`deny_*` 受保护项与 `deny_write_except`（持久化位置）最后写入，白名单不能重新放开它们。路径一律规范化为 realpath，这是正确性前提而不只是整洁：seatbelt 按真实路径匹配，未规范化的规则（例如 `/var/…` 而真实路径是 `/private/var/…`）会静默不生效。规范化在生成配置时做，不存在的路径按其最近的已存在祖先规范化后拼回。适配器把它落到三种施加层之一：
 - **外层 seatbelt**：用于 harness 自带 OS 沙箱关闭的情况（danger-full-access、bypass）。节点生成 SBPL 配置，用 `sandbox-exec -f` 启动 harness。配置以 `allow default` 为基础（读、网络、进程等不改变），紧接着 `(deny file-write*)` 把写入改为白名单（4.6），显式 deny 受保护资源。
 - **harness 原生的读限制**：用于 harness 自带沙箱开启、无法嵌套的情况。1.1 实测结论：
   - Codex 支持：Raindown 在其管理的 CODEX_HOME 中生成 permissions profile，受保护路径写 `"deny"`，启动时不传 `-s`，改传 `-c default_permissions=<name>`。声明为 `native`。
@@ -64,17 +64,41 @@
 - 适配器声明的 harness 目录，例如 Raindown 管理的 CODEX_HOME，以及 Codex/Claude 登录所需的路径；
 - 中枢监听的本机端口；其余本机端口不默认拒绝（worker 自己起的 dev server、测试服务器需要可用），只拒绝上面解析出的 Orca 端口等已知控制端口。
 
-**写入白名单（4.6，用户 2026-11-09 决定）。** 读取保持 `allow default` 加显式拒绝；写入默认拒绝，只放行（全部 realpath，按适配器与角色计算）：
-- 本任务工作目录（写类角色；只读角色仍以写拒绝表示）与本任务私有目录 `run/tasks/<任务>/`（派工令牌与 `dispatch-tokens/` 仍写拒绝）；
-- 适配器声明的 harness 可写目录：codex 为 Raindown 管理的 CODEX_HOME（`config.toml`、`rules/`、`hooks.json`、`AGENTS*.md`、`skills/`、`plugins/`、`prompts/` 除外）及其 `auth.json` 链接目标这一个文件；
-  claude-sdk 为 Raindown 管理的 Claude Code 配置目录 `run/executors/claude-sdk/claude-config/`（`CLAUDE_CONFIG_DIR`；`settings*.json`、`commands|agents|skills|hooks|plugins|rules|output-styles`、`CLAUDE.md` 等除外）。
-  用户自己的 `~/.claude`、`~/.claude.json` 不可写：其中的 shell 快照、项目记忆、MCP 与 hooks 配置会被用户自己（沙箱外）的 Claude Code 加载或执行；
-- 临时目录 `/private/tmp`、本用户 `TMPDIR` 及同级 `C/`（`/private/tmp/claude-<uid>` 除外，属于用户自己的 Claude Code 会话）；设备文件（`/dev/null`、`/dev/tty`、`/dev/ttys<N>`、`/dev/fd/` 等）；
-- 常见缓存子目录（`~/.cache`、`~/Library/Caches`、`~/.bun/install/cache`、`~/.npm/_cacache` 与 `_logs`、pnpm store）与钥匙串文件目录 `~/Library/Keychains`（凭证刷新）；
-- 登记仓库 `.git` 中 worktree 必需的部分：`objects/`、`refs/`、`logs/`、本 worktree 的 `worktrees/<自己>/`（`commondir`、`gitdir`、`config.worktree` 除外）、`packed-refs` 与 `gc.pid` 等锁文件、其他 worktree 的 `HEAD.lock` 与 reflog（`git gc` 的 reflog expire）；主 worktree 时还有 `HEAD`、`index` 等每个 worktree 的状态文件。`hooks/`、`config`、`info/`、`modules/` 与其他 worktree 的其余内容不可写；
-- 节点配置 `isolation.extra_write` 显式追加的目录（绝对路径，不能是受保护路径、持久化位置、用户主目录或其祖先）。
+**写入白名单（4.6，用户 2026-11-09 决定；PR #99 第一轮审查后修订）。** 读取保持 `allow default` 加显式拒绝。写入默认拒绝，只放行以下位置（全部 realpath，按适配器与角色计算）：
+- **工作目录**：写类角色是本任务的**独立 clone** `run/tasks/<任务>/repo/`（见下）；只读角色的工作目录仍以写拒绝表示。
+- **本任务私有目录** `run/tasks/<任务>/`：其中有按任务私有的 `tmp/` 与 `cache/`。worker 的 `TMPDIR` 与 bun、npm、pnpm、Playwright、corepack、pre-commit、go、pip、uv 的缓存环境变量都指到这里，执行结束（codex-orca 为任务完成或取消）时删除。派工令牌与 `dispatch-tokens/` 仍写拒绝。
+- **适配器声明的 harness 可写目录**：
+  - codex 使用施加时专用的独立 CODEX_HOME `run/executors/<执行器>/codex-home-sealed/`，与无外层 seatbelt 的设置不共享。它内部也是白名单：只放行 `sessions/`、`archived_sessions/`、`log/`、`cache/`、`tmp/`、`history.jsonl`、`version.json`、`internal_storage.json` 与 `*.sqlite*`。`auth.json` 链接本身拒绝写，链接目标这一个文件可写。
+  - claude-sdk 使用按任务的 Claude Code 配置目录 `run/tasks/<任务>/claude-config/`（`CLAUDE_CONFIG_DIR`），其中 `settings*.json`、`commands|agents|skills|hooks|plugins|rules|output-styles`、`CLAUDE.md` 等不可写；另放行登录钥匙串文件 `login.keychain-db` 及其 `.sb-*` 临时文件（OAuth 刷新）。
+  - 用户自己的 `~/.claude`、`~/.claude.json` 不可写：其中的 shell 快照、项目记忆、MCP 与 hooks 配置会被用户自己（沙箱外）的 Claude Code 加载或执行。
+- **设备文件**：`/dev/null`、`/dev/tty`、`/dev/ttys<N>`、`/dev/fd/` 等。
+- **追加**：节点配置 `isolation.extra_write` 显式追加的目录。只接受绝对路径，比较时大小写折叠并做 NFD；不能与以下位置互相包含：受保护路径、持久化位置、登记仓库、`PATH` 中的目录、`~/Library/Application Support`、用户主目录。
 
-SBPL 中的顺序：`(allow default)` → `(deny file-write*)` → 白名单放行 → 白名单内再挖掉（git 目录、`.git` 指针文件、harness 配置）→ git 必需部分放行 → 受保护项拒绝 → 受保护路径与挖掉位置的祖先目录 literal 写拒绝。后写的规则优先，所以白名单不能重新放开受保护项。
+共享的临时与缓存目录（`/private/tmp`、`TMPDIR` 及其 `C/`、`~/.cache`、`~/Library/Caches`、`~/.bun/install/cache`、`~/.npm/_cacache`、pnpm store）**不放行**：其中的内容会被之后沙箱外的安装与运行直接使用（审查第一轮 M2）。
+
+**独立 clone（第一步方案，审查第一轮 H1、H2、M4）。** 写类角色不再与登记仓库共享 commondir。
+- 节点在沙箱外 `git clone --shared --no-checkout`：对象经 alternates 只读引用登记仓库，不用会硬链接对象的 `--local`。`isolation.dissociate` 打开时改为完整复制。
+- `origin` 指向登记仓库的远端，worker 直接推送。
+- 节点写入 `.git/config`（任务分支的上游、`push.default=current`、`core.logAllRefUpdates=false`），并在 `state/` 下记录其 sha256。
+- 全部登记仓库的 `.git` 对 worker 整体只读。clone 的 `.git` 可写，但 `config`、`hooks/`、`info/`、`modules/`、`objects/info/alternates` 除外。
+- 节点在 clone 中只做只读的安全 git，每次运行前核对 config 的 sha256。
+- codex-orca 的 Orca worktree 只作终端宿主（`--setup skip`），setup 在 clone 中、以 worker 的 seatbelt 配置运行。
+- 迁移：旧布局的任务从登记仓库中的同名分支建立 clone。回滚：先把任务分支快进取回登记仓库，不能快进时取到 `raindown/recovered/<任务>`，再删除 clone。
+
+**持久化位置与外部启动。** 持久化位置（shell 启动文件、`~/.gitconfig`、`~/.ssh`、`~/.local/bin` 等）在白名单之后整体拒绝写，作为纵深防御。另加 `(deny job-creation)`、`(deny user-preference-write)`、`(deny lsopen)`、`(deny appleevent-send)`。
+
+SBPL 中的顺序：
+1. `(allow default)`
+2. `(deny file-write*)`
+3. 白名单放行
+4. 白名单内再挖掉：登记仓库与工作目录所属仓库的 git 目录、`.git` 指针文件、harness 配置
+5. 放行独立 clone 的 `.git`
+6. 受保护项拒绝
+7. 持久化位置拒绝
+8. 受保护路径与挖掉位置的祖先目录 literal 写拒绝
+9. 控制通道、调试、派生任务等拒绝
+
+后写的规则优先，所以白名单不能重新放开受保护项。
 
 seatbelt 的规则后者优先，允许项写得最窄（具体文件，而不是整个私有目录）。
 
@@ -124,15 +148,20 @@ seatbelt 的规则后者优先，允许项写得最窄（具体文件，而不�
   - `~/Library/LaunchAgents`（已拒绝）。
 
   → 4.6 已采用写入白名单（用户 2026-11-09 决定，见 D2）：上述位置都不在白名单内；探针新增必过项 `write.shell_startup`
-  （探针自建临时 home 中的模拟 `.zshenv`）与 `write.git_hooks`（探针自建临时仓库的 `.git/hooks/`）。
-- [白名单内仍有会被沙箱外进程执行的内容（4.6 残留）] 缓存目录本身就是持久化通道：`~/.bun/install/cache`、`~/Library/Caches`
-  （例如 Playwright 浏览器）、`~/.cache` 中的包或二进制会被之后沙箱外的安装、运行直接使用；临时目录 `/private/tmp`、`TMPDIR` 中
-  沙箱外进程随后执行的脚本同理。CODEX_HOME 与 Claude 隔离配置目录中的会话记录可被改写（提示注入，不是命令执行）；
-  claude-sdk 隔离配置目录中的 `.claude.json`（含按项目的 MCP 配置）可写，但只被之后同样受隔离的 claude-sdk 会话加载。
-  → 按需从白名单移除或改为任务私有的缓存目录（`isolation.extra_write` 只能追加，不能移除缺省项）；写入文档。
-- [写白名单误伤 harness 或工具链] 例如 Codex 写 `config.toml` 记录项目信任、工具写 `~/Library/Application Support/<工具>`、
-  `git checkout -b x origin/main` 与 `git push -u` 写上游配置（`.git/config`）。→ 4.5 验收时按失败追加 `isolation.extra_write`
-  或调整适配器声明；`.git/config` 与 harness 配置不放行。
+  （探针自建临时 home 中的模拟 `.zshenv`）、`write.git_hooks`（独立 clone 形状的探针工作目录的 `.git/hooks/`）与 `write.registered_git`（模拟登记仓库的 `.git`）。
+- [写白名单内仍可被利用的位置（4.6 与审查第一轮后的残留）]
+  - **auth.json**：worker 可以经链接改写用户的 `~/.codex/auth.json`（换成攻击者账号的凭证）。Codex 在进程内刷新凭证且刷新令牌会轮换，改由节点刷新目前不可行。
+  - **登录钥匙串**：claude-sdk 下 worker 可以损坏或替换 `login.keychain-db`。
+  - **偏好设置**：经 cfprefsd 的偏好设置写入拦不住，例如终端应用的启动命令（`user-preference-write` 实测无效）；拒绝 cfprefsd 的 mach-lookup 可能影响 `security`，未验证。
+  - **会话记录**：独立 CODEX_HOME 与按任务的 Claude 配置目录中的会话记录可被改写（提示注入，不是命令执行）。
+  - **手动运行 git**：用户在任务 clone 中手动运行 git 时，git 会跟随 worker 预埋在 `.git` 中的符号链接写入（例如 `COMMIT_EDITMSG`、已有的 reflog）。
+  → 写入文档；4.5 验收后按实际情况决定是否进一步收紧。
+- [写白名单误伤 harness 或工具链]
+  - **工具写不了自己的目录**：例如写 `~/Library/Application Support/<工具>`。
+  - **git 写配置失败**：设置其他分支的上游、husky 写 `core.hooksPath`。
+  - **冷缓存**：按任务的冷缓存使安装变慢。
+  - **SSH known_hosts**：首次连接新的 SSH 主机时 `known_hosts` 不可写（不预置，记为限制）。
+  → 4.5 验收时，优先用环境变量把工具缓存指到任务私有目录，或用 `isolation.extra_write` 追加具体子目录；`.git/config` 与 harness 配置不放行。
 
 ## Migration Plan
 

@@ -38,15 +38,19 @@ const SPEC: IsolationSpec = {
     { dir: '/Users/u/raindown-home/run/tasks', keep: '/Users/u/raindown-home/run/tasks/t-1' },
   ],
   allow_read: ['/Users/u/raindown-home/run/tasks/t-1/dispatch-tokens/l-1.token', '/Users/u/work'],
-  allow_write: ['/Users/u/work', '/Users/u/.cache', '/private/tmp'],
+  allow_write: ['/Users/u/work', '/Users/u/raindown-home/run/tasks/t-1'],
   allow_write_literals: ['/dev/null', '/Users/u/.codex/auth.json'],
   write_carve_outs: [
     '/Users/u/repo/.git',
     '/Users/u/raindown-home/run/executors/codex-exec/codex-home/config.toml',
   ],
   write_carve_out_literals: ['/Users/u/work/.git'],
-  allow_write_git: ['/Users/u/repo/.git/objects', '/Users/u/repo/.git/worktrees/work'],
-  allow_write_git_literals: ['/Users/u/repo/.git/packed-refs'],
+  allow_write_regex: ['^/Users/u/Library/Keychains/login\\.keychain-db(\\.sb-[^/]+)?$'],
+  allow_write_git: ['/Users/u/clone/.git'],
+  deny_write_except: [
+    { path: '/Users/u/.codex', except: ['/Users/u/.codex/auth.json'] },
+    { path: '/Users/u/.zshenv', except: [] },
+  ],
   deny_unix_sockets: ['/Users/u/Library/Application Support/orca'],
   allow_unix_sockets: [],
   allow_local_ports: [7477],
@@ -70,8 +74,10 @@ describe('SBPL 生成', () => {
     expect(r.data.indexOf('(deny file-read*')).toBeGreaterThan(protectedStart)
     // 挖掉的 git 目录在白名单放行之后、git 必需部分放行之前。
     const carve = r.data.indexOf('(subpath "/Users/u/repo/.git")')
-    expect(carve).toBeGreaterThan(r.data.indexOf('(subpath "/private/tmp")'))
-    expect(carve).toBeLessThan(r.data.indexOf('(subpath "/Users/u/repo/.git/objects")'))
+    expect(carve).toBeGreaterThan(
+      r.data.indexOf('(subpath "/Users/u/raindown-home/run/tasks/t-1")'),
+    )
+    expect(carve).toBeLessThan(r.data.indexOf('(subpath "/Users/u/clone/.git")'))
     expect(r.data).toContain('(regex #"^/dev/ttys[0-9]+$")')
     expect(r.data).toContain('(literal "/Users/u/work/.git")')
     expect(r.data.startsWith(';;')).toBe(true)
@@ -90,7 +96,8 @@ describe('SBPL 生成', () => {
       write_carve_outs: [],
       write_carve_out_literals: [],
       allow_write_git: [],
-      allow_write_git_literals: [],
+      allow_write_regex: [],
+      deny_write_except: [],
       deny_read: [],
     })
     if (!r.ok) throw new Error(r.error.message)
@@ -98,7 +105,11 @@ describe('SBPL 生成', () => {
     expect(r.data).not.toContain('localhost:*')
     // 没有过滤器的 (deny file-read*) 会拒绝一切：绝不能出现。唯一的例外是有意的默认写拒绝（写白名单），恰好一行。
     expect(r.data.match(/^\(deny file-write\*\)$/gm)).toHaveLength(1)
-    const rules = r.data.replace('(allow default)', '').replace('(deny file-write*)\n', '')
+    const rules = r.data
+      .replace('(allow default)', '')
+      .replace('(deny file-write*)\n', '')
+      // 第 7 节的拒绝项（派生任务、偏好设置等）本身就是不带过滤器的整体拒绝。
+      .replace(/^\(deny (?:job-creation|user-preference-write|lsopen|appleevent-send)\)$/gm, '')
     expect(rules).not.toMatch(/^\((?:allow|deny) [a-z*-]+(?: [a-z*-]+)*\)$/m)
     expect(rules).not.toContain('(allow file-write*')
   })
@@ -127,12 +138,27 @@ describe('SBPL 生成', () => {
       'write_carve_outs',
       'write_carve_out_literals',
       'allow_write_git',
-      'allow_write_git_literals',
     ] as const) {
       const w = renderSeatbeltProfile({ ...SPEC, [key]: [evil] })
       if (!w.ok) throw new Error(w.error.message)
       expect(w.data.match(/^\(allow default\)$/gm)).toHaveLength(1)
       expect(w.data).toContain(lit)
+    }
+    for (const deny_write_except of [
+      [{ path: evil, except: [] }],
+      [{ path: '/x', except: [evil] }],
+    ]) {
+      const w = renderSeatbeltProfile({ ...SPEC, deny_write_except })
+      if (!w.ok) throw new Error(w.error.message)
+      expect(w.data.match(/^\(allow default\)$/gm)).toHaveLength(1)
+      expect(w.data).toContain(lit)
+    }
+  })
+
+  test('正则过滤器：含双引号、控制字符或不以 ^/ 开头时拒绝生成（审查第一轮）', () => {
+    for (const bad of ['^/a"b', '^/a\nb', 'a', '/a']) {
+      const r = renderSeatbeltProfile({ ...SPEC, allow_write_regex: [bad] })
+      expect(!r.ok && r.error.code).toBe('isolation_profile_invalid_path')
     }
   })
 
@@ -153,7 +179,9 @@ describe('SBPL 生成', () => {
       { ...SPEC, write_carve_outs: [evil] },
       { ...SPEC, write_carve_out_literals: [evil] },
       { ...SPEC, allow_write_git: [evil] },
-      { ...SPEC, allow_write_git_literals: [evil] },
+      { ...SPEC, deny_write_except: [{ path: evil, except: [] }] },
+      { ...SPEC, deny_write_except: [{ path: '/x', except: [evil] }] },
+      { ...SPEC, allow_write_regex: [`^${evil}`] },
     ]) {
       const r = renderSeatbeltProfile(spec)
       expect(r.ok).toBe(false)
@@ -187,8 +215,7 @@ async function fakeHome(weird: boolean) {
     join(userHome, '.config/sops/age'),
     join(userHome, 'Library/LaunchAgents'),
     join(home, 'run/executors/codex-exec/codex-home'),
-    join(base, 'tmp'),
-    join(userHome, '.cache'),
+    join(home, 'run/tasks/t-1/tmp'),
     cwd,
   ])
     await mkdir(d, { recursive: true })
@@ -213,9 +240,6 @@ async function fakeHome(weird: boolean) {
     hubPort: 7477,
     userHome,
     env: {},
-    // 测试根目录本身在系统临时目录内：临时与缓存目录改为测试内的子目录，使白名单之外的写入真正被拒绝。
-    tmpDirs: [join(base, 'tmp')],
-    cacheDirs: [join(userHome, '.cache')],
   })
   if (!spec.ok) throw new Error(spec.error.message)
   const profile = renderSeatbeltProfile(spec.data)
@@ -303,13 +327,7 @@ describe.skipIf(!onMac)('macOS 实测：改名祖先目录不能绕过拒绝（�
     const s = await fakeHome(false)
     const codexHome = join(s.home, 'run/executors/codex-exec/codex-home')
     const ownTask = join(s.home, 'run/tasks/t-1')
-    for (const dir of [
-      s.cwd,
-      codexHome,
-      ownTask,
-      join(s.base, 'tmp'),
-      join(s.userHome, '.cache'),
-    ]) {
+    for (const dir of [s.cwd, codexHome, ownTask, join(s.home, 'run/tasks/t-1/tmp')]) {
       for (const argv of [
         ['/usr/bin/touch', join(dir, 'new-file')],
         ['/bin/mkdir', join(dir, 'new-dir')],

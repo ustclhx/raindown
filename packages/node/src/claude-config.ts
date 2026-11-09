@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto'
 import { chmod, lstat, mkdir, readlink, rename, rm, symlink } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { executorRunDir, fail, ok, type Result } from '@raindown/core'
+import { fail, ok, type Result, taskRunDir } from '@raindown/core'
 
 /**
  * 施加外层 seatbelt 时 claude-sdk 使用的 Claude Code 配置目录（add-worker-credential-isolation 4.6）。
@@ -13,7 +13,8 @@ import { executorRunDir, fail, ok, type Result } from '@raindown/core'
  * - `~/.claude/projects/<项目>/memory/` 会进入用户会话的系统提示词；
  * - `~/.claude.json` 可以按项目配置 MCP 服务器（命令）；`settings.json` 可以配置 hooks。
  * worker 写入这些位置，就能让代码在沙箱外执行。因此 claude-sdk 在施加外层 seatbelt 时把 `CLAUDE_CONFIG_DIR` 指向 Raindown
- * 管理的 `run/executors/claude-sdk/claude-config/`（只给受隔离的 worker 会话使用，supervisor 唤醒会话不使用），
+ * 管理的**按任务**目录 `run/tasks/<任务>/claude-config/`（审查第一轮 M5：不同任务之间不共享 `.claude.json`、shell 快照与记忆；
+ * 同一任务恢复会话时用同一目录，会话记录仍在；只给受隔离的 worker 会话使用，supervisor 唤醒会话不使用），
  * 并设 `CLAUDE_SECURESTORAGE_CONFIG_DIR`，使登录凭证仍取自用户原来的钥匙串条目（见 docs/executors.md「写白名单」）。
  *
  * 用户级的设置与扩展以符号链接只读引入（目录中只有链接本身；链接本身与这些名字在白名单内仍拒绝写）。
@@ -46,8 +47,8 @@ export const CLAUDE_CONFIG_DENY_WRITE = [
 
 /** `run/executors/claude-sdk/claude-config/`。 */
 export const CLAUDE_CONFIG_HOME = 'claude-config'
-export const claudeConfigDir = (home: string) =>
-  join(executorRunDir(home, 'claude-sdk'), CLAUDE_CONFIG_HOME)
+export const claudeConfigDir = (home: string, taskId: string) =>
+  join(taskRunDir(home, taskId), CLAUDE_CONFIG_HOME)
 
 /** 用户自己的 Claude 配置目录：`CLAUDE_CONFIG_DIR`，缺省 `~/.claude`。 */
 export const userClaudeConfigDir = (env: NodeJS.ProcessEnv, userHome = homedir()) =>
@@ -57,7 +58,7 @@ export const userClaudeConfigDir = (env: NodeJS.ProcessEnv, userHome = homedir()
  * 隔离会话的环境变量：配置目录改为 Raindown 管理的目录；钥匙串条目仍按用户原来的配置目录计算
  * （Claude Code 2.1.310：`CLAUDE_SECURESTORAGE_CONFIG_DIR` 为空串时使用缺省条目 `Claude Code-credentials`，
  * 为某目录时按该目录计算后缀，与用户以 `CLAUDE_CONFIG_DIR=<该目录>` 登录时相同）；
- * Claude Code 的临时目录改到本用户 `TMPDIR`（缺省 `/tmp/claude-<uid>` 属于用户自己的会话，worker 不可写）。
+ * Claude Code 的临时目录改到本任务私有的临时目录（缺省 `/tmp/claude-<uid>` 属于用户自己的会话，共享临时目录不在写白名单内）。
  */
 export function claudeIsolatedEnv(
   env: NodeJS.ProcessEnv,
@@ -68,7 +69,7 @@ export function claudeIsolatedEnv(
     CLAUDE_CONFIG_DIR: configDir,
     CLAUDE_SECURESTORAGE_CONFIG_DIR:
       env.CLAUDE_SECURESTORAGE_CONFIG_DIR ?? env.CLAUDE_CONFIG_DIR?.trim() ?? '',
-    CLAUDE_CODE_TMPDIR: env.CLAUDE_CODE_TMPDIR?.trim() || tmpDir,
+    CLAUDE_CODE_TMPDIR: tmpDir,
   }
 }
 
@@ -81,9 +82,10 @@ const bad = (message: string) => fail('failure', 'claude_config_failed', message
  */
 export async function prepareClaudeConfigDir(
   home: string,
+  taskId: string,
   userConfigDir: string,
 ): Promise<Result<string>> {
-  const dir = claudeConfigDir(home)
+  const dir = claudeConfigDir(home, taskId)
   try {
     const source = resolve(userConfigDir)
     if (source === resolve(dir)) return bad(`CLAUDE_CONFIG_DIR 指向隔离目录 ${dir}`)
@@ -129,4 +131,9 @@ export async function prepareClaudeConfigDir(
   } catch (err) {
     return bad(`无法准备 Claude Code 的隔离配置目录：${(err as Error).message}`)
   }
+}
+
+/** 任务结束（完成或取消）时删除按任务的隔离配置目录（`rm` 不跟随符号链接，用户目录中的链接目标不受影响）；不抛出。 */
+export async function removeClaudeConfigDir(home: string, taskId: string): Promise<void> {
+  await rm(claudeConfigDir(home, taskId), { recursive: true, force: true }).catch(() => {})
 }

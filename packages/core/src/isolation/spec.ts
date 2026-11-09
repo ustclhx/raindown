@@ -14,13 +14,12 @@ import {
   taskRunDir,
 } from './paths.ts'
 import {
-  defaultCacheDirs,
-  defaultTmpDirs,
-  type GitWriteRules,
+  escapeRegex,
   gitWriteRules,
+  keychainWriteRegex,
   normalizeExtraWrite,
+  PERSISTENCE_PATHS,
   resolveGitLayout,
-  userClaudeTmpDir,
   WRITE_ALLOWLIST_DEVICE_DIRS,
   WRITE_ALLOWLIST_DEVICES,
 } from './write-allowlist.ts'
@@ -52,6 +51,11 @@ export interface HarnessPath {
    * （例如 CODEX_HOME 的 `config.toml`、`rules/`，Claude 配置目录的 `settings.json`、`hooks/`）。
    */
   denyWrite?: readonly string[]
+  /**
+   * `access: write` 时目录内部也是白名单（审查第一轮 H3）：只放行这些相对子目录、相对文件，以及直接子项中文件名匹配
+   * `fileRegex` 的文件（正则只匹配一级文件名，不含 `/`）。给出时目录本身不作为整体放行。
+   */
+  only?: { subpaths?: readonly string[]; files?: readonly string[]; fileRegex?: string }
 }
 
 /**
@@ -86,10 +90,12 @@ export interface IsolationSpec {
   write_carve_outs: string[]
   /** 白名单内再拒绝写的单个文件（linked worktree 的 `.git` 指针文件）。 */
   write_carve_out_literals: string[]
-  /** 登记仓库 `.git` 中 worktree 必需的子目录（只给写类角色）。 */
+  /** 写白名单（正则，已转义路径前缀）：登录钥匙串文件、harness 目录中按文件名放行的运行状态。 */
+  allow_write_regex: string[]
+  /** 本任务独立 clone 的 `.git`（只给施加了外层 seatbelt 的写类角色）。 */
   allow_write_git: string[]
-  /** 登记仓库 `.git` 中 worktree 必需的单个文件（含锁文件）。 */
-  allow_write_git_literals: string[]
+  /** 最后写拒绝、但保留其中个别文件（持久化位置的纵深防御；`~/.codex` 保留 auth.json 链接目标）。 */
+  deny_write_except: Array<{ path: string; except: string[] }>
   /** 拒绝连接其中 unix 套接字的目录（文件规则拦不住 connect）。 */
   deny_unix_sockets: string[]
   /** 显式放行的 unix 套接字（适配器声明；目前为空）。 */
@@ -139,14 +145,14 @@ export interface IsolationSpecInput {
   legacyHomes?: readonly string[]
   /** 解析遗留 home 时读取的环境变量；缺省为 `process.env`。 */
   env?: Env
-  /** 写白名单中的临时目录；缺省 `defaultTmpDirs()`（`/private/tmp`、本用户 `TMPDIR` 及同级 `C`）。测试注入。 */
-  tmpDirs?: readonly string[]
-  /** 写白名单中的缓存与钥匙串目录；缺省 `defaultCacheDirs(userHome)`。测试注入。 */
-  cacheDirs?: readonly string[]
-  /** 节点配置 `isolation.extra_write`：追加的可写目录（绝对路径，不能是受保护路径或其祖先）。 */
+  /** 节点配置 `isolation.extra_write`：追加的可写目录（绝对路径，见 `normalizeExtraWrite`）。 */
   extraWrite?: readonly string[]
-  /** 本用户 uid（拒绝写 `/private/tmp/claude-<uid>`）；缺省 `process.getuid()`；null 或没有时不生成该项。 */
-  uid?: number | null
+  /** 全部登记仓库（各 workspace 的 repos）：其 `.git` 整体只读（审查第一轮 H1、H2、M4）。 */
+  registeredRepos?: readonly string[]
+  /** 本任务的独立 clone（施加外层 seatbelt 的写类角色）：只有它的 `.git` 可写。 */
+  sealedClone?: string
+  /** 是否放行登录钥匙串文件（Claude Code 刷新凭证，审查第一轮 M3）；缺省 false。 */
+  allowKeychain?: boolean
 }
 
 /** 与节点写派工令牌时相同的路径段规则：不以 `.` 开头，因此排除 `.` 与 `..`。 */
@@ -238,14 +244,6 @@ async function legacyHomeCandidates(
     found.push({ path: real, source: p.source })
   }
   return found
-}
-
-/** 工作目录所属仓库的 git 写规则；工作目录不在 git 仓库内时为空。 */
-async function gitLayoutRules(cwd: string, access: 'read' | 'write'): Promise<GitWriteRules> {
-  const layout = await resolveGitLayout(cwd)
-  if (!layout)
-    return { carveOuts: [], carveOutLiterals: [], allow: [], allowLiterals: [], deny: [] }
-  return gitWriteRules(layout, access)
 }
 
 /**
@@ -342,15 +340,36 @@ export async function computeIsolationSpec(
     }
     const allowWriteLiterals: string[] = []
     const carveOuts: string[] = []
+    const allowWriteRegex: string[] = []
+    // 只放行在 `only` 中列出的位置时，这些位置本身不参与“允许项不在受保护目录内”的检查（目录 p 已检查）。
+    const allowWriteInside: string[] = []
+    const relOk = (rel: string) =>
+      !isAbsolute(rel) && !rel.split('/').some((s) => s === '..' || s === '.' || s === '')
     for (const h of input.harnessPaths ?? []) {
       const p = await c(h.path)
       allowRead.push(p)
       if (h.access === 'write') {
         if (h.literal) allowWriteLiterals.push(p)
-        else allowWrite.push(p)
+        else if (h.only) {
+          for (const rel of [...(h.only.subpaths ?? []), ...(h.only.files ?? [])])
+            if (!relOk(rel))
+              return bad(
+                'invalid_isolation_input',
+                `harness 放行条目不是相对路径：${JSON.stringify(rel)}`,
+              )
+          allowWriteInside.push(...(h.only.subpaths ?? []).map((rel) => join(p, rel)))
+          allowWriteLiterals.push(...(h.only.files ?? []).map((rel) => join(p, rel)))
+          if (h.only.fileRegex !== undefined) {
+            // 只匹配一级文件名：除字符类 `[^/]` 外不能含 `/`；SBPL 正则字面量不能含双引号。
+            const re = h.only.fileRegex
+            if (re.includes('"') || re.replaceAll('[^/]', '').includes('/'))
+              return bad('invalid_isolation_input', 'harness 文件名正则不能含 / 或 "')
+            allowWriteRegex.push(`^${escapeRegex(p)}/${h.only.fileRegex}$`)
+          }
+        } else allowWrite.push(p)
         // 不解析最后一级：条目可能是指向用户目录的链接，要拒绝的是替换链接本身（经链接写入目标时按目标路径判断，本来就不在白名单内）。
         for (const rel of h.denyWrite ?? []) {
-          if (isAbsolute(rel) || rel.split('/').some((s) => s === '..' || s === '.' || s === ''))
+          if (!relOk(rel))
             return bad(
               'invalid_isolation_input',
               `harness 拒绝写条目不是相对路径：${JSON.stringify(rel)}`,
@@ -402,31 +421,41 @@ export async function computeIsolationSpec(
     if (denyPorts.includes(input.hubPort))
       return bad('isolation_port_conflict', `中枢端口 ${input.hubPort} 与 Orca 端口冲突`)
 
-    // ---- 写白名单（tasks 4.6）----
-    // 本任务私有目录可写（派工令牌与 `dispatch-tokens/` 仍在 deny_write 中，写在最后）。
-    allowWrite.push(ownTask)
-    // 临时目录、缓存与钥匙串目录：与任务无关，不参与上面的“允许项不在受保护目录内”检查（受保护项写在最后，仍然优先）。
-    const tmpDirs = await Promise.all((input.tmpDirs ?? (await defaultTmpDirs())).map((p) => c(p)))
-    const cacheDirs = await Promise.all(
-      (input.cacheDirs ?? (await defaultCacheDirs(userHome))).map((p) => c(p)),
-    )
-    allowWrite.push(...tmpDirs, ...cacheDirs)
+    // ---- 写白名单（tasks 4.6，审查第一轮）----
+    // 本任务私有目录可写：其中有按任务私有的临时与缓存目录（M2），派工令牌与 `dispatch-tokens/` 仍在 deny_write 中。
+    // 共享的临时与缓存目录（`/private/tmp`、`TMPDIR`、`~/.cache`、`~/Library/Caches` 等）不放行：会被沙箱外的进程直接使用。
+    allowWrite.push(ownTask, ...allowWriteInside)
     allowWriteLiterals.push(...WRITE_ALLOWLIST_DEVICES)
     allowWrite.push(...WRITE_ALLOWLIST_DEVICE_DIRS)
-    // 登记仓库的 git 目录：整体从白名单中挖掉，写类角色再放行 worktree 必需部分；hooks、config 等写在最后拒绝。
-    const gitRules = await gitLayoutRules(cwd, input.access)
+    if (input.allowKeychain) allowWriteRegex.push(keychainWriteRegex(realUserHome))
+    // 登记仓库的 git 目录整体只读；只有本任务独立 clone 的 `.git` 放行（配置、hooks、alternates 等写在最后拒绝）。
+    const registeredGitDirs: string[] = []
+    for (const r of input.registeredRepos ?? []) registeredGitDirs.push(await c(join(r, '.git')))
+    const gitRules = gitWriteRules({
+      layout: await resolveGitLayout(cwd),
+      access: input.access,
+      ...(input.sealedClone !== undefined ? { sealedClone: await c(input.sealedClone) } : {}),
+      registeredGitDirs,
+    })
     carveOuts.push(...gitRules.carveOuts)
-    const finalDenyWrite = [...gitRules.deny]
-    const uid = input.uid === undefined ? process.getuid?.() : input.uid
-    if (uid !== undefined && uid !== null) finalDenyWrite.push(await c(userClaudeTmpDir(uid)))
-    const denyWrite = minimal([...deny, ...readOnly, ...finalDenyWrite])
+    const denyWrite = minimal([...deny, ...readOnly, ...gitRules.deny])
+    // 持久化位置的纵深防御（L1）：即使被追加的白名单覆盖也拒绝写；`~/.codex` 保留已放行的 auth.json 链接目标（M1）。
+    const denyWriteExcept: Array<{ path: string; except: string[] }> = []
+    for (const rel of PERSISTENCE_PATHS) {
+      const path = await c(join(userHome, rel))
+      if (denyWrite.some((d) => isWithin(d, path))) continue
+      denyWriteExcept.push({
+        path,
+        except: allowWriteLiterals.filter((l) => l !== path && isWithin(path, l)),
+      })
+    }
     if (input.extraWrite?.length) {
-      const extra = await normalizeExtraWrite(input.extraWrite, userHome, [
-        ...denyWrite,
-        ...keeps.map((k) => k.dir),
-        realHome,
-        orcaDir,
-      ])
+      const extra = await normalizeExtraWrite(input.extraWrite, {
+        userHome,
+        protectedPaths: [...denyWrite, ...keeps.map((k) => k.dir), realHome, orcaDir],
+        registeredRepos: input.registeredRepos ?? [],
+        pathEnv: (input.env ?? process.env).PATH,
+      })
       if (!extra.ok)
         return bad(
           'isolation_extra_write_invalid',
@@ -443,10 +472,11 @@ export async function computeIsolationSpec(
       allow_read: uniqueSorted(allowRead),
       allow_write: uniqueSorted(allowWrite),
       allow_write_literals: uniqueSorted(allowWriteLiterals),
+      allow_write_regex: uniqueSorted(allowWriteRegex),
       write_carve_outs: minimal(carveOuts),
       write_carve_out_literals: uniqueSorted(gitRules.carveOutLiterals),
       allow_write_git: uniqueSorted(gitRules.allow),
-      allow_write_git_literals: uniqueSorted(gitRules.allowLiterals),
+      deny_write_except: denyWriteExcept.sort((a, b) => a.path.localeCompare(b.path)),
       deny_unix_sockets: [orcaDir],
       allow_unix_sockets: [],
       allow_local_ports: [input.hubPort],
