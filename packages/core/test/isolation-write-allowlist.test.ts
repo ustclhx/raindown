@@ -141,7 +141,8 @@ describe('git 布局与写规则（审查第一轮 H1、H2、M4）', () => {
 async function fakeEnv(root: string) {
   const home = join(root, 'raindown-home')
   const userHome = join(root, 'user')
-  const codexHome = join(home, 'run/executors/codex-orca/codex-home-sealed')
+  // 独立 CODEX_HOME 按任务放在本任务私有目录内（审查第二轮 M1）。
+  const codexHome = join(home, 'run/tasks/t-1/codex-home')
   for (const d of [
     join(home, 'state'),
     join(home, 'config'),
@@ -209,16 +210,16 @@ describe('computeIsolationSpec：写白名单', () => {
     if (!spec.ok) throw new Error(spec.error.message)
     const s = spec.data
     expect(s.allow_write).toEqual(
-      expect.arrayContaining([
-        cwd,
-        join(e.home, 'run/tasks/t-1'),
-        join(e.codexHome, 'sessions'),
-        join(e.codexHome, 'tmp'),
-        '/dev/fd',
-      ]),
+      expect.arrayContaining([cwd, join(e.home, 'run/tasks/t-1'), '/dev/fd']),
     )
-    // 独立 CODEX_HOME 内部也是白名单（H3）：目录本身不整体放行。
+    // 独立 CODEX_HOME 内部也是白名单（H3）：目录本身整体挖掉（它位于可写的本任务私有目录内，审查第二轮 M1），
+    // 之后只放行列出的运行状态。
     expect(s.allow_write).not.toContain(e.codexHome)
+    expect(s.write_carve_outs).toContain(e.codexHome)
+    expect(s.allow_write_inside).toEqual(
+      expect.arrayContaining([join(e.codexHome, 'sessions'), join(e.codexHome, 'tmp')]),
+    )
+    expect(s.allow_write_inside_literals).toContain(join(e.codexHome, 'history.jsonl'))
     for (const shared of [
       '/private/tmp',
       await realpath(tmpdir()),
@@ -228,16 +229,15 @@ describe('computeIsolationSpec：写白名单', () => {
     ])
       expect(s.allow_write).not.toContain(shared)
     expect(s.allow_write_literals).toEqual(
-      expect.arrayContaining([
-        '/dev/null',
-        join(e.codexHome, 'history.jsonl'),
-        join(e.userHome, '.codex/auth.json'),
-      ]),
+      expect.arrayContaining(['/dev/null', join(e.userHome, '.codex/auth.json')]),
     )
-    expect(s.allow_write_regex).toHaveLength(1)
-    expect(s.allow_write_regex[0]).toContain('\\.sqlite')
+    expect(s.allow_write_regex).toEqual([])
+    expect(s.allow_write_inside_regex).toHaveLength(1)
+    expect(s.allow_write_inside_regex[0]).toContain('\\.sqlite')
     // auth.json 链接本身拒绝写（M1）。
-    expect(s.write_carve_outs).toContain(join(e.codexHome, 'auth.json'))
+    expect(s.write_carve_outs.some((p) => join(e.codexHome, 'auth.json').startsWith(`${p}/`))).toBe(
+      true,
+    )
     // 持久化位置的纵深防御（L1）：~/.codex 保留 auth.json 链接目标。
     const codex = s.deny_write_except.find((d) => d.path === join(e.userHome, '.codex'))
     expect(codex?.except).toEqual([join(e.userHome, '.codex/auth.json')])

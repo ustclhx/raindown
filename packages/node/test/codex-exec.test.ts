@@ -941,8 +941,11 @@ describe('外层 seatbelt（worker-credential-isolation 4.3）', () => {
     const text = readFileSync(profile, 'utf8')
     expect(text).toContain('(version 1)\n(allow default)\n')
     // 独立的 CODEX_HOME（审查第一轮 H3）：内部也是白名单，只放行运行状态；不与 workspace-write 共用的 codex-home。
-    const sealedHome = realpathSync(join(s.home, 'run/executors/codex-exec/codex-home-sealed'))
-    expect(s.report().codexHome).toBe(join(s.home, 'run/executors/codex-exec/codex-home-sealed'))
+    // 每个任务一个独立的 CODEX_HOME（审查第二轮 M1）。
+    const sealedHome = join(realpathSync(s.home), 'run/tasks/t-test/codex-home')
+    // 任务完成后删除。
+    expect(existsSync(sealedHome)).toBe(false)
+    expect(s.report().codexHome).toBe(join(s.home, 'run/tasks/t-test/codex-home'))
     expect(text).toContain('(deny file-write*)\n')
     const writeBlock =
       text.split('(allow file-write*')[1]?.split('(allow network-outbound')[0] ?? ''

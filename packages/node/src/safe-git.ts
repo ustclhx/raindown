@@ -204,6 +204,8 @@ export function safeGitEnv(loc: GitLocation, base: NodeJS.ProcessEnv = process.e
   }
   Object.assign(env, {
     GIT_DIR: loc.gitDir,
+    // 固定 commondir：不读取 gitdir 中的 `commondir` 指针（审查第二轮 H1）。
+    GIT_COMMON_DIR: loc.commonDir,
     GIT_WORK_TREE: loc.workTree,
     GIT_OPTIONAL_LOCKS: '0',
     GIT_LFS_SKIP_SMUDGE: '1',

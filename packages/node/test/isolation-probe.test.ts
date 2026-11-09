@@ -285,6 +285,18 @@ describe('模拟已隔离（注入的文件系统接口拒绝受保护项）', (
         expected: 'deny',
         target: '/h/run/isolation-probe-p/repo/.git/objects',
       },
+      {
+        item: 'write.shared_tmp',
+        kind: 'write_new',
+        expected: 'deny',
+        target: '/tmp-shared',
+      },
+      {
+        item: 'write.git_commondir',
+        kind: 'create_file',
+        expected: 'deny',
+        target: '/c/.git/commondir',
+      },
       { item: 'connect.orca_port', kind: 'tcp_connect', expected: 'deny', skip: '未解析' },
       { item: 'debug.process', kind: 'process_debug', expected: 'deny', unverified: '未验证' },
       { item: 'write.workdir', kind: 'write_new', expected: 'allow', target: '/w' },

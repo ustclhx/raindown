@@ -2334,9 +2334,7 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
     expect(command?.indexOf('"$(cat ')).toBeGreaterThan(sandboxAt)
     expect(command).toEndWith(`"$(cat ${join(home.home, 'state/tasks/t-orca-1/spec.md')})"`)
     // 独立的 CODEX_HOME（H3）、按任务私有的临时目录（M2）、预置项目信任（M6）。
-    expect(command).toContain(
-      `CODEX_HOME=${join(home.home, 'run/executors/codex-orca/codex-home-sealed')} `,
-    )
+    expect(command).toContain(`CODEX_HOME=${join(home.home, 'run/tasks/t-orca-1/codex-home')} `)
     expect(command).toContain(`TMPDIR=${join(home.home, 'run/tasks/t-orca-1/tmp')} `)
     expect(command).toContain(`-c 'projects={"${clone}"={trust_level="trusted"}}'`)
     // 终端仍开在 Orca worktree（宿主）；Orca 的 setup 跳过，setup 在独立 clone 中运行。

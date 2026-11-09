@@ -68,7 +68,7 @@
 - **工作目录**：写类角色是本任务的**独立 clone** `run/tasks/<任务>/repo/`（见下）；只读角色的工作目录仍以写拒绝表示。
 - **本任务私有目录** `run/tasks/<任务>/`：其中有按任务私有的 `tmp/` 与 `cache/`。worker 的 `TMPDIR` 与 bun、npm、pnpm、Playwright、corepack、pre-commit、go、pip、uv 的缓存环境变量都指到这里，执行结束（codex-orca 为任务完成或取消）时删除。派工令牌与 `dispatch-tokens/` 仍写拒绝。
 - **适配器声明的 harness 可写目录**：
-  - codex 使用施加时专用的独立 CODEX_HOME `run/executors/<执行器>/codex-home-sealed/`，与无外层 seatbelt 的设置不共享。它内部也是白名单：只放行 `sessions/`、`archived_sessions/`、`log/`、`cache/`、`tmp/`、`history.jsonl`、`version.json`、`internal_storage.json` 与 `*.sqlite*`。`auth.json` 链接本身拒绝写，链接目标这一个文件可写。
+  - codex 使用施加时专用、**按任务**的独立 CODEX_HOME `run/tasks/<任务>/codex-home/`（审查第二轮 M1），与无外层 seatbelt 的设置及其他任务都不共享；目录位于本任务私有目录内，先整体挖掉再放行运行状态。它内部也是白名单：只放行 `sessions/`、`archived_sessions/`、`log/`、`cache/`、`tmp/`、`history.jsonl`、`version.json`、`internal_storage.json` 与 `*.sqlite*`。`auth.json` 链接本身拒绝写，链接目标这一个文件可写。
   - claude-sdk 使用按任务的 Claude Code 配置目录 `run/tasks/<任务>/claude-config/`（`CLAUDE_CONFIG_DIR`），其中 `settings*.json`、`commands|agents|skills|hooks|plugins|rules|output-styles`、`CLAUDE.md` 等不可写；另放行登录钥匙串文件 `login.keychain-db` 及其 `.sb-*` 临时文件（OAuth 刷新）。
   - 用户自己的 `~/.claude`、`~/.claude.json` 不可写：其中的 shell 快照、项目记忆、MCP 与 hooks 配置会被用户自己（沙箱外）的 Claude Code 加载或执行。
 - **设备文件**：`/dev/null`、`/dev/tty`、`/dev/ttys<N>`、`/dev/fd/` 等。
@@ -80,12 +80,15 @@
 - 节点在沙箱外 `git clone --shared --no-checkout`：对象经 alternates 只读引用登记仓库，不用会硬链接对象的 `--local`。`isolation.dissociate` 打开时改为完整复制。
 - `origin` 指向登记仓库的远端，worker 直接推送。
 - 节点写入 `.git/config`（任务分支的上游、`push.default=current`、`core.logAllRefUpdates=false`），并在 `state/` 下记录其 sha256。
-- 全部登记仓库的 `.git` 对 worker 整体只读。clone 的 `.git` 可写，但 `config`、`hooks/`、`info/`、`modules/`、`objects/info/alternates` 除外。
+- 全部登记仓库的 `.git` 对 worker 整体只读。clone 的 `.git` 可写，但 `config`、`hooks/`、`info/`、`modules/`、`objects/info/alternates`，以及 `commondir`、`gitdir`、`config.worktree`、`worktrees/` 除外（审查第二轮 H1）。
+- 节点在沙箱外对 clone 运行 git 时固定 `GIT_DIR` 与 `GIT_COMMON_DIR`；核对时这些指针文件存在即失败。检出 worker 写过的分支时中和 filter、diff driver 并跳过 LFS smudge（审查第二轮 M2）。
 - 节点在 clone 中只做只读的安全 git，每次运行前核对 config 的 sha256。
 - codex-orca 的 Orca worktree 只作终端宿主（`--setup skip`），setup 在 clone 中、以 worker 的 seatbelt 配置运行。
 - 迁移：旧布局的任务从登记仓库中的同名分支建立 clone。回滚：先把任务分支快进取回登记仓库，不能快进时取到 `raindown/recovered/<任务>`，再删除 clone。
 
 **持久化位置与外部启动。** 持久化位置（shell 启动文件、`~/.gitconfig`、`~/.ssh`、`~/.local/bin` 等）在白名单之后整体拒绝写，作为纵深防御。另加 `(deny job-creation)`、`(deny user-preference-write)`、`(deny lsopen)`、`(deny appleevent-send)`。
+
+**不变量（审查第二轮 L3）：节点往任务私有目录（worker 可写）写文件，一律不跟随符号链接**——在同一目录以 `O_CREAT|O_EXCL` 写临时文件再 rename；新建目录后用 `lstat` 确认不是符号链接。
 
 SBPL 中的顺序：
 1. `(allow default)`
@@ -154,6 +157,7 @@ seatbelt 的规则后者优先，允许项写得最窄（具体文件，而不�
   - **登录钥匙串**：claude-sdk 下 worker 可以损坏或替换 `login.keychain-db`。
   - **偏好设置**：经 cfprefsd 的偏好设置写入拦不住，例如终端应用的启动命令（`user-preference-write` 实测无效）；拒绝 cfprefsd 的 mach-lookup 可能影响 `security`，未验证。
   - **会话记录**：独立 CODEX_HOME 与按任务的 Claude 配置目录中的会话记录可被改写（提示注入，不是命令执行）。
+  - **Codex 项目配置**：预置信任后，Codex 会加载 clone 内的 `.codex/config.toml`。`notify`、`model_provider` 用命令行固定，`.codex/` 出现即停下，但 `model_providers` 表、`mcp_servers` 等覆盖不了的项，在出现到下一次检查之间可能生效；它们只在外层 seatbelt 内生效（审查第二轮 L2）。
   - **手动运行 git**：用户在任务 clone 中手动运行 git 时，git 会跟随 worker 预埋在 `.git` 中的符号链接写入（例如 `COMMIT_EDITMSG`、已有的 reflog）。
   → 写入文档；4.5 验收后按实际情况决定是否进一步收紧。
 - [写白名单误伤 harness 或工具链]

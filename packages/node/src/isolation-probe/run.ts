@@ -28,7 +28,12 @@ import {
   taskRunDir,
 } from '@raindown/core'
 import { z } from 'zod'
-import { removeLeaseTokenFile, removeSeatbeltProfile, writeLeaseTokenFile } from '../lease-token.ts'
+import {
+  removeLeaseTokenFile,
+  removeSeatbeltProfile,
+  writeFileNoFollow,
+  writeLeaseTokenFile,
+} from '../lease-token.ts'
 import { hubPortOf, type SeatbeltOptions, writeSeatbeltLaunch } from '../seatbelt.ts'
 
 /**
@@ -147,6 +152,7 @@ async function buildProbeRepo(scratch: string, cwd: string) {
       gitHookFile: join(cwd, '.git', 'hooks', 'post-checkout'),
       gitObjectsDir: join(cwd, '.git', 'objects'),
       registeredGitObjectsDir: join(repo, '.git', 'objects'),
+      gitCommondirFile: join(cwd, '.git', 'commondir'),
     },
   }
 }
@@ -370,7 +376,7 @@ async function runOne(
     // 子进程尝试改名 a（受保护路径的祖先目录）。只操作探针自建的临时目录树，绝不改名真实目录。
     const renameRoot = join(taskRunDir(o.home, ownTask), RENAME_PROBE_DIR)
     await mkdir(join(renameRoot, 'a', 'b'), { recursive: true, mode: 0o700 })
-    await writeFile(join(renameRoot, 'a', 'b', 'secret'), `${fake}\n`, { mode: 0o600 })
+    await writeFileNoFollow(join(renameRoot, 'a', 'b', 'secret'), `${fake}\n`)
     const renameTarget = await realpath(join(renameRoot, 'a'))
     const renameSecret = join(renameTarget, 'b', 'secret')
     const executorHome = executorHomeFor(target)

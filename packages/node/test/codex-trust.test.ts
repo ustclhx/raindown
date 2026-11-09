@@ -41,5 +41,21 @@ describe('预置项目信任（审查第一轮 M6）', () => {
     expect(sealed.data).toContain(
       `-c 'projects={"/h/run/tasks/t-1/it'\\''s"={trust_level="trusted"}}'`,
     )
+    // 审查第二轮 L2：信任后 clone 内的 .codex/config.toml 可能被加载，命令行固定 notify 与 model_provider。
+    expect(sealed.data).toContain(`-c 'notify=[]' -c 'model_provider="openai"'`)
+    expect(plain.data).not.toContain('notify=')
+    const custom = buildCodexCommand({
+      ...base,
+      role: {
+        ...base.role,
+        permissions: { ...base.role.permissions, config: { model_provider: '"azure"' } },
+      },
+      trustProject: '/h/run/tasks/t-1/repo',
+    })
+    if (!custom.ok) throw new Error(custom.error.message)
+    expect(custom.data).toContain(`-c 'model_provider="azure"'`)
+    expect(custom.data.lastIndexOf('model_provider=')).toBeGreaterThan(
+      custom.data.indexOf('trust_level'),
+    )
   })
 })

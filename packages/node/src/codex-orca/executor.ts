@@ -30,6 +30,7 @@ import {
   codexTaskMcpConfig,
   orcaCodexHome,
   prepareCodexHome,
+  removeSealedCodexHome,
   SEALED_CODEX_HOME,
   sameCodexHome,
   sealedCodexHome,
@@ -305,6 +306,15 @@ export function buildCodexCommand(input: {
     const trust = codexTrustConfig(input.trustProject)
     if (!trust.ok) return trust
     argv.push('-c', trust.data)
+    // 信任之后 Codex 会加载 clone 内的 `.codex/config.toml`（worker 或 PR 可控，审查第二轮 L2）：命令行 -c 优先于项目配置，
+    // 固定 notify 为空、model_provider 为角色配置的值（没有时为缺省的 openai）。覆盖不了的项目配置见 design Risks。
+    const provider = p.config?.model_provider
+    argv.push(
+      '-c',
+      'notify=[]',
+      '-c',
+      `model_provider=${provider !== undefined ? String(provider) : '"openai"'}`,
+    )
   }
   if (input.task) {
     argv.push(
@@ -556,7 +566,10 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
         // 只在任务完成或取消时删除。
         const terminal = r.ok && (r.data.outcome === 'done' || r.data.outcome === 'cancelled')
         if (!terminal || !state || state.isolation_layer !== 'seatbelt') return settle(r)
-        void removeTaskScratch(options.home, ctx.taskId).finally(() => settle(r))
+        void Promise.all([
+          removeTaskScratch(options.home, ctx.taskId),
+          removeSealedCodexHome(options.home, ctx.taskId),
+        ]).finally(() => settle(r))
       }
       const result = (summary: string, extra: Partial<TaskResult> = {}): TaskResult => ({
         summary,
@@ -1641,7 +1654,7 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
             ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
             ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
             env: actorEnv.data,
-            harnessPaths: codexHarnessPaths(sealedCodexHome(options.home, 'codex-orca')),
+            harnessPaths: codexHarnessPaths(sealedCodexHome(options.home, ctx.taskId)),
             status,
           })
           if (finished || stopping) return
@@ -1690,7 +1703,7 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
 
         // 施加外层 seatbelt 时使用独立的 CODEX_HOME（审查第一轮 H3）。
         const isolated = await prepareCodexHome(
-          isolation ? sealedCodexHome(options.home, 'codex-orca') : orcaCodexHome(options.home),
+          isolation ? sealedCodexHome(options.home, ctx.taskId) : orcaCodexHome(options.home),
           options.codexAuthSource ??
             actorEnv.data.CODEX_HOME ??
             process.env.CODEX_HOME ??

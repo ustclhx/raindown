@@ -153,6 +153,97 @@ describe('ensureSealedClone', () => {
   })
 })
 
+describe('审查第二轮', () => {
+  test('H1：.git/commondir 重定向——核对失败；已取得的安全 git 固定 GIT_COMMON_DIR，不读伪造的配置', async () => {
+    const { fx, home, opts } = setup()
+    const r = await ensureSealedClone({
+      home,
+      taskId: 't-1',
+      repo: fx.repo,
+      base: 'origin/main',
+      branch: 't-1',
+      ...opts,
+    })
+    if (!r.ok) throw new Error(r.error.message)
+    const loc = await verifyGitLocation(r.data.path, [fx.repo], { home })
+    if (!loc.ok) throw new Error(loc.reason)
+    const git = createSafeGit(loc, { env: fx.env })
+    // 模拟复现：伪造的 .git/evil（refs、HEAD、对象链回），config 改写远端；再写 commondir 指向它。
+    const gitDir = join(r.data.path, '.git')
+    const evil = join(gitDir, 'evil')
+    mkdirSync(join(evil, 'refs', 'heads'), { recursive: true })
+    writeFileSync(join(evil, 'HEAD'), readFileSync(join(gitDir, 'HEAD')))
+    symlinkSync(join(gitDir, 'objects'), join(evil, 'objects'))
+    writeFileSync(
+      join(evil, 'config'),
+      '[core]\n\trepositoryformatversion = 0\n[remote "origin"]\n\turl = https://evil.invalid/x.git\n',
+    )
+    writeFileSync(join(gitDir, 'commondir'), 'evil\n')
+    // 对照：不固定时普通 git 确实改读伪造的配置。
+    expect(fx.git(['config', '--get', 'remote.origin.url'], r.data.path)).toBe(
+      'https://evil.invalid/x.git\n',
+    )
+    expect(await git.run(['config', '--get', 'remote.origin.url'])).toBe(`${ORIGIN_URL}\n`)
+    const v = await verifySealedClone(home, 't-1')
+    expect(!v.ok && v.error.code).toBe('sealed_clone_invalid')
+    expect((await verifyGitLocation(r.data.path, [fx.repo], { home })).ok).toBe(false)
+    // 回收时不取回、不删除（交给用户处理）。
+    expect((await removeSealedClone(home, 't-1', { fetchBack: true, ...opts })).ok).toBe(false)
+    expect(existsSync(r.data.path)).toBe(true)
+    for (const name of ['config.worktree', 'worktrees']) {
+      const { fx: fx2, home: home2 } = setup()
+      const c = await ensureSealedClone({
+        home: home2,
+        taskId: 't-2',
+        repo: fx2.repo,
+        base: 'origin/main',
+        branch: 't-2',
+        env: fx2.env,
+      })
+      if (!c.ok) throw new Error(c.error.message)
+      if (name === 'worktrees') mkdirSync(join(c.data.path, '.git', name))
+      else writeFileSync(join(c.data.path, '.git', name), '[core]\n')
+      const bad = await verifySealedClone(home2, 't-2')
+      expect({ name, code: !bad.ok && bad.error.code }).toEqual({
+        name,
+        code: 'sealed_clone_invalid',
+      })
+    }
+  })
+
+  test('M2：检出 worker 写过的分支时不运行用户配置的 filter（.gitattributes 引用），也不做 LFS smudge', async () => {
+    const { fx, home, opts } = setup()
+    const marker = join(fx.root, 'filter-ran')
+    // 用户（夹具的临时 HOME）的全局配置里有一个会执行命令的 filter driver。
+    const gitconfig = join(fx.env.HOME as string, '.gitconfig')
+    writeFileSync(
+      gitconfig,
+      `${readFileSync(gitconfig, 'utf8')}[filter "evil"]\n\tsmudge = touch ${marker}; cat\n\tclean = cat\n`,
+    )
+    // worker 之前在任务分支上提交了引用它的 .gitattributes（迁移：共享 worktree 中的提交）。
+    writeFileSync(join(fx.worktree, '.gitattributes'), '*.txt filter=evil\n')
+    writeFileSync(join(fx.worktree, 'a.txt'), 'hello\n')
+    fx.git(['-c', 'filter.evil.clean=cat', 'add', '.gitattributes', 'a.txt'], fx.worktree)
+    fx.git(['commit', '-q', '-m', 'attrs'], fx.worktree)
+    expect(existsSync(marker)).toBe(false)
+    const r = await ensureSealedClone({
+      home,
+      taskId: 't-1',
+      repo: fx.repo,
+      base: 'origin/main',
+      branch: TASK_BRANCH,
+      ...opts,
+    })
+    if (!r.ok) throw new Error(r.error.message)
+    expect(readFileSync(join(r.data.path, 'a.txt'), 'utf8')).toBe('hello\n')
+    expect(existsSync(marker)).toBe(false)
+    // 对照：不中和时普通检出确实会运行这个 filter。
+    execFileSync('rm', ['-f', join(fx.worktree, 'a.txt')])
+    fx.git(['checkout', '--', 'a.txt'], fx.worktree)
+    expect(existsSync(marker)).toBe(true)
+  })
+})
+
 describe('核对与安全 git', () => {
   test('.git/config 被改动后核对失败，安全 git 不再运行；verifyGitLocation 只在严格条件下接受独立 clone', async () => {
     const { fx, home, opts } = setup()
@@ -330,6 +421,11 @@ describe.skipIf(!onMac)('macOS 实测：独立 clone 下的 seatbelt', () => {
       ['clone 的 info', `echo x > '${join(clone, '.git/info/exclude')}'`],
       ['clone 的 alternates', `echo /tmp > '${join(clone, '.git/objects/info/alternates')}'`],
       ['git config', 'git config core.fsmonitor /tmp/evil'],
+      // 审查第二轮 H1：commondir 重定向、config.worktree、新建 worktree 管理目录、gitdir。
+      ['clone 的 commondir', `echo evil > '${join(clone, '.git/commondir')}'`],
+      ['clone 的 config.worktree', `echo x > '${join(clone, '.git/config.worktree')}'`],
+      ['clone 的 worktrees', `mkdir -p '${join(clone, '.git/worktrees/x')}'`],
+      ['clone 的 gitdir', `echo x > '${join(clone, '.git/gitdir')}'`],
       ['改名 clone 的 .git', `mv '${join(clone, '.git')}' '${join(clone, '.git2')}'`],
     ] as const) {
       const res = sh(cmd)

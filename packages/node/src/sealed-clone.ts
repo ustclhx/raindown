@@ -4,6 +4,7 @@ import { basename, dirname, join } from 'node:path'
 import { fail, ok, type Result, raindownPaths, runTasksDir, taskRunDir } from '@raindown/core'
 import { z } from 'zod'
 import { type CommandRunner, execRunner } from './codex-orca/orca.ts'
+import { UNTRUSTED_CHECKOUT_ENV, untrustedCheckoutConfig } from './github.ts'
 import { ensureTaskRunDir } from './lease-token.ts'
 
 /**
@@ -67,16 +68,31 @@ const GIT_SAFE = [
   'protocol.ext.allow=never',
 ]
 
+/**
+ * 运行 git。`gitDir` 给出时固定 `GIT_DIR`、`GIT_COMMON_DIR`（与 `GIT_WORK_TREE=cwd`）：不读取仓库中的
+ * `.git/commondir` 指针（审查第二轮 H1：worker 写入 commondir 可以让 git 改用它伪造的配置）。
+ * `extra` 是追加的 `-c` 配置与环境变量（检出 worker 可控的分支时中和 filter、LFS，审查第二轮 M2）。
+ */
 async function git(
   o: SealedCloneGit,
   cwd: string,
   args: readonly string[],
+  pin?: { gitDir: string },
+  extra: { config?: readonly (readonly [string, string])[]; env?: Record<string, string> } = {},
 ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   try {
-    const out = await (o.run ?? execRunner)('git', [...GIT_SAFE, ...args], {
+    const env = gitEnv(o.env)
+    if (pin) {
+      env.GIT_DIR = pin.gitDir
+      env.GIT_COMMON_DIR = pin.gitDir
+      env.GIT_WORK_TREE = cwd
+    }
+    Object.assign(env, extra.env ?? {})
+    const config = (extra.config ?? []).flatMap(([k, v]) => ['-c', `${k}=${v}`])
+    const out = await (o.run ?? execRunner)('git', [...GIT_SAFE, ...config, ...args], {
       cwd,
       timeoutMs: o.timeoutMs ?? 600_000,
-      env: gitEnv(o.env),
+      env,
     })
     return { ok: out.code === 0, stdout: out.stdout, stderr: out.stderr }
   } catch (err) {
@@ -86,7 +102,9 @@ async function git(
 
 /** 登记仓库的缺省基准：`origin/HEAD` 指向的远端分支，取不到时 `origin/main`。 */
 export async function defaultCloneBase(repo: string, o: SealedCloneGit = {}): Promise<string> {
-  const r = await git(o, repo, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])
+  const r = await git(o, repo, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], {
+    gitDir: join(repo, '.git'),
+  })
   const ref = r.stdout.trim()
   return r.ok && /^origin\/[\w./-]+$/.test(ref) ? ref : 'origin/main'
 }
@@ -158,6 +176,11 @@ export async function verifySealedClone(
   } catch {
     return bad('sealed_clone_invalid', `${dir}/.git 不存在`)
   }
+  // commondir、config.worktree、worktrees/ 会让 git 改读别处的配置（审查第二轮 H1）：独立 clone 中不应存在。
+  for (const name of ['commondir', 'config.worktree', 'worktrees', 'gitdir']) {
+    if (await exists(join(dir, '.git', name)))
+      return bad('sealed_clone_invalid', `${dir}/.git/${name} 不应存在，不在其中运行 git`)
+  }
   const config = await readPlain(join(dir, '.git', 'config'))
   if (!config || sha256(config) !== record.config_sha256)
     return bad('sealed_clone_config_changed', `${dir}/.git/config 已被改动，不在其中运行 git`)
@@ -169,6 +192,15 @@ export async function verifySealedClone(
   )
     return bad('sealed_clone_invalid', `${dir}/.git/objects/info/alternates 与记录不一致`)
   return ok(record)
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await lstat(path)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /** `.git/config` 的 sha256（核对用；不是普通文件时 undefined）。 */
@@ -222,8 +254,16 @@ export async function ensureSealedClone(
     return bad('sealed_clone_failed', `无法建立任务私有目录：${(err as Error).message}`)
   }
   const repo = await realpath(i.repo)
-  const step = async (cwd: string, args: readonly string[], what: string) => {
-    const r = await git(i, cwd, args)
+  const cloneGit = { gitDir: join(dir, '.git') }
+  const repoGit = { gitDir: join(repo, '.git') }
+  const step = async (
+    cwd: string,
+    args: readonly string[],
+    what: string,
+    pin?: { gitDir: string },
+    extra?: Parameters<typeof git>[4],
+  ) => {
+    const r = await git(i, cwd, args, pin, extra)
     if (!r.ok) throw new Error(`${what}失败：${r.stderr.trim().slice(0, 500)}`)
     return r.stdout
   }
@@ -248,9 +288,10 @@ export async function ensureSealedClone(
       dir,
       ['fetch', '--quiet', '--no-tags', 'local', '+refs/remotes/origin/*:refs/remotes/origin/*'],
       '复制远端跟踪分支',
+      cloneGit,
     )
     const has = async (ref: string) =>
-      (await git(i, dir, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`])).ok
+      (await git(i, dir, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], cloneGit)).ok
     const start = (await has(`refs/remotes/local/${i.branch}`))
       ? `local/${i.branch}`
       : (await has(`refs/remotes/origin/${i.branch}`))
@@ -258,24 +299,48 @@ export async function ensureSealedClone(
         : (await has(i.base))
           ? i.base
           : `local/${i.base}`
-    await step(dir, ['checkout', '--quiet', '--no-track', '-b', i.branch, start], '检出任务分支')
-    const url = (await git(i, repo, ['config', '--get', 'remote.origin.url'])).stdout.trim()
-    const pushUrl = (await git(i, repo, ['config', '--get', 'remote.origin.pushurl'])).stdout.trim()
-    await step(dir, ['remote', 'remove', 'local'], '移除本地来源')
+    // 分支可能是 worker 之前写的（迁移的同名分支、已有 PR）：检出时中和 hook、fsmonitor 与已配置的 filter driver，
+    // 不做 LFS smudge（审查第二轮 M2，与审查准备的检出相同）。
+    const neutral = await untrustedCheckoutConfig(repo, {
+      ...(i.run ? { run: i.run } : {}),
+      env: gitEnv(i.env),
+    })
+    if (!neutral.ok) throw new Error(`读取仓库 git 配置失败：${neutral.error.message}`)
+    await step(
+      dir,
+      ['checkout', '--quiet', '--no-track', '-b', i.branch, start],
+      '检出任务分支',
+      cloneGit,
+      { config: neutral.data, env: { ...UNTRUSTED_CHECKOUT_ENV } },
+    )
+    const url = (
+      await git(i, repo, ['config', '--get', 'remote.origin.url'], repoGit)
+    ).stdout.trim()
+    const pushUrl = (
+      await git(i, repo, ['config', '--get', 'remote.origin.pushurl'], repoGit)
+    ).stdout.trim()
+    await step(dir, ['remote', 'remove', 'local'], '移除本地来源', cloneGit)
     if (url) {
-      await step(dir, ['config', 'remote.origin.url', url], '设置远端')
+      await step(dir, ['config', 'remote.origin.url', url], '设置远端', cloneGit)
       await step(
         dir,
         ['config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*'],
         '设置远端',
+        cloneGit,
       )
-      if (pushUrl) await step(dir, ['config', 'remote.origin.pushurl', pushUrl], '设置远端')
-      await step(dir, ['config', `branch.${i.branch}.remote`, 'origin'], '设置上游')
-      await step(dir, ['config', `branch.${i.branch}.merge`, `refs/heads/${i.branch}`], '设置上游')
+      if (pushUrl)
+        await step(dir, ['config', 'remote.origin.pushurl', pushUrl], '设置远端', cloneGit)
+      await step(dir, ['config', `branch.${i.branch}.remote`, 'origin'], '设置上游', cloneGit)
+      await step(
+        dir,
+        ['config', `branch.${i.branch}.merge`, `refs/heads/${i.branch}`],
+        '设置上游',
+        cloneGit,
+      )
     }
-    await step(dir, ['config', 'push.default', 'current'], '设置推送方式')
+    await step(dir, ['config', 'push.default', 'current'], '设置推送方式', cloneGit)
     // 沙箱外运行的 git 不再追加 reflog：worker 预埋在 logs/ 中的符号链接不会让它写进任意文件（审查第一轮 H2）。
-    await step(dir, ['config', 'core.logAllRefUpdates', 'false'], '关闭 reflog')
+    await step(dir, ['config', 'core.logAllRefUpdates', 'false'], '关闭 reflog', cloneGit)
   } catch (err) {
     await rm(dir, { recursive: true, force: true }).catch(() => {})
     return bad('sealed_clone_failed', `无法建立独立 clone：${(err as Error).message}`)
@@ -321,14 +386,19 @@ export async function removeSealedClone(
   let recoveredBranch: string | undefined
   if (o.fetchBack) {
     const fetch = (dst: string, force: boolean) =>
-      git(o, r.repo, [
-        'fetch',
-        '--quiet',
-        '--no-tags',
-        '--no-write-fetch-head',
-        r.path,
-        `${force ? '+' : ''}refs/heads/${r.branch}:refs/heads/${dst}`,
-      ])
+      git(
+        o,
+        r.repo,
+        [
+          'fetch',
+          '--quiet',
+          '--no-tags',
+          '--no-write-fetch-head',
+          r.path,
+          `${force ? '+' : ''}refs/heads/${r.branch}:refs/heads/${dst}`,
+        ],
+        { gitDir: join(r.repo, '.git') },
+      )
     if ((await fetch(r.branch, false)).ok) recoveredBranch = r.branch
     else {
       const alt = `raindown/recovered/${taskId}`

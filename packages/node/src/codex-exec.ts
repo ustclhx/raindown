@@ -31,6 +31,7 @@ import {
   execCodexHome,
   prepareCodexHome,
   readCodexHome,
+  removeSealedCodexHome,
   SEALED_CODEX_HOME,
   sealedCodexHome,
 } from './codex-home.ts'
@@ -232,7 +233,13 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
         ctx.signal.removeEventListener('abort', onAbort)
         queue.close()
         if (!scratchApplied) return settle(value)
-        void removeTaskScratch(options.home, ctx.taskId).finally(() => settle(value))
+        // 独立 CODEX_HOME 按任务保留到任务完成或取消（恢复会话需要它，审查第二轮 M1）。
+        const terminal =
+          value.ok && (value.data.outcome === 'done' || value.data.outcome === 'cancelled')
+        void Promise.all([
+          removeTaskScratch(options.home, ctx.taskId),
+          terminal ? removeSealedCodexHome(options.home, ctx.taskId) : undefined,
+        ]).finally(() => settle(value))
       }
       const onAbort = () => {
         // abort 与 cancel 可能在 close 回调之前连续到达，只向进程组发送一次信号。
@@ -339,7 +346,7 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
         // 施加时使用独立的 CODEX_HOME（审查第一轮 H3），写类角色在本任务的独立 clone 中运行（第一步方案）。
         const applies = seatbeltApplies(credentialIsolation, role.data, options.isolation)
         const dir = applies
-          ? sealedCodexHome(options.home, 'codex-exec')
+          ? sealedCodexHome(options.home, ctx.taskId)
           : readRole
             ? readCodexHome(options.home)
             : execCodexHome(options.home)

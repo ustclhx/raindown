@@ -23,7 +23,7 @@ import {
   UNTRUSTED_CHECKOUT_ENV,
   untrustedCheckoutConfig,
 } from './github.ts'
-import { removeEmptyTaskRunDir } from './lease-token.ts'
+import { removeEmptyTaskRunDir, writeFileNoFollow } from './lease-token.ts'
 
 /**
  * claude-sdk 审查准备（add-m1-supervisor D10；tasks 5.2；executor-claude-sdk "审查任务的准备与结构化输出"）。
@@ -163,7 +163,8 @@ export async function prepareReview(input: PrepareReviewInput): Promise<Result<P
   if (!diff.ok)
     return bail(fail('failure', 'review_prep_failed', `读取 PR diff 失败：${diff.error.message}`))
   const diffPath = join(dir, REVIEW_DIFF_FILE)
-  await writeFile(diffPath, diff.data, { mode: 0o600 })
+  // 私有目录对 worker 可写：不跟随预埋的符号链接（审查第二轮 L3）。
+  await writeFileNoFollow(diffPath, diff.data)
 
   const fetched = await git(
     input.repo,

@@ -43,12 +43,15 @@
     - H1、H2、M4：施加时写类任务在独立 clone `run/tasks/<任务>/repo`（`git clone --shared`，不硬链接对象）中运行，登记仓库的 `.git` 整体只读；
       clone 的 `.git/config` 由节点写入并记录 sha256（节点每次运行 git 前核对），config、hooks、`info/`、`modules/`、alternates 不可写；
       codex-orca 的 Orca worktree 只作终端宿主，setup 在 clone 中以 worker 的 seatbelt 配置运行；迁移与回滚（取回分支）见 docs。
-    - H3、M1：施加时用独立的 `codex-home-sealed`，内部白名单；`auth.json` 链接本身拒绝写；节点刷新凭证不可行，登记 Risks。
+    - H3、M1：施加时用独立的 CODEX_HOME（第二轮改为按任务），内部白名单；`auth.json` 链接本身拒绝写；节点刷新凭证不可行，登记 Risks。
     - M2：按任务私有的 `tmp/`、`cache/` 与环境变量，共享临时与缓存目录移出白名单；launchd plist 设 `BUN_RUNTIME_TRANSPILER_CACHE_PATH=0`。
     - M3：钥匙串只放行 `login.keychain-db` 与 `.sb-*`（claude-sdk）。M5：claude-sdk 配置目录按任务。M6：codex-orca 预置项目信任。
     - L1：`extra_write` 大小写折叠与 NFD，拒绝登记仓库、PATH 目录、Application Support；持久化位置整体拒绝写。L2：随独立 clone 消失。
     - L3：文档与 dev 角色模板写明推送与新建分支的做法。L4：审查元数据存 `state/review-meta/`。L5：`job-creation`、`user-preference-write`、`lsopen`、`appleevent-send`。
     - 探针新增必过项 `write.registered_git`，另有 `write.shared_tmp`。
+  - PR #99 第二轮审查：H1 独立 clone 的 `commondir`、`gitdir`、`config.worktree`、`worktrees/` 拒绝写，核对时存在即失败，节点的 git 固定 `GIT_COMMON_DIR`；
+    M1 独立 CODEX_HOME 改为按任务（`run/tasks/<任务>/codex-home`）；M2 检出 worker 写过的分支时中和 filter 与 LFS；
+    L1 `write.shared_tmp`、`write.git_commondir` 列为必过项；L2 codex-orca 固定 `notify`、`model_provider`；L3 节点往任务目录写文件不跟随符号链接。
   - **留给 4.5 真实验收确认**（不运行真实 harness，未验证）：Codex 在独立 CODEX_HOME 内部白名单下能否正常启动、刷新凭证与使用 `tmp/arg0`；
     Claude Code 在按任务配置目录与 `CLAUDE_SECURESTORAGE_CONFIG_DIR` 下能否取到钥匙串凭证与刷新；预置信任能否消除信任弹窗；
     仓库 setup（`bun install`）在冷的任务缓存下的耗时；husky 等写 `core.hooksPath` 的工具；工具写 `~/Library/Application Support` 等位置的失败（按 docs 排查追加）；

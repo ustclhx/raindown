@@ -94,6 +94,13 @@ export interface IsolationSpec {
   allow_write_regex: string[]
   /** 本任务独立 clone 的 `.git`（只给施加了外层 seatbelt 的写类角色）。 */
   allow_write_git: string[]
+  /**
+   * 内部为白名单的 harness 目录（独立 CODEX_HOME）中放行的子目录、文件与文件名正则：目录本身在 `write_carve_outs` 中整体挖掉，
+   * 这些在挖掉之后再放行（审查第二轮 M1）。
+   */
+  allow_write_inside: string[]
+  allow_write_inside_literals: string[]
+  allow_write_inside_regex: string[]
   /** 最后写拒绝、但保留其中个别文件（持久化位置的纵深防御；`~/.codex` 保留 auth.json 链接目标）。 */
   deny_write_except: Array<{ path: string; except: string[] }>
   /** 拒绝连接其中 unix 套接字的目录（文件规则拦不住 connect）。 */
@@ -341,8 +348,11 @@ export async function computeIsolationSpec(
     const allowWriteLiterals: string[] = []
     const carveOuts: string[] = []
     const allowWriteRegex: string[] = []
-    // 只放行在 `only` 中列出的位置时，这些位置本身不参与“允许项不在受保护目录内”的检查（目录 p 已检查）。
+    // 只放行在 `only` 中列出的位置（审查第二轮 M1）：目录本身先整体挖掉（它可能位于本任务私有目录等更大的可写子树内），
+    // 再在 1b 阶段放行列出的子目录、文件与文件名正则。目录 p 已参与“允许项不在受保护目录内”的检查。
     const allowWriteInside: string[] = []
+    const allowWriteInsideLiterals: string[] = []
+    const allowWriteInsideRegex: string[] = []
     const relOk = (rel: string) =>
       !isAbsolute(rel) && !rel.split('/').some((s) => s === '..' || s === '.' || s === '')
     for (const h of input.harnessPaths ?? []) {
@@ -357,14 +367,15 @@ export async function computeIsolationSpec(
                 'invalid_isolation_input',
                 `harness 放行条目不是相对路径：${JSON.stringify(rel)}`,
               )
+          carveOuts.push(p)
           allowWriteInside.push(...(h.only.subpaths ?? []).map((rel) => join(p, rel)))
-          allowWriteLiterals.push(...(h.only.files ?? []).map((rel) => join(p, rel)))
+          allowWriteInsideLiterals.push(...(h.only.files ?? []).map((rel) => join(p, rel)))
           if (h.only.fileRegex !== undefined) {
             // 只匹配一级文件名：除字符类 `[^/]` 外不能含 `/`；SBPL 正则字面量不能含双引号。
             const re = h.only.fileRegex
             if (re.includes('"') || re.replaceAll('[^/]', '').includes('/'))
               return bad('invalid_isolation_input', 'harness 文件名正则不能含 / 或 "')
-            allowWriteRegex.push(`^${escapeRegex(p)}/${h.only.fileRegex}$`)
+            allowWriteInsideRegex.push(`^${escapeRegex(p)}/${h.only.fileRegex}$`)
           }
         } else allowWrite.push(p)
         // 不解析最后一级：条目可能是指向用户目录的链接，要拒绝的是替换链接本身（经链接写入目标时按目标路径判断，本来就不在白名单内）。
@@ -424,7 +435,7 @@ export async function computeIsolationSpec(
     // ---- 写白名单（tasks 4.6，审查第一轮）----
     // 本任务私有目录可写：其中有按任务私有的临时与缓存目录（M2），派工令牌与 `dispatch-tokens/` 仍在 deny_write 中。
     // 共享的临时与缓存目录（`/private/tmp`、`TMPDIR`、`~/.cache`、`~/Library/Caches` 等）不放行：会被沙箱外的进程直接使用。
-    allowWrite.push(ownTask, ...allowWriteInside)
+    allowWrite.push(ownTask)
     allowWriteLiterals.push(...WRITE_ALLOWLIST_DEVICES)
     allowWrite.push(...WRITE_ALLOWLIST_DEVICE_DIRS)
     if (input.allowKeychain) allowWriteRegex.push(keychainWriteRegex(realUserHome))
@@ -473,6 +484,9 @@ export async function computeIsolationSpec(
       allow_write: uniqueSorted(allowWrite),
       allow_write_literals: uniqueSorted(allowWriteLiterals),
       allow_write_regex: uniqueSorted(allowWriteRegex),
+      allow_write_inside: uniqueSorted(allowWriteInside),
+      allow_write_inside_literals: uniqueSorted(allowWriteInsideLiterals),
+      allow_write_inside_regex: uniqueSorted(allowWriteInsideRegex),
       write_carve_outs: minimal(carveOuts),
       write_carve_out_literals: uniqueSorted(gitRules.carveOutLiterals),
       allow_write_git: uniqueSorted(gitRules.allow),

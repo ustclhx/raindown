@@ -280,7 +280,7 @@ worker 需要访问的节点运行目录放在 raindown-home 下的 `run/`，与
 - `run/executors/<执行器>/<harness 子目录>/`：执行器级的 harness 目录，目前是上面的 CODEX_HOME；
 - `run/tasks/<任务>/dispatch-tokens/<租约>.token`：任务私有目录中的派工令牌；
 - `run/tasks/<任务>/review/<node-id>/`：claude-sdk 审查任务的私有目录（`worktree/`、`pr.diff`）；清理用的元数据由节点保存在 worker 不可写的 `state/review-meta/<node-id>/<任务>.json`（审查第一轮 L4）。
-- 施加外层 seatbelt 时（4.6、审查第一轮）：`run/tasks/<任务>/repo/`（写类任务的独立 clone）、`tmp/` 与 `cache/`（任务私有的临时与缓存目录）、`claude-config/`（claude-sdk 按任务的配置目录）；`run/executors/<codex 执行器>/codex-home-sealed/`（独立的 CODEX_HOME）。
+- 施加外层 seatbelt 时（4.6、审查第一轮）：`run/tasks/<任务>/repo/`（写类任务的独立 clone）、`tmp/` 与 `cache/`（任务私有的临时与缓存目录）、`claude-config/`（claude-sdk 按任务的配置目录）、`codex-home/`（codex 按任务的独立 CODEX_HOME，审查第二轮 M1）。
 
 各级目录 0700。任务结束、审查清理与节点启动清理后，变空的 `run/tasks/<任务>/` 被删除（只用 rmdir，不递归删除内容）。
 节点自己的任务状态（任务说明 `spec.md`、`orca.json`）、唤醒令牌、日志与锁仍在 `state/`。
@@ -1095,7 +1095,7 @@ isolation:
 | --- | --- | --- |
 | 工作目录 | 写类角色：**本任务的独立 clone** `run/tasks/<任务>/repo/`（见下文）；只读角色的工作目录以写拒绝表示 | 写类角色 |
 | 本任务私有目录 | `run/tasks/<任务>/`，其中含按任务私有的 `tmp/` 与 `cache/`；`dispatch-tokens/` 与派工令牌仍拒绝 | 全部 |
-| Codex | 独立的 `run/executors/<执行器>/codex-home-sealed/`，内部也是白名单（见下文）；`auth.json` 链接的目标**这一个文件** | codex-orca、codex-exec |
+| Codex | 按任务的独立 `run/tasks/<任务>/codex-home/`，内部也是白名单（见下文）；`auth.json` 链接的目标**这一个文件** | codex-orca、codex-exec |
 | Claude Code | 按任务的 `run/tasks/<任务>/claude-config/`（`settings*.json`、`CLAUDE.md`、`commands/agents/skills/hooks/plugins/rules/output-styles`、`keybindings.json`、`managed-settings.json`、`.mcp.json` 除外） | claude-sdk |
 | 登录钥匙串 | 只有 `~/Library/Keychains/login.keychain-db` 与 `login.keychain-db.sb-*`（正则） | claude-sdk |
 | 设备 | `/dev/null`、`/dev/zero`、`/dev/tty`、`/dev/ptmx`、`/dev/ttys<N>`（固定正则）、`/dev/fd/`、`/dev/stdout`、`/dev/stderr`、`/dev/random`、`/dev/urandom`、`/dev/dtracehelper` | 全部 |
@@ -1140,14 +1140,19 @@ worker 的环境（codex-orca 终端命令的 `env` 赋值、codex-exec 子进�
   节点在 `state/tasks/<任务>/sealed-clone.json`（worker 读写都被拒绝）记录 `.git/config` 的 sha256 与 alternates。
 - 写规则：
   - 全部登记仓库（各 workspace 的 repos）的 `.git` 整体挖掉，对 worker 只读；
-  - clone 的 `.git` 放行，其中 `config`、`hooks/`、`info/`、`modules/`、`objects/info/alternates`、`objects/info/http-alternates` 最后再拒绝；
+  - clone 的 `.git` 放行，其中以下位置最后再拒绝：`config`、`hooks/`、`info/`、`modules/`、`objects/info/alternates`、`objects/info/http-alternates`，
+    以及 `commondir`、`gitdir`、`config.worktree`、`worktrees/`（审查第二轮 H1：worker 写入 `.git/commondir` 指向它伪造的目录，git 就会改读那里的配置）；
   - clone 的 `.git` 及其祖先目录不能改名。
   只有根目录正是本任务 clone、`.git` 是真实目录、且不是登记仓库的布局才放行。其他布局（共享 commondir 的 worktree、主检出、可疑的指针）的 git 目录一律只读。
 - 节点在沙箱外运行 git 的规则：
-  - push-env、diff 统计等安全 git 用 `verifyGitLocation(…, { home })` 接受独立 clone，条件是：路径正是 `run/tasks/<任务>/repo`、`.git` 是真实目录、config 的 sha256 与 alternates 和记录一致；
+  - push-env、diff 统计等安全 git 用 `verifyGitLocation(…, { home })` 接受独立 clone，条件是：路径正是 `run/tasks/<任务>/repo`、`.git` 是真实目录、
+    config 的 sha256 与 alternates 和记录一致，并且 `.git/commondir`、`config.worktree`、`worktrees/`、`gitdir` 都不存在；
+  - 安全 git 与节点建立、回收 clone 时运行的 git 都固定 `GIT_DIR` 与 `GIT_COMMON_DIR`（审查第二轮 H1），不读取 `commondir` 指针；
   - 之后**每次**运行 git 前重新核对 sha256，不一致即不运行；
   - 安全 git 另加 `-c protocol.ext.allow=never`；
   - 节点在 clone 中只做只读操作（`GIT_OPTIONAL_LOCKS=0`），不 fetch、不写 reflog，worker 预埋的符号链接不会被节点写入（测试覆盖 `logs/`、`FETCH_HEAD`、`ORIG_HEAD`）。
+- 检出：任务分支可能是 worker 写过的（迁移的同名分支、已有 PR 的 `origin/<分支>`）。节点检出时用审查准备的同一套中和（审查第二轮 M2）：
+  hook、fsmonitor、已配置的 filter driver 与 diff driver 全部置空，并设 `GIT_LFS_SKIP_SMUDGE=1`。LFS 文件因此是指针，worker 需要时可在沙箱内运行 `git lfs pull`。
 - setup：
   - codex-orca 仍用 `orca worktree create` 建 Orca worktree，但**只作终端宿主**（`--setup skip`），终端命令 `cd` 进独立 clone；
   - 新建 clone 后，节点以与 worker 相同的 seatbelt 配置与环境，在 clone 中运行仓库 `orca.yaml` 的 `scripts.setup`，再按原来的方式等待 setup 完成；
@@ -1167,7 +1172,11 @@ worker 的环境（codex-orca 终端命令的 `env` 赋值、codex-exec 子进�
   clone 核对不通过（配置被改动）时不取回、不删除，交给用户处理。
 - clone 不会自动删除，与 Orca worktree 一样保留；不要在任务 clone 中手动运行 git（见残留风险）。
 
-**独立 CODEX_HOME（审查第一轮 H3）。** 施加外层 seatbelt 的设置（danger-full-access）使用 `run/executors/<执行器>/codex-home-sealed/`，与 workspace-write / read-only 的 CODEX_HOME 不共享。共享时，worker 写入的 `.env`、`config.toml` 会被之后没有外层 seatbelt 的 Codex 进程加载。
+**独立 CODEX_HOME（审查第一轮 H3、第二轮 M1）。** 施加外层 seatbelt 的设置（danger-full-access）使用**按任务**的 `run/tasks/<任务>/codex-home/`：
+- 与 workspace-write / read-only 的 CODEX_HOME 不共享：共享时，worker 写入的 `.env`、`config.toml` 会被之后没有外层 seatbelt 的 Codex 进程加载；
+- 也不在任务之间共享：共享时一个任务的 worker 能改写另一个任务的会话记录，后者恢复会话时被注入；
+- 同一任务恢复会话用同一目录，任务完成或取消时删除；
+- 它位于可写的本任务私有目录内，因此目录本身先整体挖掉，再只放行下面的运行状态；执行器级的 CODEX_HOME（`run/executors/<执行器>/`）对 worker 读写都拒绝。
 - 内部也是白名单：只放行以下运行状态；
   - `sessions/`、`archived_sessions/`、`log/`、`cache/`、`tmp/`；
   - 根目录的 `history.jsonl`、`version.json`、`internal_storage.json`；
@@ -1251,6 +1260,13 @@ isolation:
 3. 路径属于 harness 运行状态（独立 CODEX_HOME、Claude 配置目录之外）：修改适配器声明（`SEALED_CODEX_HOME_ALLOW`、`CLAUDE_CONFIG_DENY_WRITE`）并补测试，不要用 `extra_write` 绕过。
 4. 路径是 `.git/config`、hooks、登记仓库的 `.git`、shell 启动文件、`~/.gitconfig` 等：这正是白名单要拦住的写入，改用不写这些位置的做法。
 
+**项目配置（审查第二轮 L2）。** codex-orca 预置信任后，Codex 会加载 clone 内的 `.codex/config.toml`（worker 或 PR 可控）。
+- 命令行 `-c` 优先于项目配置：施加时固定 `notify=[]`，`model_provider` 固定为角色配置的值（没有时为 `"openai"`）。
+- codex-orca 启动、恢复前与运行中仍会检查 `.codex/`，出现即停下（已有机制）。
+- 覆盖不了的项目配置（例如 `model_providers` 表、`mcp_servers`、`shell_environment_policy`）在出现到下一次检查之间可能生效，但 Codex 本身在外层 seatbelt 内，影响限于沙箱内（design Risks）。
+
+**节点往任务私有目录写文件（审查第二轮 L3）。** 任务私有目录对 worker 可写。节点往其中写文件（例如审查的 `pr.diff`、探针的临时文件）一律用 `writeFileNoFollow`：先以 `wx` 在同一目录写临时文件，再 rename 到目标，不跟随 worker 预埋的符号链接。新建目录则在创建后用 `lstat` 确认不是符号链接。
+
 **残留风险**（design Risks）：
 - 会话记录可以被改写：CODEX_HOME 与 Claude 配置目录中的会话记录可以被 worker 改写（提示注入，不是命令执行）。
 - 用户在 clone 中手动运行 git 会被利用：沙箱外的 git 会跟随 worker 预埋在 `.git` 中的符号链接写入，例如 `COMMIT_EDITMSG`，或已有的 reflog 文件。
@@ -1333,6 +1349,7 @@ claude-sdk 多声明一个沙箱设置 `supervisor-session → none`。探针每
 | `write.registered_git` | 拒绝 | 审查第一轮 H1：在模拟登记仓库的 `.git/objects/` 中新建探针文件（登记仓库的 `.git` 对 worker 整体只读） |
 | `write.git_objects` | 可写（只读角色为拒绝） | 工作目录（独立 clone 形状）`.git/objects/` 中新建探针文件后删除 |
 | `write.shared_tmp` | 拒绝 | 审查第一轮 M2：在共享的系统临时目录（`TMPDIR`）新建探针文件；worker 改用按任务私有的临时目录 |
+| `write.git_commondir` | 拒绝 | 审查第二轮 H1：在探针工作目录（独立 clone 形状）独占新建 `.git/commondir`，成功则立即删除 |
 | `debug.process` | 拒绝 | **未验证**，原因见下 |
 | `write.workdir` | 可写（只读角色为拒绝） | 在工作目录独占新建文件后删除 |
 | `read.own_task_token` | 可读 | 读取本任务令牌 |
@@ -1343,7 +1360,7 @@ claude-sdk 多声明一个沙箱设置 `supervisor-session → none`。探针每
 - 判定：`EACCES`/`EPERM`/`EROFS` 为拒绝；`ENOENT` 为跳过（目标不存在，无法验证）；连接得到 `ECONNREFUSED` 记为拒绝并注明歧义
   （seatbelt 拒绝 unix 连接时 bun 报的也是 `ECONNREFUSED`，与失效套接字、无人监听的端口无法区分）；其他错误为失败。
 - **通过**：没有不符合预期的项、没有运行错误，并且核心受保护项 `read.hub_token`、`read.ledger_db`、`read.other_task_token`、`write.config`、`rename.protected_ancestor`、`write.own_profile`（这两项为审查第一轮新增）、
-  `write.shell_startup`、`write.git_hooks`、`write.registered_git`（4.6 与审查第一轮新增；旧节点的结果缺新增项，按缺少核心项不通过）全部出现且确实被拒绝。跳过与未验证不计入通过或失败，但会显示（核心项被跳过同样不能通过）。
+  `write.shell_startup`、`write.git_hooks`、`write.registered_git`、`write.shared_tmp`、`write.git_commondir`（4.6 与两轮审查新增；旧节点的结果缺新增项，按缺少核心项不通过）全部出现且确实被拒绝。跳过与未验证不计入通过或失败，但会显示（核心项被跳过同样不能通过）。
 - `ok` 与 `passed` 由中枢按预期与实际重新计算后才写入（deny/allow 为 `actual === expected`，skipped/unverified 为 null，error 为 false），节点上报的值不用。
 - 探针运行本身抛错时，节点改为上报每个目标都带 `probe_failed` 错误的不通过结果，不继续上报之前的结果。
 - 跨进程调试为什么未验证：不需要 sudo、不触碰真实进程的检查都区分不了“隔离生效”与“系统本来就不允许”——`task_for_pid` 需要调试授权，

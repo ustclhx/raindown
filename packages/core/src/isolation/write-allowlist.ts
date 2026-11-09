@@ -225,6 +225,11 @@ export const GIT_DENY = [
   'hooks',
   'info',
   'modules',
+  // 改写这些指针或新建 worktree 管理目录可以让沙箱外的 git 改读别处的配置（审查第二轮 H1：独立 clone 的 commondir 重定向）。
+  'commondir',
+  'gitdir',
+  'config.worktree',
+  'worktrees',
   join('objects', 'info', 'alternates'),
   join('objects', 'info', 'http-alternates'),
 ] as const

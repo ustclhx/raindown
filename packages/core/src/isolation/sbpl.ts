@@ -174,7 +174,12 @@ export function renderSeatbeltProfile(spec: IsolationSpec): Result<string> {
         ...literals(spec.write_carve_out_literals),
       ]),
       ';; 1b. 本任务独立 clone 的 .git（写类角色）；config、hooks、alternates 等在下面再次拒绝。登记仓库的 .git 整体只读',
-      ...rule('allow', 'file-write*', subpaths(spec.allow_write_git)),
+      ...rule('allow', 'file-write*', [
+        ...subpaths(spec.allow_write_git),
+        ...subpaths(spec.allow_write_inside),
+        ...literals(spec.allow_write_inside_literals),
+        ...spec.allow_write_inside_regex.map(sbplRegex),
+      ]),
       '',
       ';; 2. 受保护资源：读写拒绝（以目录为单位，新增文件自动覆盖）；写在白名单之后，白名单不能重新放开',
       ...rule('deny', 'file-read*', subpaths(spec.deny_read)),

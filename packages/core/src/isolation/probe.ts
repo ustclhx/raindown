@@ -113,6 +113,8 @@ export interface ProbePlanInput {
   gitObjectsDir?: string
   /** 模拟登记仓库的 `.git/objects/`：一律拒绝（审查第一轮 H1：登记仓库的 `.git` 对 worker 整体只读）。 */
   registeredGitObjectsDir?: string
+  /** 探针工作目录（独立 clone 形状）的 `.git/commondir`：拒绝（审查第二轮 H1：commondir 重定向）。 */
+  gitCommondirFile?: string
   /** 共享的系统临时目录（`TMPDIR`）：拒绝（审查第一轮 M2，worker 改用按任务私有的临时目录）。 */
   sharedTmp?: string
 }
@@ -268,13 +270,29 @@ export function buildProbePlan(input: ProbePlanInput): ProbePlan {
           skip: '没有提供探针的模拟登记仓库',
         },
   )
-  if (input.sharedTmp)
-    items.push({
-      item: 'write.shared_tmp',
-      kind: 'write_new',
-      expected: 'deny',
-      target: input.sharedTmp,
-    })
+  items.push(
+    input.sharedTmp
+      ? { item: 'write.shared_tmp', kind: 'write_new', expected: 'deny', target: input.sharedTmp }
+      : {
+          item: 'write.shared_tmp',
+          kind: 'write_new',
+          expected: 'deny',
+          skip: '没有提供共享的系统临时目录',
+        },
+    input.gitCommondirFile
+      ? {
+          item: 'write.git_commondir',
+          kind: 'create_file',
+          expected: 'deny',
+          target: input.gitCommondirFile,
+        }
+      : {
+          item: 'write.git_commondir',
+          kind: 'create_file',
+          expected: 'deny',
+          skip: '没有提供探针的临时仓库',
+        },
+  )
   if (input.gitObjectsDir)
     items.push({
       item: 'write.git_objects',
