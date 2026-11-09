@@ -37,6 +37,7 @@ permissions:
 `,
   'dev.md': `按任务合同在指定仓库中完成开发，只修改授权范围内的内容。
 运行相关检查，提交、推送并创建 PR，不合并。
+推送用 git push origin HEAD:<分支>；新建分支加 --no-track（隔离下 .git/config 不可写，设置上游会失败）。
 优先通过 Raindown MCP 的 raindown_report 上报状态（harness 中的工具名为 mcp__raindown__raindown_report）：
 - 需要人决定时上报 question，给出一个具体问题、2–8 个选项及说明和推荐项，随后停下等待回复。
 - 完成时上报 ready，附 PR 地址作为 deliverables；若返回 branch_unknown，改用 blocked 说明无法确认任务分支；若返回 deliverable_branch_mismatch，按提示在登记分支上开 PR，否则改用 blocked 说明，不要反复提交 ready。

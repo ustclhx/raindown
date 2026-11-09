@@ -171,6 +171,19 @@ async function attempt(item: ProbePlanItem, plan: ProbePlan, sys: ProbeSystem): 
         return { actual: 'allow', detail: `探针文件未能删除，残留 ${path}（${errCode(err)}）` }
       }
     }
+    case 'create_file':
+      // 只用于探针自建的临时目录（模拟的 shell 启动文件、临时仓库的 .git/hooks）；成功即为“可写”，随后立即删除。
+      try {
+        await sys.createExclusive(target)
+      } catch (err) {
+        return fileOutcome(err)
+      }
+      try {
+        await sys.unlink(target)
+        return { actual: 'allow' }
+      } catch (err) {
+        return { actual: 'allow', detail: `探针文件未能删除，残留 ${target}（${errCode(err)}）` }
+      }
     case 'open_write':
       try {
         await sys.openWrite(target)

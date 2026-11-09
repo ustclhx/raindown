@@ -28,7 +28,12 @@ import {
   taskRunDir,
 } from '@raindown/core'
 import { z } from 'zod'
-import { removeLeaseTokenFile, removeSeatbeltProfile, writeLeaseTokenFile } from '../lease-token.ts'
+import {
+  removeLeaseTokenFile,
+  removeSeatbeltProfile,
+  writeFileNoFollow,
+  writeLeaseTokenFile,
+} from '../lease-token.ts'
 import { hubPortOf, type SeatbeltOptions, writeSeatbeltLaunch } from '../seatbelt.ts'
 
 /**
@@ -97,6 +102,8 @@ export interface IsolationProbeOptions {
   tmpDir?: string
   ageKeyFile?: string
   resolveOrcaPorts?: () => Promise<number[]> | number[]
+  /** `config/node.yaml` 的 `isolation.extra_write`（与 worker 的隔离清单一致）。 */
+  extraWrite?: readonly string[]
   launchWrapper?: ProbeLaunchWrapper
   /** 子进程的可执行文件（缺省为当前运行时，即 bun）。 */
   execPath?: string
@@ -112,6 +119,43 @@ export const PROBE_TASK_PREFIX = 'isolation-probe-'
 const PROBE_LEASE = 'isolation-probe'
 /** 改名探针的临时目录名（位于探针临时任务目录下）。 */
 const RENAME_PROBE_DIR = 'rename-probe'
+/**
+ * 写白名单探针（tasks 4.6、审查第一轮）的临时目录 `run/isolation-probe-<hex>/`：位于写白名单之外（不在本任务私有目录内），
+ * 其中有模拟的用户主目录 `home/` 与模拟的登记仓库 `repo/.git`。探针工作目录造成独立 clone 的形状（`.git` 是真实目录，
+ * `objects/info/alternates` 指向模拟登记仓库的对象库），按与 worker 相同的规则计算白名单。结束即删除。
+ */
+export const PROBE_SCRATCH_PREFIX = 'isolation-probe-'
+
+/** 最小的 git 目录（不运行 git）：`HEAD`、`config`、`hooks/`、`objects/`、`refs/heads/`。 */
+async function fakeGitDir(dir: string) {
+  for (const d of [join(dir, 'hooks'), join(dir, 'objects', 'info'), join(dir, 'refs', 'heads')])
+    await mkdir(d, { recursive: true, mode: 0o700 })
+  await writeFile(join(dir, 'HEAD'), 'ref: refs/heads/main\n', { mode: 0o600 })
+  await writeFile(join(dir, 'config'), '[core]\n\trepositoryformatversion = 0\n', {
+    mode: 0o600,
+  })
+}
+
+/** 模拟登记仓库 `scratch/repo` 与独立 clone 形状的探针工作目录 `cwd`。 */
+async function buildProbeRepo(scratch: string, cwd: string) {
+  const repo = join(scratch, 'repo')
+  await fakeGitDir(join(repo, '.git'))
+  await fakeGitDir(join(cwd, '.git'))
+  await writeFile(
+    join(cwd, '.git', 'objects', 'info', 'alternates'),
+    `${join(repo, '.git', 'objects')}\n`,
+    { mode: 0o600 },
+  )
+  return {
+    repo,
+    plan: {
+      gitHookFile: join(cwd, '.git', 'hooks', 'post-checkout'),
+      gitObjectsDir: join(cwd, '.git', 'objects'),
+      registeredGitObjectsDir: join(repo, '.git', 'objects'),
+      gitCommondirFile: join(cwd, '.git', 'commondir'),
+    },
+  }
+}
 
 const knownLayer = (v: string | undefined) =>
   v !== undefined && (ISOLATION_LAYERS as readonly string[]).includes(v) ? v : 'none'
@@ -140,6 +184,9 @@ export function probeTargets(executors: readonly ExecutorInfo[]): ProbeTarget[] 
 
 /** 与执行器实际使用的 CODEX_HOME 子目录一致（codex-exec 的只读角色单独一个目录）。 */
 function executorHomeFor(target: ProbeTarget): string | undefined {
+  // 施加外层 seatbelt 的设置（danger-full-access）使用独立的 CODEX_HOME（审查第一轮 H3）。
+  if (target.setting === 'danger-full-access' && target.executor.startsWith('codex-'))
+    return 'codex-home-sealed'
   if (target.executor === 'codex-exec')
     return target.setting === 'read-only' ? 'codex-read-home' : 'codex-home'
   if (target.executor === 'codex-orca') return 'codex-home'
@@ -270,6 +317,23 @@ async function cleanStaleProbeTasks(home: string): Promise<void> {
   }
 }
 
+/** 删除上次运行中断时残留的写白名单探针临时目录 `run/isolation-probe-*`（只删真实目录，不跟随链接）。 */
+async function cleanStaleProbeScratch(home: string): Promise<void> {
+  const root = raindownPaths(home).run
+  let entries: string[]
+  try {
+    entries = await readdir(root)
+  } catch {
+    return
+  }
+  for (const name of entries) {
+    if (!name.startsWith(PROBE_SCRATCH_PREFIX)) continue
+    const p = join(root, name)
+    const info = await lstat(p).catch(() => undefined)
+    if (info?.isDirectory() && !info.isSymbolicLink()) await rm(p, { recursive: true, force: true })
+  }
+}
+
 async function runOne(
   o: IsolationProbeOptions,
   target: ProbeTarget,
@@ -291,10 +355,17 @@ async function runOne(
   const ownTask = `${PROBE_TASK_PREFIX}self-${hex}`
   const otherTask = `${PROBE_TASK_PREFIX}other-${hex}`
   let cwd: string | undefined
+  let scratch: string | undefined
   const tokens: string[] = []
   try {
     // 规范化为真实路径：与隔离清单中的路径一致（seatbelt 按真实路径匹配）。
     cwd = await realpath(await mkdtemp(join(o.tmpDir ?? tmpdir(), 'raindown-isolation-probe-')))
+    // 写白名单探针（tasks 4.6）：模拟的用户主目录与登记仓库，位于写白名单之外。
+    scratch = join(raindownPaths(o.home).run, `${PROBE_SCRATCH_PREFIX}${hex}`)
+    await mkdir(join(scratch, 'home'), { recursive: true, mode: 0o700 })
+    scratch = await realpath(scratch)
+    const shellStartupFile = join(scratch, 'home', '.zshenv')
+    const repo = await buildProbeRepo(scratch, cwd)
     // 本任务令牌（允许项）与临时伪造的他人任务令牌（受保护项）：内容明显为假，结束后删除。
     const fake = PROBE_FAKE_TOKEN_CONTENT.trim()
     const ownToken = await writeLeaseTokenFile(o.home, ownTask, PROBE_LEASE, fake)
@@ -305,7 +376,7 @@ async function runOne(
     // 子进程尝试改名 a（受保护路径的祖先目录）。只操作探针自建的临时目录树，绝不改名真实目录。
     const renameRoot = join(taskRunDir(o.home, ownTask), RENAME_PROBE_DIR)
     await mkdir(join(renameRoot, 'a', 'b'), { recursive: true, mode: 0o700 })
-    await writeFile(join(renameRoot, 'a', 'b', 'secret'), `${fake}\n`, { mode: 0o600 })
+    await writeFileNoFollow(join(renameRoot, 'a', 'b', 'secret'), `${fake}\n`)
     const renameTarget = await realpath(join(renameRoot, 'a'))
     const renameSecret = join(renameTarget, 'b', 'secret')
     const executorHome = executorHomeFor(target)
@@ -322,6 +393,10 @@ async function runOne(
       ...(o.ageKeyFile ? { ageKeyFile: o.ageKeyFile } : {}),
       ...(o.resolveOrcaPorts ? { resolveOrcaPorts: o.resolveOrcaPorts } : {}),
       ...(o.env ? { env: o.env } : {}),
+      ...(o.extraWrite ? { extraWrite: o.extraWrite } : {}),
+      // 模拟登记仓库的 .git 整体只读；探针工作目录按独立 clone 计算（写类角色时其 .git 可写）。
+      registeredRepos: [repo.repo],
+      sealedClone: cwd,
     })
     if (!spec.ok) return failed(spec.error.code, spec.error.message)
     const probeSpec: IsolationSpec = {
@@ -343,6 +418,9 @@ async function runOne(
       cwd,
       hubUrl: o.hubUrl,
       orcaSockets: shared.sockets,
+      shellStartupFile,
+      ...repo.plan,
+      sharedTmp: await realpath(tmpdir()),
     })
     const wrap = o.launchWrapper ?? identityLaunchWrapper
     const argv = await wrap(target, [o.execPath ?? process.execPath, PROBE_CHILD_SCRIPT], {
@@ -365,6 +443,7 @@ async function runOne(
     for (const task of [ownTask, otherTask])
       await rm(taskRunDir(o.home, task), { recursive: true, force: true }).catch(() => {})
     if (cwd) await rm(cwd, { recursive: true, force: true }).catch(() => {})
+    if (scratch) await rm(scratch, { recursive: true, force: true }).catch(() => {})
   }
 }
 
@@ -395,6 +474,7 @@ export async function cleanProbeLeftovers(home: string): Promise<string[]> {
     }
   }
   await cleanStaleProbeTasks(home)
+  await cleanStaleProbeScratch(home)
   return removed
 }
 
@@ -408,7 +488,8 @@ const targetAccess = (t: ProbeTarget): 'read' | 'write' =>
  */
 function reuseRun(rep: IsolationProbeRun, target: ProbeTarget): IsolationProbeRun {
   const items = rep.items.map((i) => {
-    if (i.item !== 'write.workdir') return i
+    // 工作目录与登记仓库 .git 中 worktree 必需部分只对写类角色放行（tasks 4.6）。
+    if (i.item !== 'write.workdir' && i.item !== 'write.git_objects') return i
     const expected = targetAccess(target) === 'write' ? ('allow' as const) : ('deny' as const)
     return { ...i, expected, ok: probeItemOk({ expected, actual: i.actual }) }
   })

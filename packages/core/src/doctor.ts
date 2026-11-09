@@ -13,6 +13,7 @@ import { isRepoRoot } from './git.ts'
 import { type Env, GIT_REPOS, type RaindownHomeSource, raindownPaths } from './home.ts'
 import { roleSandboxInfo } from './isolation/capability.ts'
 import { describeIsolationStatus, isolationStatusRows } from './isolation/probe.ts'
+import { normalizeExtraWrite } from './isolation/write-allowlist.ts'
 import type { NodeView } from './ledger/protocol.ts'
 import { loadPoliciesConfig } from './policy/config.ts'
 import { policyVersion } from './policy/version.ts'
@@ -523,7 +524,9 @@ export async function runDoctor(
     })
   }
 
-  checks.push(...(await isolationSwitchChecks(home, opts.platform ?? process.platform)))
+  checks.push(
+    ...(await isolationSwitchChecks(home, opts.platform ?? process.platform, opts.userHome)),
+  )
   if (opts.isolationNodes) checks.push(...(await isolationProbeChecks(opts.isolationNodes)))
 
   const normalized: DoctorCheck[] = checks.map((c) => ({
@@ -543,13 +546,43 @@ export async function runDoctor(
 /**
  * 本机节点的外层 seatbelt 开关（`config/node.yaml` 的 `isolation.enforce`，审查第一轮 L3）：
  * 打开但不在 macOS 上时明确提示“未施加”；node.yaml 读取失败由节点启动时报告，这里不重复。
+ * 写白名单的追加目录 `isolation.extra_write`（tasks 4.6）不为空时逐条显示，并按受保护的 raindown-home 与持久化位置预先检查
+ * （完整检查在每次启动 harness 前计算隔离清单时进行，不合法时任务以 `isolation_extra_write_invalid` 失败）。
  */
 export async function isolationSwitchChecks(
   home: string,
   platform: NodeJS.Platform,
+  userHome: string = homedir(),
 ): Promise<DoctorCheck[]> {
   const config = await loadNodeConfig(home)
-  if (!config.ok || !config.data.isolation.enforce) return []
+  if (!config.ok) return []
+  const checks: DoctorCheck[] = []
+  const extra = config.data.isolation.extra_write
+  if (extra.length > 0) {
+    const workspaces = await loadWorkspaces(home)
+    const checked = await normalizeExtraWrite(extra, {
+      userHome,
+      protectedPaths: [home],
+      registeredRepos: workspaces.ok ? workspaces.data.workspaces.flatMap((w) => w.repos) : [],
+      pathEnv: process.env.PATH,
+    })
+    checks.push(
+      checked.ok
+        ? {
+            id: 'isolation.extra_write',
+            ok: true,
+            message: `外层 seatbelt 写白名单追加目录（config/node.yaml 的 isolation.extra_write）：${extra.join('、')}`,
+          }
+        : {
+            id: 'isolation.extra_write',
+            ok: false,
+            severity: 'warning',
+            message: `config/node.yaml 的 isolation.extra_write 中的 ${checked.path} 不能放行：${checked.reason}；施加外层 seatbelt 时任务会以 isolation_extra_write_invalid 失败`,
+            hint: '只追加工具的缓存或数据子目录，不要追加用户主目录、shell 启动文件、~/.ssh、~/.gitconfig、raindown-home 等位置或它们的祖先',
+          },
+    )
+  }
+  if (!config.data.isolation.enforce) return checks
   if (platform !== 'darwin')
     return [
       {
@@ -559,14 +592,16 @@ export async function isolationSwitchChecks(
         message: `config/node.yaml 的 isolation.enforce 已打开，但本机平台（${platform}）不支持外层 seatbelt，未施加任何隔离`,
         hint: '外层 seatbelt 只支持 macOS；Linux 的施加层尚未实现。不需要时把 isolation.enforce 改回 false',
       },
+      ...checks,
     ]
   return [
     {
       id: 'isolation.enforce',
       ok: true,
       message:
-        'config/node.yaml 的 isolation.enforce 已打开：施加层为 seatbelt 的角色以 sandbox-exec 启动（是否生效以隔离自检为准）',
+        'config/node.yaml 的 isolation.enforce 已打开：施加层为 seatbelt 的角色以 sandbox-exec 启动，写入为白名单（是否生效以隔离自检为准）',
     },
+    ...checks,
   ]
 }
 

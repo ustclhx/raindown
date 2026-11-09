@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from 'node:child_process'
+import { realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -24,11 +25,15 @@ import { z } from 'zod'
 import { type NodeClock, systemClock } from './clock.ts'
 import {
   CODEX_CREDENTIAL_ISOLATION,
+  codexHarnessPaths,
   codexShellEnvPolicyConfig,
   codexTaskMcpConfig,
   execCodexHome,
   prepareCodexHome,
   readCodexHome,
+  removeSealedCodexHome,
+  SEALED_CODEX_HOME,
+  sealedCodexHome,
 } from './codex-home.ts'
 import { questionMessage } from './codex-orca/classify.ts'
 import { resolveContext } from './codex-orca/spec.ts'
@@ -39,6 +44,7 @@ import {
   type ExecutorPlugin,
   resumedSignal,
 } from './executor.ts'
+import { prepareSealedWorkdir, rollbackSealedClone } from './sealed-workdir.ts'
 import {
   effectiveCredentialIsolation,
   prepareSeatbelt,
@@ -46,6 +52,7 @@ import {
   seatbeltApplies,
   seatbeltFailureMessage,
 } from './seatbelt.ts'
+import { prepareTaskScratch, removeTaskScratch } from './task-scratch.ts'
 
 export { readCodexHome } from './codex-home.ts'
 
@@ -195,6 +202,10 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
       let diagnostics = ''
       let executionStarted = false
       let lastActivity = clock.now()
+      /** Codex 的工作目录：施加外层 seatbelt 的写类角色改为本任务的独立 clone。 */
+      let cwd = ctx.cwd
+      /** 施加了外层 seatbelt：结束时删除本任务私有的临时与缓存目录（审查第一轮 M2）。 */
+      let scratchApplied = false
       let settle: (r: Result<ExecutorOutcome>) => void = () => {}
       const done = new Promise<Result<ExecutorOutcome>>((resolve) => {
         settle = resolve
@@ -221,7 +232,14 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
         finished = true
         ctx.signal.removeEventListener('abort', onAbort)
         queue.close()
-        settle(value)
+        if (!scratchApplied) return settle(value)
+        // 独立 CODEX_HOME 按任务保留到任务完成或取消（恢复会话需要它，审查第二轮 M1）。
+        const terminal =
+          value.ok && (value.data.outcome === 'done' || value.data.outcome === 'cancelled')
+        void Promise.all([
+          removeTaskScratch(options.home, ctx.taskId),
+          terminal ? removeSealedCodexHome(options.home, ctx.taskId) : undefined,
+        ]).finally(() => settle(value))
       }
       const onAbort = () => {
         // abort 与 cancel 可能在 close 回调之前连续到达，只向进程组发送一次信号。
@@ -324,7 +342,20 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
           process.env.CODEX_HOME ??
           join(homedir(), '.codex')
         const readRole = effectiveRoleKind(role.data) === 'read'
-        const dir = readRole ? readCodexHome(options.home) : execCodexHome(options.home)
+        // 外层 seatbelt（4.3）：开关打开且角色沙箱为 danger-full-access 时施加；失败时不启动 Codex。
+        // 施加时使用独立的 CODEX_HOME（审查第一轮 H3），写类角色在本任务的独立 clone 中运行（第一步方案）。
+        const applies = seatbeltApplies(credentialIsolation, role.data, options.isolation)
+        const dir = applies
+          ? sealedCodexHome(options.home, ctx.taskId)
+          : readRole
+            ? readCodexHome(options.home)
+            : execCodexHome(options.home)
+        if (!applies && !readRole) {
+          const rolled = await rollbackSealedClone(options.home, ctx.taskId, {
+            ...(options.isolation?.gitEnv ? { env: options.isolation.gitEnv } : {}),
+          })
+          if (rolled) output(rolled, 'status')
+        }
         const isolated = await prepareCodexHome(dir, source)
         if (!isolated.ok) {
           finish(
@@ -336,21 +367,51 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
           return
         }
         if (finished) return
-        // 外层 seatbelt（4.3）：开关打开且角色沙箱为 danger-full-access 时施加；失败时不启动 Codex。
         let seatbelt: string[] = []
-        if (seatbeltApplies(credentialIsolation, role.data, options.isolation)) {
-          const prepared = await prepareSeatbelt(options.isolation, {
+        let scratchEnv: Record<string, string> = {}
+        if (applies && options.isolation) {
+          scratchApplied = true
+          const common = {
             home: options.home,
             taskId: ctx.taskId,
             executor: 'codex-exec',
-            executorHome: readRole ? 'codex-read-home' : 'codex-home',
-            cwd: ctx.cwd,
-            access: readRole ? 'read' : 'write',
+            executorHome: SEALED_CODEX_HOME,
             ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
             ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
-            harnessPaths: [{ path: isolated.data, access: 'write' }],
-          })
+            harnessPaths: codexHarnessPaths(isolated.data),
+          }
+          let prepared: Result<{ prefix: string[]; scratchEnv: Record<string, string> }>
+          if (!readRole) {
+            const repo = await realpath(ctx.cwd).catch(() => ctx.cwd)
+            const workdir = await prepareSealedWorkdir(options.isolation, {
+              ...common,
+              repo,
+              branch: ctx.taskId,
+              env: env.data,
+              status: (text) => output(text, 'status'),
+            })
+            if (workdir.ok) {
+              cwd = workdir.data.dir
+              await ctx.reportBranch?.({ branch: ctx.taskId, worktree: cwd, repo })
+            }
+            prepared = workdir
+          } else {
+            const scratch = await prepareTaskScratch(options.home, ctx.taskId).catch(
+              (err: Error) => err,
+            )
+            if (scratch instanceof Error)
+              prepared = fail('failure', 'task_scratch_failed', scratch.message)
+            else {
+              const r = await prepareSeatbelt(options.isolation, {
+                ...common,
+                cwd,
+                access: 'read',
+              })
+              prepared = r.ok ? ok({ prefix: r.data.prefix, scratchEnv: scratch }) : r
+            }
+          }
           if (finished) return
+          if (prepared.ok) scratchEnv = prepared.data.scratchEnv
           if (!prepared.ok) {
             finish(
               ok({
@@ -364,12 +425,15 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
         }
         const childEnv = {
           ...env.data,
+          // 按任务私有的临时与缓存目录（审查第一轮 M2；只在施加外层 seatbelt 时注入）。
+          ...scratchEnv,
           CODEX_HOME: isolated.data,
           ...(ctx.leaseTokenFile ? { RAINDOWN_LEASE_TOKEN_FILE: ctx.leaseTokenFile } : {}),
           // 中枢地址随派工令牌一起交给受管 MCP：任务绑定会话不读 config/hub.yaml（D3）。
           ...(ctx.leaseTokenFile && ctx.hubUrl ? { RAINDOWN_HUB_URL: ctx.hubUrl } : {}),
         }
-        // 不上报任务分支：codex-exec 不创建专用分支或 worktree，cwd 的当前分支不归本任务所有（见 docs/executors.md）。
+        // 未施加外层 seatbelt 时不上报任务分支：codex-exec 不创建专用分支或 worktree，cwd 的当前分支不归本任务所有（见 docs/executors.md）。
+        // 施加时写类角色在本任务的独立 clone 中、以任务 id 为分支运行，上面已上报。
         if (finished) return
         // exec 无 -a 选项、不走交互审批，无需默认覆盖 reviewer。
         const args = [...command.slice(1), 'exec', '--json']
@@ -400,7 +464,7 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
           processArgs.push('--', prompt)
           const argv = [...seatbelt, command[0] ?? 'codex', ...processArgs]
           child = spawn(argv[0] as string, argv.slice(1), {
-            cwd: ctx.cwd,
+            cwd,
             env: childEnv,
             shell: false,
             detached: true,
@@ -486,7 +550,7 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
                   ...(session ? { session } : {}),
                 }),
               )
-            } else finish(ok({ outcome: 'done', result: result(lastText), workdir: ctx.cwd }))
+            } else finish(ok({ outcome: 'done', result: result(lastText), workdir: cwd }))
           })
         }
         await start(ctx.resume?.session)

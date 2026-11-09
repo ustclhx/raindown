@@ -21,6 +21,7 @@ import {
   REVIEW_DIFF_FILE,
   readRoleMayUse,
   reviewDir as reviewDirOf,
+  reviewMetaPath,
 } from '../src/index.ts'
 import { fakeGh, gitEnv, PR_URL, sh, type TempRepo, tempRepo } from './github-helpers.ts'
 
@@ -460,7 +461,14 @@ describe('审查准备', () => {
     // 模拟崩溃：会话进行中直接丢弃（不等清理），再看启动清理。
     const dir = reviewDir(r, 't-stale')
     mkdirSync(dir, { recursive: true })
-    writeFileSync(join(dir, 'meta.json'), JSON.stringify({ repo: r.repo }))
+    // 清理用的元数据由节点保存在 state/（审查第一轮 L4）；私有目录中 worker 可写的副本不被信任。
+    const meta = reviewMetaPath(r.home, 'n-test', 't-stale')
+    mkdirSync(join(meta, '..'), { recursive: true })
+    writeFileSync(meta, JSON.stringify({ repo: r.repo }))
+    writeFileSync(
+      join(dir, 'meta.json'),
+      JSON.stringify({ repo: '/nonexistent/evil', ref: 'refs/heads/main' }),
+    )
     sh(r.repo, 'worktree', 'add', '--detach', join(dir, 'worktree'), r.base)
     const other = reviewDirOf(r.home, 'n-other', 't-x')
     mkdirSync(other, { recursive: true })
@@ -479,6 +487,9 @@ describe('审查准备', () => {
     expect(existsSync(dir)).toBe(false)
     expect(existsSync(join(r.home, 'run', 'tasks', 't-stale'))).toBe(false)
     expect(sh(r.repo, 'worktree', 'list')).not.toContain('t-stale')
+    expect(existsSync(meta)).toBe(false)
+    // 伪造的副本把 ref 指向 main：没有被当作清理目标。
+    expect(sh(r.repo, 'rev-parse', '--verify', '-q', 'refs/heads/main').trim()).not.toBe('')
     expect(existsSync(other)).toBe(true)
     expect(existsSync(legacy)).toBe(false)
     expect(sh(r.repo, 'worktree', 'list')).not.toContain('t-old')

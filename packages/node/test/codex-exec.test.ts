@@ -36,6 +36,7 @@ import {
 } from '../src/index.ts'
 import { bench } from './harness.ts'
 import { processStopped } from './process.ts'
+import { initTestRepo } from './sealed-helpers.ts'
 import { waitFor } from './wait.ts'
 
 /** 所有执行测试只启动 process.execPath + 临时脚本，CI 无需安装 Codex。 */
@@ -66,7 +67,8 @@ const { spawn } = require('node:child_process')
 const question = ${JSON.stringify(question)}
 const resumed = ${JSON.stringify(resumed)}
 const args = process.argv.slice(2)
-fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify({ args, cwd: process.cwd(), token: process.env.RAINDOWN_HUB_TOKEN, home: process.env.RAINDOWN_HOME, actor: process.env.RAINDOWN_ACTOR, codexHome: process.env.CODEX_HOME, leaseTokenFile: process.env.RAINDOWN_LEASE_TOKEN_FILE, hubUrl: process.env.RAINDOWN_HUB_URL }))
+// 施加真实 seatbelt 时测试目录不在写白名单内：报告写不出去不影响后续逻辑。
+try { fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify({ args, cwd: process.cwd(), token: process.env.RAINDOWN_HUB_TOKEN, home: process.env.RAINDOWN_HOME, actor: process.env.RAINDOWN_ACTOR, codexHome: process.env.CODEX_HOME, leaseTokenFile: process.env.RAINDOWN_LEASE_TOKEN_FILE, hubUrl: process.env.RAINDOWN_HUB_URL, tmp: process.env.TMPDIR })) } catch {}
 // 故意逐 7 字节输出，覆盖 UTF-8、多行和 JSON 跨 chunk；最后一行没有换行。
 const send = text => { const b = Buffer.from(text.trimEnd()); for (let i = 0; i < b.length; i += 7) fs.writeSync(1, b.subarray(i, i + 7)) }
 ${body}
@@ -127,6 +129,7 @@ ${body}
         codexHome?: string
         leaseTokenFile?: string
         hubUrl?: string
+        tmp?: string
       },
     launched: () => existsSync(report),
   }
@@ -888,13 +891,23 @@ function fakeSandboxExec(dir: string) {
 describe('外层 seatbelt（worker-credential-isolation 4.3）', () => {
   const dfa = { permissions: { sandbox: 'danger-full-access' as const } }
   const hubUrl = 'http://127.0.0.1:7477'
+  // 施加外层 seatbelt 的写类角色从登记仓库建立独立 clone（审查第一轮）：测试目录先变成 git 仓库（临时 HOME）。
   const isolation = (s: ReturnType<typeof setup>, sandboxExec?: string, enforce = true) => ({
     enforce,
     platform: 'darwin' as const,
     ...(sandboxExec ? { sandboxExec } : {}),
     userHome: join(s.dir, 'user'),
     env: {},
+    gitEnv: existsSync(join(s.dir, '.git')) ? gitEnvOf(s.dir) : initTestRepo(s.dir),
   })
+  const gitEnvOf = (dir: string): NodeJS.ProcessEnv => ({
+    PATH: process.env.PATH ?? '/usr/bin:/bin',
+    HOME: join(dir, '.git-test-home'),
+    XDG_CONFIG_HOME: join(dir, '.git-test-home', 'xdg'),
+    GIT_CONFIG_NOSYSTEM: '1',
+    LANG: 'C',
+  })
+  const cloneOf = (s: ReturnType<typeof setup>) => join(s.home, 'run/tasks/t-test/repo')
 
   test.each([
     ['开关关闭', false, 'danger-full-access'],
@@ -927,7 +940,30 @@ describe('外层 seatbelt（worker-credential-isolation 4.3）', () => {
     expect(lstatSync(profile).mode & 0o777).toBe(0o600)
     const text = readFileSync(profile, 'utf8')
     expect(text).toContain('(version 1)\n(allow default)\n')
-    expect(text).toContain(`(subpath "${realpathSync(execCodexHome(s.home))}")`)
+    // 独立的 CODEX_HOME（审查第一轮 H3）：内部也是白名单，只放行运行状态；不与 workspace-write 共用的 codex-home。
+    // 每个任务一个独立的 CODEX_HOME（审查第二轮 M1）。
+    const sealedHome = join(realpathSync(s.home), 'run/tasks/t-test/codex-home')
+    // 任务完成后删除。
+    expect(existsSync(sealedHome)).toBe(false)
+    expect(s.report().codexHome).toBe(join(s.home, 'run/tasks/t-test/codex-home'))
+    expect(text).toContain('(deny file-write*)\n')
+    const writeBlock =
+      text.split('(allow file-write*')[1]?.split('(allow network-outbound')[0] ?? ''
+    expect(writeBlock).not.toContain(`(subpath "${sealedHome}")`)
+    for (const name of ['sessions', 'log', 'tmp'])
+      expect(text).toContain(`(subpath "${join(sealedHome, name)}")`)
+    // 普通 CODEX_HOME（无外层 seatbelt 的设置共用）没有被创建或放行。
+    expect(existsSync(execCodexHome(s.home))).toBe(false)
+    // auth.json 链接本身拒绝写（M1）。
+    expect(text).toContain(`(subpath "${join(sealedHome, 'auth.json')}")`)
+    // 写类角色在本任务的独立 clone 中运行（第一步方案），临时目录是本任务私有目录（M2）。
+    const clone = realpathSync(cloneOf(s))
+    expect(realpathSync(s.report().cwd)).toBe(clone)
+    expect(s.report().tmp).toBe(join(s.home, 'run/tasks/t-test/tmp'))
+    expect(text).toContain(`(subpath "${join(clone, '.git')}")`)
+    expect(text).toContain(`(subpath "${join(clone, '.git', 'hooks')}")`)
+    // 执行结束删除任务私有的临时与缓存目录。
+    expect(existsSync(join(s.home, 'run/tasks/t-test/tmp'))).toBe(false)
   })
 
   test('开关打开但非 macOS：不施加，能力声明不变', async () => {
@@ -986,9 +1022,10 @@ describe('外层 seatbelt（worker-credential-isolation 4.3）', () => {
         s.run({ ...s.ctx, hubUrl }, { ...s.options, isolation: isolation(s) }),
       )
       expect(outcome.outcome).toBe('done')
-      expect(readFileSync(join(s.dir, 'hub-read.txt'), 'utf8')).toBe('EPERM')
+      // worker 在本任务的独立 clone 中运行（审查第一轮，第一步方案）。
+      expect(readFileSync(join(cloneOf(s), 'hub-read.txt'), 'utf8')).toBe('EPERM')
       // 审查第一轮 H2：worker 不能改写本任务实际使用的配置（位于 state/tasks/<任务>/）。
-      expect(readFileSync(join(s.dir, 'profile-write.txt'), 'utf8')).toBe('EPERM')
+      expect(readFileSync(join(cloneOf(s), 'profile-write.txt'), 'utf8')).toBe('EPERM')
       expect(readFileSync(join(s.home, 'state/tasks/t-test/isolation.sb'), 'utf8')).toContain(
         '(deny file-write*',
       )

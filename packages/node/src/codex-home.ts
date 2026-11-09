@@ -17,9 +17,11 @@ import {
   type CredentialIsolation,
   executorRunDir,
   fail,
+  type HarnessPath,
   ok,
   type Result,
   raindownPaths,
+  taskRunDir,
 } from '@raindown/core'
 
 /**
@@ -351,3 +353,59 @@ export async function prepareCodexHome(dir: string, authSource: string): Promise
     return bad(`无法准备 Codex 的 CODEX_HOME：${(err as Error).message}`)
   }
 }
+
+/**
+ * 施加外层 seatbelt 的设置使用的独立 CODEX_HOME（审查第一轮 H3、第二轮 M1）：**每个任务一个** `run/tasks/<任务>/codex-home/`。
+ * - 与 workspace-write / read-only 设置的 CODEX_HOME 不共享：共享时 worker 写入的 `.env`、`config.toml` 等会被之后
+ *   没有外层 seatbelt 的 Codex 进程加载；
+ * - 也不在任务之间共享：共享时一个任务的 worker 能改写另一个任务的会话记录，后者恢复会话时被注入。
+ * 同一任务恢复会话用同一目录；任务完成或取消时删除（`removeSealedCodexHome`）。准备方式与普通 CODEX_HOME 相同
+ * （`prepareCodexHome`：覆盖 config.toml、清除扩展、链接 auth.json）。
+ */
+export const sealedCodexHome = (home: string, taskId: string) =>
+  join(taskRunDir(home, taskId), 'codex-home')
+
+/**
+ * 施加时 `run/executors/<执行器>/` 下只“保留”这个不存在的子目录名：执行器级的 CODEX_HOME（`codex-home`、`codex-read-home`，
+ * 被未施加的设置使用）对 worker 读写都拒绝。
+ */
+export const SEALED_CODEX_HOME = 'codex-home-sealed'
+
+/** 删除本任务的独立 CODEX_HOME（`rm` 不跟随 auth.json 链接）；不抛出。 */
+export async function removeSealedCodexHome(home: string, taskId: string): Promise<void> {
+  await rm(sealedCodexHome(home, taskId), { recursive: true, force: true }).catch(() => {})
+}
+
+/**
+ * 独立 CODEX_HOME 内部也是白名单（H3）：只放行运行状态——会话记录、日志、缓存、临时目录（Codex 启动时在 `tmp/arg0/`
+ * 建 apply_patch 等别名链接，拒绝会使这些工具不可用；这个目录只被同样受隔离的 Codex 使用，见 docs）、
+ * 根目录的 `history.jsonl`、`version.json`、`internal_storage.json` 与 sqlite 状态库。
+ * `.env`、`config.toml`、`shell_snapshots/`、`prompts/`、`rules/`、`hooks.json`、`AGENTS*.md`、`skills/`、`plugins/`、
+ * `models_cache.json` 等会被加载或执行的文件都不在内。
+ */
+export const SEALED_CODEX_HOME_ALLOW = {
+  subpaths: ['sessions', 'archived_sessions', 'log', 'cache', 'tmp'],
+  files: ['history.jsonl', 'version.json', 'internal_storage.json'],
+  fileRegex: '[^/]+\\.sqlite(-wal|-shm|-journal)?',
+} as const
+
+/**
+ * 外层 seatbelt 下 Codex 的 harness 目录（独立 CODEX_HOME）：
+ * - 内部白名单见 `SEALED_CODEX_HOME_ALLOW`；
+ * - `auth.json` 链接本身拒绝写（不能被换成指向别处的链接或普通文件，审查第一轮 M1）；
+ * - 链接目标（用户的 `auth.json`）这一个文件可写：Codex 在进程内刷新登录凭证并经链接写回。worker 因此可以把它换成
+ *   攻击者账号的凭证（登记在 design Risks）；改由节点在沙箱外刷新需要 Codex 支持只读凭证，目前不可行（见 docs）。
+ */
+export const codexHarnessPaths = (codexHome: string): HarnessPath[] => [
+  {
+    path: codexHome,
+    access: 'write',
+    only: {
+      subpaths: [...SEALED_CODEX_HOME_ALLOW.subpaths],
+      files: [...SEALED_CODEX_HOME_ALLOW.files],
+      fileRegex: SEALED_CODEX_HOME_ALLOW.fileRegex,
+    },
+    denyWrite: ['auth.json'],
+  },
+  { path: join(codexHome, 'auth.json'), access: 'write', literal: true },
+]

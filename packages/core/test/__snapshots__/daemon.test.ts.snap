@@ -26,6 +26,8 @@ exports[`plist 两个服务的 plist 快照包含启动、重启、环境和日�
     <string>/raindown</string>
     <key>PATH</key>
     <string>/opt:/usr/bin</string>
+    <key>BUN_RUNTIME_TRANSPILER_CACHE_PATH</key>
+    <string>0</string>
   </dict>
   <key>StandardOutPath</key>
   <string>/raindown/state/logs/hub.log</string>
@@ -62,6 +64,8 @@ exports[`plist 两个服务的 plist 快照包含启动、重启、环境和日�
     <string>/raindown</string>
     <key>PATH</key>
     <string>/opt:/usr/bin</string>
+    <key>BUN_RUNTIME_TRANSPILER_CACHE_PATH</key>
+    <string>0</string>
   </dict>
   <key>StandardOutPath</key>
   <string>/raindown/state/logs/node.log</string>
@@ -97,6 +101,8 @@ exports[`plist XML 特殊字符在所有字符串中转义，路径解析仅解�
     <string>/a&amp;&lt;&gt;&quot;&apos;/&amp;lt;</string>
     <key>PATH</key>
     <string>/a&amp;&lt;&gt;&quot;&apos;/&amp;lt;</string>
+    <key>BUN_RUNTIME_TRANSPILER_CACHE_PATH</key>
+    <string>0</string>
   </dict>
   <key>StandardOutPath</key>
   <string>/a&amp;&lt;&gt;&quot;&apos;/&amp;lt;</string>

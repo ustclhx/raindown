@@ -168,6 +168,25 @@ export async function writeSeatbeltProfile(
   return path
 }
 
+/**
+ * 节点往任务私有目录（worker 可写）写文件的方式（审查第二轮 L3，design D2 的不变量）：先以 `wx`（`O_CREAT|O_EXCL`，
+ * 不跟随已有的符号链接）在同一目录写临时文件，再 rename 到目标——rename 替换的是目录项本身，worker 预埋在目标路径的
+ * 符号链接不会被跟随写入。
+ */
+export async function writeFileNoFollow(
+  path: string,
+  data: string | Uint8Array,
+  mode = 0o600,
+): Promise<void> {
+  const pending = join(dirname(path), `.${randomUUID()}.tmp`)
+  try {
+    await writeFile(pending, data, { flag: 'wx', mode })
+    await rename(pending, path)
+  } finally {
+    await rm(pending, { force: true })
+  }
+}
+
 /** 节点启动时删除上次运行残留的外层 seatbelt 配置（`state/tasks/<任务>/isolation.sb`）。 */
 async function cleanSeatbeltProfiles(home: string): Promise<void> {
   const root = legacyTasksDir(home)

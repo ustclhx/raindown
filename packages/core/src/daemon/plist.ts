@@ -22,7 +22,11 @@ const escapeXml = (value: string): string =>
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[char] ?? char
   })
 
-/** 纯函数：所有字符串（包括 PATH 与命令参数）都经过 XML 转义。 */
+/**
+ * 纯函数：所有字符串（包括 PATH 与命令参数）都经过 XML 转义。
+ * `BUN_RUNTIME_TRANSPILER_CACHE_PATH=0` 关闭节点进程的 bun 转译缓存（缺省写在共享的 `~/Library/Caches`，
+ * add-worker-credential-isolation 审查第一轮 M2）；已安装的服务需重新运行 `raindown daemon install` 才生效。
+ */
 export function generatePlist(options: PlistOptions): string {
   const string = (value: string) => `<string>${escapeXml(value)}</string>`
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -47,6 +51,8 @@ ${[options.bunPath, options.cliPath, ...options.command].map((arg) => `    ${str
     ${string(options.home)}
     <key>PATH</key>
     ${string(options.path)}
+    <key>BUN_RUNTIME_TRANSPILER_CACHE_PATH</key>
+    ${string('0')}
   </dict>
   <key>StandardOutPath</key>
   ${string(options.logPath)}

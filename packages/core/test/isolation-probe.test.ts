@@ -87,6 +87,11 @@ describe('探针清单（buildProbePlan）', () => {
     expect(by['rename.protected_ancestor']?.skip).toBeDefined()
     expect(by['write.own_profile']).toMatchObject({ expected: 'deny', kind: 'open_write' })
     expect(by['debug.process']?.unverified).toContain('未验证')
+    // 写白名单探针（4.6）：没有给出临时 home 与临时仓库时跳过（核心项被跳过同样不能通过）。
+    expect(by['write.shell_startup']).toMatchObject({ expected: 'deny', kind: 'create_file' })
+    expect(by['write.shell_startup']?.skip).toBeDefined()
+    expect(by['write.git_hooks']?.skip).toBeDefined()
+    expect(by['write.git_objects']).toBeUndefined()
     expect(by['write.workdir']).toMatchObject({ expected: 'allow', target: s.cwd })
     expect(by['read.own_task_token']).toMatchObject({ expected: 'allow', target: '/x/own.token' })
     expect(by['connect.hub']).toMatchObject({
@@ -116,6 +121,34 @@ describe('探针清单（buildProbePlan）', () => {
     expect(by['connect.orca_socket.1']?.target).toBe('/orca/a.sock')
     expect(by['connect.orca_socket.2']?.target).toBe('/orca/daemon/d.sock')
   })
+
+  test('写白名单探针：模拟 shell 启动文件与临时仓库 hooks 预期拒绝；objects 按角色读写类别', async () => {
+    const plan = (s: Awaited<ReturnType<typeof spec>>) =>
+      Object.fromEntries(
+        buildProbePlan({
+          spec: s.spec,
+          home: s.home,
+          ageKeyFile: '/k',
+          otherTaskToken: '/o',
+          ownToken: '/s',
+          cwd: s.cwd,
+          hubUrl: 'http://127.0.0.1:7801',
+          orcaSockets: { status: 'none', reason: 'x' },
+          shellStartupFile: '/scratch/home/.zshenv',
+          gitHookFile: '/scratch/repo/.git/hooks/post-checkout',
+          gitObjectsDir: `${s.cwd}/.git/objects`,
+        }).items.map((i) => [i.item, i]),
+      )
+    const w = plan(await spec())
+    expect(w['write.shell_startup']).toMatchObject({
+      kind: 'create_file',
+      expected: 'deny',
+      target: '/scratch/home/.zshenv',
+    })
+    expect(w['write.git_hooks']).toMatchObject({ kind: 'create_file', expected: 'deny' })
+    // 工作目录不是 git 仓库时清单没有 git 放行：objects 预期拒绝。
+    expect(w['write.git_objects']?.expected).toBe('deny')
+  })
 })
 
 const run = (
@@ -144,6 +177,11 @@ const run = (
           'write.config',
           'rename.protected_ancestor',
           'write.own_profile',
+          'write.shell_startup',
+          'write.git_hooks',
+          'write.registered_git',
+          'write.shared_tmp',
+          'write.git_commondir',
         ] as const
       ).map((item) => ({
         item,
@@ -352,6 +390,36 @@ describe('审查第一轮：开关与 Orca 端口的 doctor 提示', () => {
       expect(linux?.message).toContain('不支持外层 seatbelt，未施加任何隔离')
       const [mac] = await isolationSwitchChecks(home, 'darwin')
       expect(mac).toMatchObject({ id: 'isolation.enforce', ok: true })
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  test('4.6：doctor 显示 isolation.extra_write；用户主目录、持久化位置与 raindown-home 给出警告', async () => {
+    const home = tempHome()
+    const userHome = mkdtempSync(join(tmpdir(), 'raindown-fake-user-'))
+    roots.push(userHome)
+    try {
+      writeText(
+        join(home, 'config/node.yaml'),
+        `isolation:\n  enforce: true\n  extra_write:\n    - ${join(userHome, 'Library/Developer')}\n`,
+      )
+      const checks = await isolationSwitchChecks(home, 'darwin', userHome)
+      expect(checks.find((c) => c.id === 'isolation.extra_write')).toMatchObject({ ok: true })
+      expect(checks.find((c) => c.id === 'isolation.extra_write')?.message).toContain(
+        join(userHome, 'Library/Developer'),
+      )
+      for (const bad of [userHome, join(userHome, '.ssh'), join(home, 'state')]) {
+        writeText(join(home, 'config/node.yaml'), `isolation:\n  extra_write:\n    - ${bad}\n`)
+        const [c] = await isolationSwitchChecks(home, 'darwin', userHome)
+        expect({ bad, c }).toMatchObject({
+          bad,
+          c: { id: 'isolation.extra_write', ok: false, severity: 'warning' },
+        })
+      }
+      // 相对路径在配置校验时就被拒绝（node.yaml 不合法由节点启动时报告，这里不重复）。
+      writeText(join(home, 'config/node.yaml'), 'isolation:\n  extra_write:\n    - relative/x\n')
+      expect(await isolationSwitchChecks(home, 'darwin', userHome)).toEqual([])
     } finally {
       rmSync(home, { recursive: true, force: true })
     }

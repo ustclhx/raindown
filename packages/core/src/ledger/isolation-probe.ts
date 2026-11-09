@@ -91,6 +91,14 @@ export const PROBE_REQUIRED_DENY_ITEMS = [
   // 审查第一轮 H1、H2：受保护路径的祖先目录不可改名；本任务实际使用的 seatbelt 配置不可改写。
   'rename.protected_ancestor',
   'write.own_profile',
+  // tasks 4.6 写白名单：白名单之外（模拟的 shell 启动文件）与登记仓库的 .git/hooks 不可写。
+  'write.shell_startup',
+  'write.git_hooks',
+  // 审查第一轮 H1：登记仓库的 .git 对 worker 整体只读（worker 在本任务的独立 clone 中工作）。
+  'write.registered_git',
+  // 审查第二轮 L1、H1：共享的系统临时目录不可写；独立 clone 的 .git/commondir 不可写。
+  'write.shared_tmp',
+  'write.git_commondir',
 ] as const
 
 /**

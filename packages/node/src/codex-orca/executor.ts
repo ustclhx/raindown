@@ -25,11 +25,15 @@ import { z } from 'zod'
 import { type NodeClock, sleep, systemClock } from '../clock.ts'
 import {
   CODEX_CREDENTIAL_ISOLATION,
+  codexHarnessPaths,
   codexShellEnvPolicyConfig,
   codexTaskMcpConfig,
   orcaCodexHome,
   prepareCodexHome,
+  removeSealedCodexHome,
+  SEALED_CODEX_HOME,
   sameCodexHome,
+  sealedCodexHome,
 } from '../codex-home.ts'
 import { CHILD_ENV_DENYLIST, dualRaindownEnv, executorRoleEnv } from '../env.ts'
 import {
@@ -44,6 +48,7 @@ import {
   resumedSignal,
 } from '../executor.ts'
 import { autoApprovedText, needsUserText } from '../precheck.ts'
+import { prepareSealedWorkdir, rollbackSealedClone, type SealedWorkdir } from '../sealed-workdir.ts'
 import {
   effectiveCredentialIsolation,
   prepareSeatbelt,
@@ -51,6 +56,7 @@ import {
   seatbeltApplies,
   seatbeltFailureMessage,
 } from '../seatbelt.ts'
+import { prepareTaskScratch, removeTaskScratch } from '../task-scratch.ts'
 import { resolveContractCwd } from '../workdir.ts'
 import {
   analyzeTail,
@@ -213,11 +219,21 @@ const stateSchema = z.object({
    * 开关打开时这类终端不重新挂接，按无法恢复处理。
    */
   isolation_layer: z.literal('seatbelt').optional(),
+  /**
+   * 施加外层 seatbelt 的写类任务的工作目录布局（审查第一轮，第一步方案）：`sealed` 时 `worktree_path` 是本任务的独立 clone
+   * （`run/tasks/<任务>/repo`），Orca worktree（`host_worktree`）只作终端宿主。缺失表示旧布局（Orca worktree 即工作目录）。
+   */
+  layout: z.literal('sealed').optional(),
+  host_worktree: z.string().optional(),
   /** 按 reply_id 的送达状态（PR #24 审查第 8 条：节点重启后不重复送达）。 */
   replies: z.record(z.string(), replyStateSchema).default({}),
   approval_round: approvalRoundSchema.optional(),
 })
 type OrcaTaskState = z.infer<typeof stateSchema>
+
+/** Orca 终端所在的 worktree：独立 clone 布局下是宿主 worktree，否则就是工作目录。 */
+const hostOf = (s: Pick<OrcaTaskState, 'worktree_path' | 'host_worktree'>) =>
+  s.host_worktree ?? s.worktree_path
 
 const quote = (s: string) => (/^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`)
 
@@ -254,6 +270,13 @@ export function buildCodexCommand(input: {
    * 任务说明 `"$(cat spec.md)"` 仍由沙箱外的外层 shell 展开。缺省时命令与之前逐字节一致。
    */
   seatbelt?: readonly string[]
+  /** 施加外层 seatbelt 时追加的环境变量（按任务私有的临时与缓存目录，审查第一轮 M2）。缺省时命令不变。 */
+  extraEnv?: Readonly<Record<string, string>>
+  /**
+   * 施加外层 seatbelt 时预置该目录的项目信任（审查第一轮 M6）：独立 CODEX_HOME 的 config.toml 不可写，
+   * 信任弹窗的确认无法保存；改为 `-c projects={"<目录>"={trust_level="trusted"}}`。缺省时命令不变。
+   */
+  trustProject?: string
 }): Result<string> {
   if (input.codexBin.includes('=')) {
     return fail('usage', 'invalid_codex_bin', 'codexBin 不能包含 =，避免被 env 当作环境变量赋值')
@@ -278,6 +301,20 @@ export function buildCodexCommand(input: {
     }
     if (p.approval) argv.push('-a', p.approval)
     if (p.sandbox) argv.push('-s', p.sandbox)
+  }
+  if (input.trustProject !== undefined) {
+    const trust = codexTrustConfig(input.trustProject)
+    if (!trust.ok) return trust
+    argv.push('-c', trust.data)
+    // 信任之后 Codex 会加载 clone 内的 `.codex/config.toml`（worker 或 PR 可控，审查第二轮 L2）：命令行 -c 优先于项目配置，
+    // 固定 notify 为空、model_provider 为角色配置的值（没有时为缺省的 openai）。覆盖不了的项目配置见 design Risks。
+    const provider = p.config?.model_provider
+    argv.push(
+      '-c',
+      'notify=[]',
+      '-c',
+      `model_provider=${provider !== undefined ? String(provider) : '"openai"'}`,
+    )
   }
   if (input.task) {
     argv.push(
@@ -306,6 +343,7 @@ export function buildCodexCommand(input: {
     ...taskEnv,
     RAINDOWN_ACTOR: env.data.RAINDOWN_ACTOR,
     FLOW_ACTOR: env.data.FLOW_ACTOR,
+    ...(input.extraEnv ?? {}),
     CODEX_HOME: input.codexHome,
   })
     .map(([key, value]) => quote(`${key}=${value}`))
@@ -314,6 +352,18 @@ export function buildCodexCommand(input: {
   return ok(
     `cd ${quote(input.worktreePath)} && exec env ${unset} ${assignments} ${cmd} "$(cat ${quote(input.specPath)})"`,
   )
+}
+
+/**
+ * 预置项目信任的 `-c` 值（审查第一轮 M6）：`projects={"<目录>"={trust_level="trusted"}}`。用不含点号的顶层键加内联表，
+ * 目录作为 TOML 基本字符串（转义 `\` 与 `"`），不受键路径按点号拆分的影响；含控制字符时拒绝。
+ */
+export function codexTrustConfig(dir: string): Result<string> {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: 正是要拒绝控制字符
+  if (/[\u0000-\u001f\u007f]/.test(dir))
+    return fail('usage', 'invalid_trust_path', `信任目录含控制字符：${JSON.stringify(dir)}`)
+  const key = `"${dir.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+  return ok(`projects={${key}={trust_level="trusted"}}`)
 }
 
 /** 默认的基准分支：`git symbolic-ref --short refs/remotes/origin/HEAD`，取不到时 `origin/main`。 */
@@ -512,7 +562,14 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
         directoryRetry.abort()
         ctx.signal.removeEventListener('abort', onAbort)
         queue.close()
-        settle(r)
+        // 按任务私有的临时与缓存目录（审查第一轮 M2）：Codex 终端可能在本次执行之后继续运行（重新挂接），
+        // 只在任务完成或取消时删除。
+        const terminal = r.ok && (r.data.outcome === 'done' || r.data.outcome === 'cancelled')
+        if (!terminal || !state || state.isolation_layer !== 'seatbelt') return settle(r)
+        void Promise.all([
+          removeTaskScratch(options.home, ctx.taskId),
+          removeSealedCodexHome(options.home, ctx.taskId),
+        ]).finally(() => settle(r))
       }
       const result = (summary: string, extra: Partial<TaskResult> = {}): TaskResult => ({
         summary,
@@ -724,7 +781,7 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
        */
       const relocate = async (): Promise<boolean> => {
         if (!state || !(await requireWorkdir())) return false
-        const r = await orca.terminalList({ worktreePath: state.worktree_path })
+        const r = await orca.terminalList({ worktreePath: hostOf(state) })
         if (!r.ok) return false
         const s = state
         // 缺少原进程身份时，唯一候选也可能是用户另开的未隔离 Codex，不能接管。
@@ -732,7 +789,7 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
         // 只考虑仍连接、未成为孤儿的 Codex 终端。
         const codex = r.data.filter(
           (t) =>
-            (t.worktreePath === undefined || t.worktreePath === s.worktree_path) &&
+            (t.worktreePath === undefined || t.worktreePath === hostOf(s)) &&
             t.agentIdentity === 'codex' &&
             t.orphaned !== true &&
             t.connected !== false,
@@ -1518,9 +1575,36 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
         if (!(await requireRepo(repo))) return
         const scope = codexOrcaInputs.parse(contract.inputs ?? {}).scope
 
+        // 外层 seatbelt（4.2）：开关打开且角色沙箱设置为 danger-full-access / bypass 时施加。
+        const isolation = seatbeltApplies(credentialIsolation, role, options.isolation)
+          ? options.isolation
+          : undefined
+        // 写类角色在本任务的独立 clone 中运行，Orca worktree 只作终端宿主（审查第一轮，第一步方案 (b)）。
+        const sealedRole = isolation !== undefined && effectiveRoleKind(role) !== 'read'
+
         state = await readState()
         if (state && state.repo !== repo) state = undefined
         approvalRound = state?.approval_round
+        if (state && state.layout === 'sealed' && !sealedRole) {
+          // 回滚（开关已关闭）：关闭旧终端，把独立 clone 中的任务分支取回登记仓库后删除 clone，回到 Orca worktree。
+          const old = state
+          if (old.handle) await orca.terminalClose({ handle: old.handle })
+          const rolled = await rollbackSealedClone(options.home, ctx.taskId, {
+            ...(options.isolation?.gitEnv ? { env: options.isolation.gitEnv } : {}),
+          })
+          old.worktree_path = old.host_worktree ?? old.worktree_path
+          delete old.layout
+          delete old.host_worktree
+          delete old.handle
+          delete old.pty_id
+          delete old.incarnation_id
+          delete old.isolation_layer
+          await saveState()
+          return failed(
+            'isolation_layout_changed',
+            `${rolled ?? '外层 seatbelt 已关闭'}；之后在 Orca worktree ${old.worktree_path} 中运行，它仍停在创建时的基准上，请先合入取回的分支再重试`,
+          )
+        }
         if (state && !(await requireWorkdir())) return
         let fresh = false
         if (!state) {
@@ -1530,7 +1614,8 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
             repo,
             name: ctx.taskId,
             baseBranch: base,
-            setup: 'run',
+            // 独立 clone 布局下 Orca worktree 只作终端宿主：setup 在独立 clone 中运行。
+            setup: sealedRole ? 'skip' : 'run',
             comment: `raindown 任务 ${ctx.taskId}`,
           })
           if (finished || stopping) return
@@ -1546,6 +1631,45 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
           fresh = true
           await saveState()
           status(`已创建 worktree ${state.worktree_path}（分支 ${state.branch}，基于 ${base}）`)
+        }
+        let sealedLaunch: SealedWorkdir | undefined
+        if (sealedRole && isolation) {
+          const cur = state
+          if (cur.layout !== 'sealed' && cur.handle) {
+            // 迁移：旧布局（共享 commondir 的 Orca worktree）中的终端没有隔离，关闭后在独立 clone 中重新启动。
+            await orca.terminalClose({ handle: cur.handle })
+            delete cur.handle
+            delete cur.pty_id
+            delete cur.incarnation_id
+            await saveState()
+          }
+          const sealed = await prepareSealedWorkdir(isolation, {
+            home: options.home,
+            taskId: ctx.taskId,
+            executor: 'codex-orca',
+            executorHome: SEALED_CODEX_HOME,
+            repo,
+            base: cur.base_branch,
+            branch: cur.branch,
+            ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
+            ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
+            env: actorEnv.data,
+            harnessPaths: codexHarnessPaths(sealedCodexHome(options.home, ctx.taskId)),
+            status,
+          })
+          if (finished || stopping) return
+          if (!sealed.ok)
+            return failed(sealed.error.code, seatbeltFailureMessage(sealed.error.message))
+          if (cur.layout !== 'sealed') {
+            cur.host_worktree = cur.worktree_path
+            cur.worktree_path = sealed.data.dir
+            cur.layout = 'sealed'
+            await saveState()
+            status(
+              `工作目录改为本任务的独立 clone ${cur.worktree_path}（分支 ${cur.branch}）；Orca worktree ${cur.host_worktree} 只作终端宿主`,
+            )
+          }
+          sealedLaunch = sealed.data
         }
         const st = state
         if (!(await requireWorkdir())) return
@@ -1577,8 +1701,9 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
         const specPath = await writeTaskSpec(options.home, ctx.taskId, spec)
         if (finished || stopping) return
 
+        // 施加外层 seatbelt 时使用独立的 CODEX_HOME（审查第一轮 H3）。
         const isolated = await prepareCodexHome(
-          orcaCodexHome(options.home),
+          isolation ? sealedCodexHome(options.home, ctx.taskId) : orcaCodexHome(options.home),
           options.codexAuthSource ??
             actorEnv.data.CODEX_HOME ??
             process.env.CODEX_HOME ??
@@ -1589,14 +1714,10 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
 
         // 每次派工都检查，包含已运行终端的恢复；worker 上轮可能自行创建了项目配置。
         if (await blockProjectConfig(st.worktree_path)) return
-        // 外层 seatbelt（4.2）：开关打开且角色沙箱设置为 danger-full-access / bypass 时施加。
-        const isolation = seatbeltApplies(credentialIsolation, role, options.isolation)
-          ? options.isolation
-          : undefined
 
         // 上一次执行留下的终端仍在运行且属于这个 worktree：接着用它，把带来的回复送进去。
         if (st.handle) {
-          const tail = await reusable(st.handle, st.worktree_path)
+          const tail = await reusable(st.handle, hostOf(st))
           if (finished || stopping) return
           if (tail) {
             // 无法改变存活进程的 CODEX_HOME；升级前的终端不能通过重挂接绕过隔离。
@@ -1651,22 +1772,31 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
           }
           if (!(await requireWorkdir())) return
           let seatbelt: string[] | undefined
-          if (isolation) {
+          let scratchEnv: Record<string, string> | undefined
+          if (sealedLaunch) {
+            seatbelt = sealedLaunch.prefix
+            scratchEnv = sealedLaunch.scratchEnv
+          } else if (isolation) {
+            const scratch = await prepareTaskScratch(options.home, ctx.taskId).catch(
+              (err: Error) => err,
+            )
+            if (scratch instanceof Error) return failed('task_scratch_failed', scratch.message)
             const prepared = await prepareSeatbelt(isolation, {
               home: options.home,
               taskId: ctx.taskId,
               executor: 'codex-orca',
-              executorHome: 'codex-home',
+              executorHome: SEALED_CODEX_HOME,
               cwd: st.worktree_path,
               access: effectiveRoleKind(role) === 'read' ? 'read' : 'write',
               ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
               ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
-              harnessPaths: [{ path: isolated.data, access: 'write' }],
+              harnessPaths: codexHarnessPaths(isolated.data),
             })
             if (finished || stopping) return
             if (!prepared.ok)
               return failed(prepared.error.code, seatbeltFailureMessage(prepared.error.message))
             seatbelt = prepared.data.prefix
+            scratchEnv = scratch
           }
           const cmd = buildCodexCommand({
             codexBin,
@@ -1682,11 +1812,14 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
             },
             role,
             ...(seatbelt ? { seatbelt } : {}),
+            // 施加时：按任务私有的临时与缓存目录（M2），并预置工作目录的项目信任，不出现信任弹窗（M6）。
+            ...(scratchEnv ? { extraEnv: scratchEnv } : {}),
+            ...(seatbelt ? { trustProject: st.worktree_path } : {}),
           })
           if (!cmd.ok) return failed(cmd.error.code, cmd.error.message)
           const title = `[Raindown] ${ctx.taskId}`
           const term = await orca.terminalCreate({
-            worktreePath: st.worktree_path,
+            worktreePath: hostOf(st),
             command: cmd.data,
             title,
           })

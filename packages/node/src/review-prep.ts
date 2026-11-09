@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs'
-import { mkdir, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { lstat, mkdir, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import {
   fail,
   gitSha,
@@ -23,7 +23,7 @@ import {
   UNTRUSTED_CHECKOUT_ENV,
   untrustedCheckoutConfig,
 } from './github.ts'
-import { removeEmptyTaskRunDir } from './lease-token.ts'
+import { removeEmptyTaskRunDir, writeFileNoFollow } from './lease-token.ts'
 
 /**
  * claude-sdk 审查准备（add-m1-supervisor D10；tasks 5.2；executor-claude-sdk "审查任务的准备与结构化输出"）。
@@ -37,8 +37,9 @@ import { removeEmptyTaskRunDir } from './lease-token.ts'
  *    检出时中和 hook、fsmonitor 与全部已配置的 filter driver（`untrustedCheckoutConfig`），并设 `GIT_LFS_SKIP_SMUDGE=1`；
  * 5. 任务结束后移除 worktree、任务专用 ref 与私有目录；节点启动时清理本节点残留的私有目录并 `git worktree prune`。
  *
- * 私有目录：`<raindown-home>/run/tasks/<task-id>/review/<node-id>/`，内含 `worktree/`、`pr.diff` 与 `meta.json`（登记仓库路径，
- * 供启动清理使用）。位于 `state/` 之外，是本任务私有目录的一部分，隔离时随本任务目录放行（worker-credential-isolation D2）。
+ * 私有目录：`<raindown-home>/run/tasks/<task-id>/review/<node-id>/`，内含 `worktree/` 与 `pr.diff`。清理用的元数据（登记仓库路径、
+ * 任务专用 ref）由节点自己保存在 worker 读写都被拒绝的 `state/review-meta/<node-id>/<task-id>.json`（审查第一轮 L4：
+ * 私有目录对 worker 可写，不能信任其中的副本）。位于 `state/` 之外，是本任务私有目录的一部分，隔离时随本任务目录放行（worker-credential-isolation D2）。
  * 旧版本放在 `state/review/<node-id>/<task-id>/`，启动清理同时清理旧位置。git 一律带 `-c core.hooksPath=/dev/null`，不运行仓库 hook。
  */
 
@@ -51,6 +52,19 @@ const REVIEW_DIR = 'review'
 /** 本节点某个审查任务的私有目录。 */
 export const reviewDir = (home: string, nodeId: string, taskId: string) =>
   join(taskRunDir(home, taskId), REVIEW_DIR, nodeId)
+
+/** 本节点某个审查任务的元数据（节点保存，worker 不可写）。 */
+export const reviewMetaPath = (home: string, nodeId: string, taskId: string) =>
+  join(raindownPaths(home).state, 'review-meta', nodeId, `${taskId}.json`)
+
+async function writeReviewMeta(path: string, meta: { repo: string; ref: string }): Promise<void> {
+  for (const d of [dirname(dirname(path)), dirname(path)]) {
+    await mkdir(d, { recursive: true, mode: 0o700 })
+    const info = await lstat(d)
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`${d} 不是普通目录`)
+  }
+  await writeFile(path, `${JSON.stringify(meta)}\n`, { mode: 0o600 })
+}
 
 /** 旧版本的审查目录根（`state/review/<node-id>/`），只用于启动清理。 */
 export const legacyReviewRoot = (home: string, nodeId: string) =>
@@ -122,11 +136,12 @@ export async function prepareReview(input: PrepareReviewInput): Promise<Result<P
     return fail('failure', 'review_prep_failed', `gh 返回的 head 不是提交 sha：${head}`)
 
   const dir = reviewDir(input.home, input.nodeId, input.taskId)
+  const metaPath = reviewMetaPath(input.home, input.nodeId, input.taskId)
   // 同一任务上一次尝试的残留（例如节点崩溃）：先清理。
-  await removeReviewDir(dir, input.git)
+  await removeReviewDir(dir, metaPath, input.git)
   await mkdir(dir, { recursive: true, mode: 0o700 })
   const cleanup = async () => {
-    await removeReviewDir(dir, input.git)
+    await removeReviewDir(dir, metaPath, input.git)
     await removeEmptyTaskRunDir(input.home, input.taskId, [
       join(REVIEW_DIR, input.nodeId),
       REVIEW_DIR,
@@ -137,9 +152,7 @@ export async function prepareReview(input: PrepareReviewInput): Promise<Result<P
     return r
   }
   const ref = reviewRef(input.taskId)
-  await writeFile(join(dir, META_FILE), `${JSON.stringify({ repo: input.repo, ref })}\n`, {
-    mode: 0o600,
-  })
+  await writeReviewMeta(metaPath, { repo: input.repo, ref })
   const config = await untrustedCheckoutConfig(input.repo, input.git)
   if (!config.ok)
     return bail(
@@ -150,7 +163,8 @@ export async function prepareReview(input: PrepareReviewInput): Promise<Result<P
   if (!diff.ok)
     return bail(fail('failure', 'review_prep_failed', `读取 PR diff 失败：${diff.error.message}`))
   const diffPath = join(dir, REVIEW_DIFF_FILE)
-  await writeFile(diffPath, diff.data, { mode: 0o600 })
+  // 私有目录对 worker 可写：不跟随预埋的符号链接（审查第二轮 L3）。
+  await writeFileNoFollow(diffPath, diff.data)
 
   const fetched = await git(
     input.repo,
@@ -212,12 +226,19 @@ export async function prepareReview(input: PrepareReviewInput): Promise<Result<P
 }
 
 /** 移除审查私有目录：先让登记仓库移除 worktree，再删目录，最后 prune。不抛出。 */
-async function removeReviewDir(dir: string, gitOptions?: GitOptions): Promise<void> {
-  if (!existsSync(dir)) return
+async function removeReviewDir(
+  dir: string,
+  metaPath: string,
+  gitOptions?: GitOptions,
+): Promise<void> {
+  if (!existsSync(dir)) {
+    await rm(metaPath, { force: true }).catch(() => {})
+    return
+  }
   let repo: string | undefined
   let ref: string | undefined
   try {
-    const meta = JSON.parse(await readFile(join(dir, META_FILE), 'utf8')) as {
+    const meta = JSON.parse(await readFile(metaPath, 'utf8')) as {
       repo?: unknown
       ref?: unknown
     }
@@ -238,6 +259,7 @@ async function removeReviewDir(dir: string, gitOptions?: GitOptions): Promise<vo
     await git(repo, ['worktree', 'prune'], gitOptions)
     if (ref) await git(repo, ['update-ref', '-d', ref], gitOptions)
   }
+  await rm(metaPath, { force: true }).catch(() => {})
 }
 
 /**
@@ -260,7 +282,7 @@ export async function cleanupStaleReviews(
     if (!safeName(task)) continue
     const dir = reviewDir(home, nodeId, task)
     if (!existsSync(dir)) continue
-    await removeReviewDir(dir, gitOptions)
+    await removeReviewDir(dir, reviewMetaPath(home, nodeId, task), gitOptions)
     await removeEmptyTaskRunDir(home, task, [join(REVIEW_DIR, nodeId), REVIEW_DIR])
   }
   const legacy = legacyReviewRoot(home, nodeId)
@@ -270,7 +292,9 @@ export async function cleanupStaleReviews(
   } catch {
     return
   }
-  for (const name of names) await removeReviewDir(join(legacy, name), gitOptions)
+  // 旧位置在 state/ 下（worker 不可写），元数据仍在目录内。
+  for (const name of names)
+    await removeReviewDir(join(legacy, name), join(legacy, name, META_FILE), gitOptions)
 }
 
 /** 审查任务的首条用户消息附加说明：PR、记录的 head、diff 位置与输出要求。 */

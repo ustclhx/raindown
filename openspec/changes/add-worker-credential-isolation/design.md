@@ -30,8 +30,8 @@
 ## Decisions
 
 ### D1. 统一的隔离描述，适配器选择施加层
-节点为每次派工生成 `IsolationSpec{deny_read[], deny_write[], allow_read[], allow_write[], allow_unix_sockets[], allow_local_ports[]}`。路径一律规范化为 realpath，这是正确性前提而不只是整洁：seatbelt 按真实路径匹配，未规范化的规则（例如 `/var/…` 而真实路径是 `/private/var/…`）会静默不生效。规范化在生成配置时做，不存在的路径按其最近的已存在祖先规范化后拼回。适配器把它落到三种施加层之一：
-- **外层 seatbelt**：用于 harness 自带 OS 沙箱关闭的情况（danger-full-access、bypass）。节点生成 SBPL 配置，用 `sandbox-exec -f` 启动 harness。配置以 `allow default` 为基础，显式 deny 受保护资源，避免误伤 harness 的正常运行。
+节点为每次派工生成 `IsolationSpec{deny_read[], deny_write[], allow_read[], allow_write[], allow_unix_sockets[], allow_local_ports[]}`。写入是白名单（4.6，见 D2）：`allow_write`（子树）、`allow_write_literals`（单个文件）与 `allow_write_regex` 就是全部可写位置，`write_carve_outs*` 在其中再挖掉登记仓库的 git 目录与 harness 配置，`allow_write_git` 再放行本任务独立 clone 的 `.git`；`deny_*` 受保护项与 `deny_write_except`（持久化位置）最后写入，白名单不能重新放开它们。路径一律规范化为 realpath，这是正确性前提而不只是整洁：seatbelt 按真实路径匹配，未规范化的规则（例如 `/var/…` 而真实路径是 `/private/var/…`）会静默不生效。规范化在生成配置时做，不存在的路径按其最近的已存在祖先规范化后拼回。适配器把它落到三种施加层之一：
+- **外层 seatbelt**：用于 harness 自带 OS 沙箱关闭的情况（danger-full-access、bypass）。节点生成 SBPL 配置，用 `sandbox-exec -f` 启动 harness。配置以 `allow default` 为基础（读、网络、进程等不改变），紧接着 `(deny file-write*)` 把写入改为白名单（4.6），显式 deny 受保护资源。
 - **harness 原生的读限制**：用于 harness 自带沙箱开启、无法嵌套的情况。1.1 实测结论：
   - Codex 支持：Raindown 在其管理的 CODEX_HOME 中生成 permissions profile，受保护路径写 `"deny"`，启动时不传 `-s`，改传 `-c default_permissions=<name>`。声明为 `native`。
   - Claude Code 不支持可靠的原生读限制（`denyRead` 只覆盖 Bash）。claude-sdk 开启 bash 沙箱时声明为 `none`；需要隔离的角色应关闭 bash 沙箱，改由外层 seatbelt 施加。
@@ -63,6 +63,45 @@
 - 本任务私有目录中的派工令牌文件；
 - 适配器声明的 harness 目录，例如 Raindown 管理的 CODEX_HOME，以及 Codex/Claude 登录所需的路径；
 - 中枢监听的本机端口；其余本机端口不默认拒绝（worker 自己起的 dev server、测试服务器需要可用），只拒绝上面解析出的 Orca 端口等已知控制端口。
+
+**写入白名单（4.6，用户 2026-11-09 决定；PR #99 第一轮审查后修订）。** 读取保持 `allow default` 加显式拒绝。写入默认拒绝，只放行以下位置（全部 realpath，按适配器与角色计算）：
+- **工作目录**：写类角色是本任务的**独立 clone** `run/tasks/<任务>/repo/`（见下）；只读角色的工作目录仍以写拒绝表示。
+- **本任务私有目录** `run/tasks/<任务>/`：其中有按任务私有的 `tmp/` 与 `cache/`。worker 的 `TMPDIR` 与 bun、npm、pnpm、Playwright、corepack、pre-commit、go、pip、uv 的缓存环境变量都指到这里，执行结束（codex-orca 为任务完成或取消）时删除。派工令牌与 `dispatch-tokens/` 仍写拒绝。
+- **适配器声明的 harness 可写目录**：
+  - codex 使用施加时专用、**按任务**的独立 CODEX_HOME `run/tasks/<任务>/codex-home/`（审查第二轮 M1），与无外层 seatbelt 的设置及其他任务都不共享；目录位于本任务私有目录内，先整体挖掉再放行运行状态。它内部也是白名单：只放行 `sessions/`、`archived_sessions/`、`log/`、`cache/`、`tmp/`、`history.jsonl`、`version.json`、`internal_storage.json` 与 `*.sqlite*`。`auth.json` 链接本身拒绝写，链接目标这一个文件可写。
+  - claude-sdk 使用按任务的 Claude Code 配置目录 `run/tasks/<任务>/claude-config/`（`CLAUDE_CONFIG_DIR`），其中 `settings*.json`、`commands|agents|skills|hooks|plugins|rules|output-styles`、`CLAUDE.md` 等不可写；另放行登录钥匙串文件 `login.keychain-db` 及其 `.sb-*` 临时文件（OAuth 刷新）。
+  - 用户自己的 `~/.claude`、`~/.claude.json` 不可写：其中的 shell 快照、项目记忆、MCP 与 hooks 配置会被用户自己（沙箱外）的 Claude Code 加载或执行。
+- **设备文件**：`/dev/null`、`/dev/tty`、`/dev/ttys<N>`、`/dev/fd/` 等。
+- **追加**：节点配置 `isolation.extra_write` 显式追加的目录。只接受绝对路径，比较时大小写折叠并做 NFD；不能与以下位置互相包含：受保护路径、持久化位置、登记仓库、`PATH` 中的目录、`~/Library/Application Support`、用户主目录。
+
+共享的临时与缓存目录（`/private/tmp`、`TMPDIR` 及其 `C/`、`~/.cache`、`~/Library/Caches`、`~/.bun/install/cache`、`~/.npm/_cacache`、pnpm store）**不放行**：其中的内容会被之后沙箱外的安装与运行直接使用（审查第一轮 M2）。
+
+**独立 clone（第一步方案，审查第一轮 H1、H2、M4）。** 写类角色不再与登记仓库共享 commondir。
+- 节点在沙箱外 `git clone --shared --no-checkout`：对象经 alternates 只读引用登记仓库，不用会硬链接对象的 `--local`。`isolation.dissociate` 打开时改为完整复制。
+- `origin` 指向登记仓库的远端，worker 直接推送。
+- 节点写入 `.git/config`（任务分支的上游、`push.default=current`、`core.logAllRefUpdates=false`），并在 `state/` 下记录其 sha256。
+- 全部登记仓库的 `.git` 对 worker 整体只读。clone 的 `.git` 可写，但 `config`、`hooks/`、`info/`、`modules/`、`objects/info/alternates`，以及 `commondir`、`gitdir`、`config.worktree`、`worktrees/` 除外（审查第二轮 H1）。
+- 节点在沙箱外对 clone 运行 git 时固定 `GIT_DIR` 与 `GIT_COMMON_DIR`；核对时这些指针文件存在即失败。检出 worker 写过的分支时中和 filter、diff driver 并跳过 LFS smudge（审查第二轮 M2）。
+- 节点在 clone 中只做只读的安全 git，每次运行前核对 config 的 sha256。
+- codex-orca 的 Orca worktree 只作终端宿主（`--setup skip`），setup 在 clone 中、以 worker 的 seatbelt 配置运行。
+- 迁移：旧布局的任务从登记仓库中的同名分支建立 clone。回滚：先把任务分支快进取回登记仓库，不能快进时取到 `raindown/recovered/<任务>`，再删除 clone。
+
+**持久化位置与外部启动。** 持久化位置（shell 启动文件、`~/.gitconfig`、`~/.ssh`、`~/.local/bin` 等）在白名单之后整体拒绝写，作为纵深防御。另加 `(deny job-creation)`、`(deny user-preference-write)`、`(deny lsopen)`、`(deny appleevent-send)`。
+
+**不变量（审查第二轮 L3）：节点往任务私有目录（worker 可写）写文件，一律不跟随符号链接**——在同一目录以 `O_CREAT|O_EXCL` 写临时文件再 rename；新建目录后用 `lstat` 确认不是符号链接。
+
+SBPL 中的顺序：
+1. `(allow default)`
+2. `(deny file-write*)`
+3. 白名单放行
+4. 白名单内再挖掉：登记仓库与工作目录所属仓库的 git 目录、`.git` 指针文件、harness 配置
+5. 放行独立 clone 的 `.git`
+6. 受保护项拒绝
+7. 持久化位置拒绝
+8. 受保护路径与挖掉位置的祖先目录 literal 写拒绝
+9. 控制通道、调试、派生任务等拒绝
+
+后写的规则优先，所以白名单不能重新放开受保护项。
 
 seatbelt 的规则后者优先，允许项写得最窄（具体文件，而不是整个私有目录）。
 
@@ -111,8 +150,22 @@ seatbelt 的规则后者优先，允许项写得最窄（具体文件，而不�
   - `~/.ssh/config`；
   - `~/Library/LaunchAgents`（已拒绝）。
 
-  → 真实开启（4.5）之前由 4.6 解决，二选一：写入白名单（默认 `deny file-write*`，只放行工作目录、harness 目录、临时目录、缓存目录与主仓库 `.git`
-  中 worktree 必需的部分），或至少对上述持久化位置写拒绝；探针增加“写 shell 启动文件”一项（只在临时 home 上测试）。
+  → 4.6 已采用写入白名单（用户 2026-11-09 决定，见 D2）：上述位置都不在白名单内；探针新增必过项 `write.shell_startup`
+  （探针自建临时 home 中的模拟 `.zshenv`）、`write.git_hooks`（独立 clone 形状的探针工作目录的 `.git/hooks/`）与 `write.registered_git`（模拟登记仓库的 `.git`）。
+- [写白名单内仍可被利用的位置（4.6 与审查第一轮后的残留）]
+  - **auth.json**：worker 可以经链接改写用户的 `~/.codex/auth.json`（换成攻击者账号的凭证）。Codex 在进程内刷新凭证且刷新令牌会轮换，改由节点刷新目前不可行。
+  - **登录钥匙串**：claude-sdk 下 worker 可以损坏或替换 `login.keychain-db`。
+  - **偏好设置**：经 cfprefsd 的偏好设置写入拦不住，例如终端应用的启动命令（`user-preference-write` 实测无效）；拒绝 cfprefsd 的 mach-lookup 可能影响 `security`，未验证。
+  - **会话记录**：独立 CODEX_HOME 与按任务的 Claude 配置目录中的会话记录可被改写（提示注入，不是命令执行）。
+  - **Codex 项目配置**：预置信任后，Codex 会加载 clone 内的 `.codex/config.toml`。`notify`、`model_provider` 用命令行固定，`.codex/` 出现即停下，但 `model_providers` 表、`mcp_servers` 等覆盖不了的项，在出现到下一次检查之间可能生效；它们只在外层 seatbelt 内生效（审查第二轮 L2）。
+  - **手动运行 git**：用户在任务 clone 中手动运行 git 时，git 会跟随 worker 预埋在 `.git` 中的符号链接写入（例如 `COMMIT_EDITMSG`、已有的 reflog）。
+  → 写入文档；4.5 验收后按实际情况决定是否进一步收紧。
+- [写白名单误伤 harness 或工具链]
+  - **工具写不了自己的目录**：例如写 `~/Library/Application Support/<工具>`。
+  - **git 写配置失败**：设置其他分支的上游、husky 写 `core.hooksPath`。
+  - **冷缓存**：按任务的冷缓存使安装变慢。
+  - **SSH known_hosts**：首次连接新的 SSH 主机时 `known_hosts` 不可写（不预置，记为限制）。
+  → 4.5 验收时，优先用环境变量把工具缓存指到任务私有目录，或用 `isolation.extra_write` 追加具体子目录；`.git/config` 与 harness 配置不放行。
 
 ## Migration Plan
 
