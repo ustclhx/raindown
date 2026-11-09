@@ -159,11 +159,10 @@ export interface JournalReceipt extends WriteReceipt {
 }
 
 /**
- * 转义正文行首的 Markdown 标题标记（`#`…`######` 后跟空白或行尾）：正文不能伪造 journal 记录标题行，
+ * 转义正文行首（可有缩进）的 `#`：正文不能伪造 journal 记录标题行，也不会在按记录过滤时切出新段，
  * 记录归属（workspace）的判定因此只取决于真正的标题行（add-worker-credential-isolation D3）。
  */
-export const escapeJournalHeadings = (text: string): string =>
-  text.replace(/^([ \t]*)(#{1,6})(?=[ \t]|$)/gm, '$1\\$2')
+export const escapeJournalHeadings = (text: string): string => text.replace(/^([ \t]*)#/gm, '$1\\#')
 
 /** 一条 journal 记录的 Markdown：标题行带时间、操作者、workspace，下面是正文。 */
 export function renderJournalRecord(

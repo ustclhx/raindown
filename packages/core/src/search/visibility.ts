@@ -1,5 +1,5 @@
 import { WS_REF_RE } from '../schema/common.ts'
-import { isResourceType } from '../schema/entries.ts'
+import { ENTRY_TYPES, isResourceType } from '../schema/entries.ts'
 
 /**
  * 知识读取的 workspace 可见范围（add-worker-credential-isolation D3）。
@@ -28,6 +28,8 @@ const UNKNOWN_SCOPE = '?'
 
 /** 归属字段：资源类用 `owner`，其余类型用 `workspace`。 */
 const SCOPE_KEYS = ['owner', 'workspace'] as const
+/** schema 要求 `workspace` 的类型。 */
+const WORKSPACE_REQUIRED = new Set(['product', 'project-card'])
 
 /**
  * 条目的归属 workspace 列表（去重、排序）。空列表表示 global。
@@ -35,8 +37,23 @@ const SCOPE_KEYS = ['owner', 'workspace'] as const
  */
 export function entryScopes(frontmatter: Record<string, unknown>): string[] {
   const out = new Set<string>()
-  // schema 要求 owner 的资源类型，缺少 owner 时无法判定归属。
-  if (isResourceType(frontmatter.type) && !('owner' in frontmatter)) out.add(UNKNOWN_SCOPE)
+  // 缺少归属字段时是否可以按 global：只有类型精确等于已知、且 schema 不要求归属的类型才可以。
+  // schema 要求归属的类型（资源类要求 owner，product / project-card 要求 workspace）缺少该字段、
+  // 类型大小写不符（例如 `Repo`）、未知类型或没有类型，一律按无法判定（取严）。
+  const type = frontmatter.type
+  const known = typeof type === 'string' && (ENTRY_TYPES as readonly string[]).includes(type)
+  const required = !known
+    ? undefined
+    : isResourceType(type)
+      ? 'owner'
+      : WORKSPACE_REQUIRED.has(type as string)
+        ? 'workspace'
+        : null
+  if (required === undefined) {
+    if (!SCOPE_KEYS.some((k) => k in frontmatter)) out.add(UNKNOWN_SCOPE)
+  } else if (required !== null && !(required in frontmatter)) {
+    out.add(UNKNOWN_SCOPE)
+  }
   for (const key of SCOPE_KEYS) {
     if (!(key in frontmatter)) continue
     const value = frontmatter[key]
@@ -72,8 +89,12 @@ export function visibleScopeEncodings(visibility: KbVisibility): string[] {
 /** journal 记录标题行；与 `renderJournalRecord` 的格式严格一致（身份同 `ACTOR_RE`，workspace 同 `WS_REF_RE`）。 */
 const JOURNAL_HEADING_RE =
   /^## (\d{2}:\d{2}:\d{2}) · ([A-Za-z0-9._:@-]{1,64})(?: · (ws\/[a-z0-9][a-z0-9-]*))?$/
-/** 切段：任何以 `##` 加空白开头的行都开始一个新段（包括不规范的标题行）。 */
-const SEGMENT_START_RE = /^##\s/
+/**
+ * 切段（取严）：任何行首（可有缩进）是 `#` 的行都开始一个新段——包括 `###`、`##09:00` 这类不规范或缩进的
+ * 标题行，避免把一条不可见记录并入上一条可见记录。代价是旧记录正文中的小标题会切出一个不合规的段而被丢弃。
+ * 新写入的正文行首 `#` 一律被转义（`escapeJournalHeadings`），不会切段。
+ */
+const SEGMENT_START_RE = /^[ \t]*#/
 /** 文件头只承认 `# YYYY-MM-DD` 标题行。 */
 const JOURNAL_TITLE_RE = /^# \d{4}-\d{2}-\d{2}$/
 
@@ -90,7 +111,9 @@ export function filterJournalBody(body: string, visibility: KbVisibility): strin
   const header: string[] = []
   const segments: string[][] = []
   for (const line of lines) {
-    if (SEGMENT_START_RE.test(line)) segments.push([line])
+    // 第一段之前的 `# YYYY-MM-DD` 是文件标题，不开始新段。
+    if (segments.length === 0 && JOURNAL_TITLE_RE.test(line.replace(/\r$/, ''))) header.push(line)
+    else if (SEGMENT_START_RE.test(line)) segments.push([line])
     else if (segments.length > 0) (segments[segments.length - 1] as string[]).push(line)
     else header.push(line)
   }

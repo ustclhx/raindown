@@ -177,6 +177,7 @@ workspace、lease 与 attempt；`--actor`、`--task` 和环境变量都不能声
 | `POST /v1/kb/query` | `{filters}`：最多 20 条 `key=value`，每条最长 500 字；空条件或格式错误为 `invalid_filter`（与本地一致） | 同 `kb_query` |
 
 这些上限同样出现在 CLI 与 MCP 工具的输入 schema 中（`schemas/operations/kb-*.input.schema.json`）。
+**CLI 行为变化**：`raindown kb search --limit` 超过 100，以及 `raindown kb get` 的标识以 `/` 开头、含 `.`/`..` 段、以 `.md` 结尾或含反斜杠时，改为用法错误（退出码 2），此前分别是照常执行与 `not_found`。
 
 - **只接受任务绑定令牌**：user 令牌（含降级为 AI 身份）、绑定令牌（含 `node:*`）、唤醒绑定令牌一律 403 `scope_denied`。
   无绑定与唤醒绑定的 MCP 会话仍在本地读取。令牌每次请求按账本重核，任务结束、租约失效或中枢重启后 401 `unauthorized`。
@@ -188,7 +189,9 @@ workspace、lease 与 attempt；`--actor`、`--task` 和环境变量都不能声
   - `kb/get` 对不可见的条目返回与不存在相同的 404 `not_found`，不泄露存在性。
   - journal 按记录**正向选择**：任何 `##` 加空白开头的行都开始一段，只保留首行严格匹配 `## HH:MM:SS · 操作者[ · ws/<id>]`
     且未标 workspace 或标了本 workspace 的段；不规范的段整段丢弃，文件头只保留 `# YYYY-MM-DD`。没有可见记录的 journal
-    在检索中不返回，`kb/get` 返回 not_found。`kb_journal` 写入时转义正文行首的 `#`，正文无法伪造记录标题。
+    在检索中不返回，`kb/get` 返回 not_found。切段取严：行首（可有缩进）是 `#` 的任何行都开始新段，不规范或缩进的标题不会并入上一条可见记录。
+    `kb_journal` 写入时转义正文行首的 `#`，正文无法伪造记录标题；本变更之前写入、正文含类似标题行的旧记录不受转义保护，
+    按上述规则切段后至多丢掉其中的内容，不会把它并入别的记录。
   - 检索分批读取（每批至少 50 行、最多 10 批），过滤后取满 `limit`；排序与 CLI 相同。
   - 这比本地读取更严：可见条目的结果、字段与顺序与 CLI 相同，只是少了不可见的条目与记录。
 - 参数不合法 400 `invalid_arguments`；请求体先看 Content-Length，再边读边按字节计数，最大 32 KiB。
