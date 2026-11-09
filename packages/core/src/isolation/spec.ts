@@ -159,29 +159,42 @@ async function keepChild(dir: string, segment: string): Promise<Result<DenyChild
   return ok({ dir: d, keep })
 }
 
+/** 遗留 home 候选及其来源（环境变量名、默认目录或调用方显式传入），用于说明 `isolation_allow_in_deny` 的原因。 */
+interface LegacyHome {
+  path: string
+  source: string
+}
+
 async function legacyHomeCandidates(
   input: IsolationSpecInput,
   userHome: string,
-): Promise<string[]> {
+): Promise<LegacyHome[]> {
   const env = input.env ?? process.env
-  const raw =
-    input.legacyHomes ??
+  const raw: LegacyHome[] =
+    input.legacyHomes?.map((path) => ({ path, source: 'legacyHomes 参数' })) ??
     [
       env.FLOW_HOME?.trim()
-        ? resolveRaindownHome({ RAINDOWN_HOME: env.FLOW_HOME }, userHome)
+        ? {
+            path: resolveRaindownHome({ RAINDOWN_HOME: env.FLOW_HOME }, userHome),
+            source: '环境变量 FLOW_HOME',
+          }
         : undefined,
       env.RAINDOWN_HOME?.trim()
-        ? resolveRaindownHome({ RAINDOWN_HOME: env.RAINDOWN_HOME }, userHome)
+        ? {
+            path: resolveRaindownHome({ RAINDOWN_HOME: env.RAINDOWN_HOME }, userHome),
+            source: '环境变量 RAINDOWN_HOME',
+          }
         : undefined,
-      join(userHome, 'flow-home'),
-      join(userHome, 'raindown-home'),
-    ].filter((p): p is string => p !== undefined)
+      { path: join(userHome, 'flow-home'), source: '默认目录 ~/flow-home' },
+      { path: join(userHome, 'raindown-home'), source: '默认目录 ~/raindown-home' },
+    ].filter((p): p is LegacyHome => p !== undefined)
   const home = await canonicalPath(input.home)
-  const found: string[] = []
+  const found: LegacyHome[] = []
   for (const p of raw) {
-    const real = await canonicalPath(p)
+    const real = await canonicalPath(p.path)
     if (!existsSync(real) || isWithin(real, home) || isWithin(home, real)) continue
-    found.push(real)
+    if (found.some((f) => f.path === real)) continue
+    found.push({ path: real, source: p.source })
   }
   return found
 }
@@ -244,6 +257,7 @@ export async function computeIsolationSpec(
     // 已被 raindown-home 整体拒绝覆盖的项不再单列。
     const coveredByHome = (p: string) => isWithin(realHome, p) && !isWithin(realRun, p)
 
+    const legacy = await legacyHomeCandidates(input, userHome)
     const deny = minimal(
       [
         ageDir,
@@ -251,7 +265,7 @@ export async function computeIsolationSpec(
         await c(join(userHome, ORCA_RUNTIME_DIR)),
         await c(input.nodeLockFile ?? join(paths.state, 'node.lock')),
         await c(input.logsDir ?? paths.logs),
-        ...(await legacyHomeCandidates(input, userHome)),
+        ...legacy.map((l) => l.path),
       ].filter((p) => !coveredByHome(p)),
     )
     const orcaDir = await c(join(userHome, ORCA_RUNTIME_DIR))
@@ -271,6 +285,10 @@ export async function computeIsolationSpec(
         )
       allowRead.push(token)
       readOnly.push(token)
+      // 令牌所在目录（`dispatch-tokens/`）本身也拒绝写：否则 worker 可以把父目录改名后重建同名目录，
+      // 绕开令牌文件的只读（#93 N3）。令牌直接位于任务目录下时只保护文件本身，不拒绝整个任务目录。
+      const tokenDir = dirname(token)
+      if (tokenDir !== ownTask) readOnly.push(tokenDir)
     }
     for (const h of input.harnessPaths ?? []) {
       const p = await c(h.path)
@@ -281,11 +299,23 @@ export async function computeIsolationSpec(
 
     for (const allowed of uniqueSorted([...allowRead, ...allowWrite])) {
       const inside = deny.find((d) => isWithin(d, allowed))
-      if (inside)
-        return bad('isolation_allow_in_deny', `允许路径 ${allowed} 位于受保护目录 ${inside} 内`, {
-          allowed,
-          denied: inside,
-        })
+      if (inside) {
+        // 遗留 home（另一个可能的数据目录）是工作目录等允许路径的祖先时，写明它是遗留 home 及其来源变量。
+        const legacyHome = legacy.find((l) => isWithin(l.path, inside) || isWithin(inside, l.path))
+        return bad(
+          'isolation_allow_in_deny',
+          legacyHome
+            ? `允许路径 ${allowed} 位于遗留 home ${legacyHome.path}（来源：${legacyHome.source}）内；遗留 home 整体受保护，请把工作目录移出该目录，或移走/改名遗留 home`
+            : `允许路径 ${allowed} 位于受保护目录 ${inside} 内`,
+          {
+            allowed,
+            denied: inside,
+            ...(legacyHome
+              ? { legacy_home: legacyHome.path, legacy_source: legacyHome.source }
+              : {}),
+          },
+        )
+      }
       for (const dc of keeps) {
         if (allowed !== dc.dir && isWithin(dc.dir, allowed) && !isWithin(dc.keep, allowed))
           return bad(

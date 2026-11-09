@@ -149,6 +149,18 @@ export {
   UNTRUSTED_CHECKOUT_ENV,
   untrustedCheckoutConfig,
 } from './github.ts'
+export { type ProbeSystem, realProbeSystem, runProbeItems } from './isolation-probe/checks.ts'
+export {
+  defaultMacosVersion,
+  findOrcaSockets,
+  type IsolationProbeOptions,
+  identityLaunchWrapper,
+  PROBE_CHILD_SCRIPT,
+  type ProbeLaunchWrapper,
+  type ProbeTarget,
+  probeTargets,
+  runIsolationProbe,
+} from './isolation-probe/run.ts'
 export {
   cleanLeaseTokenFiles,
   leaseTokenDir,
@@ -160,6 +172,9 @@ export {
   DELIVER_GIVE_UP_MS,
   DELIVER_TIMEOUT_MS,
   generateNodeId,
+  ISOLATION_PROBE_INTERVAL_MS,
+  ISOLATION_PROBE_VERSION_CHECK_MS,
+  type IsolationProbeNodeOptions,
   JUMP_THRESHOLD_MS,
   loadOrCreateNodeId,
   type NodeLogger,

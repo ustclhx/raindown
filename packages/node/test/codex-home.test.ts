@@ -257,6 +257,30 @@ describe('CODEX_HOME 从 state/ 迁到 run/', () => {
     expect(readFileSync(join(current.orca, 'sessions', 'rollout.jsonl'), 'utf8')).toBe('会话-orca')
   })
 
+  test('#93 N2：启动时删除迁移中断残留的临时链接，只删匹配名字的符号链接', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'raindown-codex-migrate-'))
+    dirs.push(root)
+    const home = join(root, 'raindown-home')
+    const state = join(home, 'state')
+    mkdirSync(state, { recursive: true })
+    const target = join(root, 'target')
+    mkdirSync(target)
+    const stale = join(state, 'codex-orca-home.0123456789abcdef.link')
+    symlinkSync(target, stale)
+    // 名字匹配但不是链接、或名字不匹配的条目保留。
+    const plainFile = join(state, 'codex-exec-home.0123456789abcdef.link')
+    writeFileSync(plainFile, '占位')
+    const otherLink = join(state, 'other.0123456789abcdef.link')
+    symlinkSync(target, otherLink)
+    const logs: string[] = []
+    await migrateCodexHomes(home, (m) => logs.push(m))
+    expect(existsSync(stale)).toBe(false)
+    expect(lstatSync(plainFile).isFile()).toBe(true)
+    expect(lstatSync(otherLink).isSymbolicLink()).toBe(true)
+    expect(existsSync(target)).toBe(true)
+    expect(logs).toEqual([])
+  })
+
   test('没有旧目录时什么也不做', async () => {
     const root = mkdtempSync(join(tmpdir(), 'raindown-codex-migrate-'))
     dirs.push(root)

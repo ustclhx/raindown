@@ -33,6 +33,7 @@ import {
   taskProposalDecision,
   taskProposalId,
 } from './events.ts'
+import { isolationProbeReport, readIsolationProbeReport } from './isolation-probe.ts'
 import { deliveredInput, lenientInputs } from './pr-input.ts'
 import {
   prSubscriptionView,
@@ -744,6 +745,10 @@ export const registerNodeRequest = z
       .meta({ description: '节点能力，含执行器贡献的 executor:<type>' }),
     executors: z.array(executorInfo).default([]),
     concurrency: z.number().int().min(1).default(1),
+    isolation_probe: isolationProbeReport.optional().meta({
+      description:
+        '最近一次隔离自检探针的结果（worker-credential-isolation 3.2）；旧节点不上报，中枢显示“未探测”',
+    }),
   })
   .meta({ title: 'POST /v1/nodes' })
 export type RegisterNodeRequest = z.infer<typeof registerNodeRequest>
@@ -761,6 +766,9 @@ export const nodeView = z
       .nullable()
       .meta({ description: '最近一次活动；非事件派生，重建后为 null' }),
     active_leases: z.number().int().min(0),
+    isolation_probe: readIsolationProbeReport.meta({
+      description: '最近一次注册上报的隔离探针结果；null 表示未探测（旧节点或节点未运行探针）',
+    }),
   })
   .meta({ title: 'Raindown node' })
 export type NodeView = z.infer<typeof nodeView>

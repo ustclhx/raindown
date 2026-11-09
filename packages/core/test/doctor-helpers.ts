@@ -1,6 +1,7 @@
 import { basename, join } from 'node:path'
 import { type DoctorOptions, findExecutable } from '../src/doctor.ts'
 import { execCommand } from '../src/git.ts'
+import { fail } from '../src/result.ts'
 
 /** 新执行器依赖全部模拟；只有旧检查的 git / gitleaks 可以运行真实命令。 */
 export function doctorOptions(home: string, overrides: DoctorOptions = {}) {
@@ -27,6 +28,8 @@ export function doctorOptions(home: string, overrides: DoctorOptions = {}) {
           return execCommand(bin, args, opts)
       }
     },
+    // 测试绝不连接中枢：缺省按中枢不可用处理。
+    isolationNodes: async () => fail('retryable', 'hub_unavailable', '测试中不连接中枢'),
     inspectClaudeSdk: async () => ({
       version: '0.3.310',
       expectedVersion: '0.3.310',

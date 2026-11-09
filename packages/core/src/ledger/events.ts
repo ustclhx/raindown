@@ -23,6 +23,7 @@ import { fail, ok, type Result } from '../result.ts'
 import { dateString, workspaceRef } from '../schema/common.ts'
 import { adapterCapabilities, NO_ADAPTER_CAPABILITIES, readAdapterCapabilities } from './adapter.ts'
 import { actor, capability, executorType, leaseId, nodeId, taskId, timestamp } from './common.ts'
+import { isolationProbeReport } from './isolation-probe.ts'
 import { prEventPayload, prSubscriptionRole, prUnsubscribeReason } from './pr-subscription.ts'
 import { PROTOCOL_MESSAGE_MAX } from './redact.ts'
 import {
@@ -464,6 +465,7 @@ export const eventPayloads = {
     capabilities: z.array(capability),
     executors: z.array(executorInfo).default([]),
     concurrency: z.number().int().min(1),
+    isolation_probe: isolationProbeReport.optional(),
   }),
   'schedule.fired': z.strictObject({
     rule_id: z.string().min(1),

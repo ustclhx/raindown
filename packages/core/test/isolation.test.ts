@@ -15,6 +15,7 @@ import {
   computeIsolationSpec,
   credentialIsolationFor,
   describeCredentialIsolation,
+  type IsolationProbeRun,
   type IsolationSpec,
   type IsolationSpecInput,
   isWithin,
@@ -81,8 +82,9 @@ describe('computeIsolationSpec', () => {
     const realToken = R('raindown-home/run/tasks/t-1/dispatch-tokens/l-1.token')
     // raindown-home 内的受保护项（state/、config/、brain/、节点锁与日志）由整体拒绝覆盖，不单列。
     expect(r.data.deny_read).toEqual(protectedDirs)
-    // 令牌只读：显式写拒绝。
-    expect(r.data.deny_write).toEqual([...protectedDirs, realToken].sort())
+    // 令牌只读：令牌所在的 dispatch-tokens 目录本身也拒绝写（不能经改名父目录绕开只读，#93 N3）。
+    const realTokenDir = R('raindown-home/run/tasks/t-1/dispatch-tokens')
+    expect(r.data.deny_write).toEqual([...protectedDirs, realTokenDir].sort())
     expect(r.data.deny_children_except).toEqual([
       { dir: R('raindown-home'), keep: R('raindown-home/run') },
       {
@@ -321,8 +323,28 @@ describe('credential_isolation 能力与角色沙箱设置', () => {
       ...caps,
       credential_isolation: { ...caps.credential_isolation, enforced: true },
     }
-    expect(credentialIsolationFor(enforced, 'bash-sandbox-off').enforced).toBe(true)
-    expect(credentialIsolationFor(enforced, 'bash-sandbox-on').enforced).toBe(false)
+    // enforced 由探针决定：没有探针结果、探针不通过、探针属于别的设置时都为 false。
+    const run = (passed: boolean, setting = 'bash-sandbox-off'): IsolationProbeRun => ({
+      executor: 'claude-sdk',
+      setting,
+      declared_layer: 'seatbelt',
+      applied_layer: 'seatbelt',
+      passed,
+      items: [
+        { item: 'read.hub_token', expected: 'deny', actual: passed ? 'deny' : 'allow', ok: passed },
+      ],
+    })
+    expect(credentialIsolationFor(enforced, 'bash-sandbox-off').enforced).toBe(false)
+    expect(credentialIsolationFor(enforced, 'bash-sandbox-off', run(false)).enforced).toBe(false)
+    expect(credentialIsolationFor(enforced, 'bash-sandbox-off', run(true)).enforced).toBe(true)
+    expect(
+      credentialIsolationFor(enforced, 'bash-sandbox-off', run(true, 'bash-sandbox-on')).enforced,
+    ).toBe(false)
+    // 适配器未施加（enforced: false）时，即使探针通过也不算已施加。
+    expect(credentialIsolationFor(caps, 'bash-sandbox-off', run(true)).enforced).toBe(false)
+    expect(
+      credentialIsolationFor(enforced, 'bash-sandbox-on', run(true, 'bash-sandbox-on')).enforced,
+    ).toBe(false)
     expect(describeCredentialIsolation(caps)).toBe(
       'bash-sandbox-off→seatbelt、bash-sandbox-on→none（仅声明，未施加）',
     )
@@ -415,6 +437,32 @@ describe('审查修复（第一轮）', () => {
     expect(explicit.data.deny_read).toContain(join(s.real, 'env-flow-home'))
     expect(explicit.data.deny_read).not.toContain(join(s.real, 'user', 'flow-home'))
     expect(explicit.data.deny_read).not.toContain(s.real)
+  })
+
+  test('#93 N1：遗留 home 是工作目录的祖先时，错误写明遗留 home 及其来源变量', async () => {
+    const s = setup()
+    const legacy = join(s.root, 'old-flow-home')
+    const cwd = join(legacy, 'worktrees', 'w1')
+    mkdirSync(cwd, { recursive: true })
+    const r = await computeIsolationSpec({ ...s.base, cwd, env: { FLOW_HOME: legacy } })
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.error.code).toBe('isolation_allow_in_deny')
+    expect(r.error.message).toContain('遗留 home')
+    expect(r.error.message).toContain('FLOW_HOME')
+    expect(r.error.details).toMatchObject({
+      legacy_home: join(s.real, 'old-flow-home'),
+      legacy_source: '环境变量 FLOW_HOME',
+    })
+  })
+
+  test('#93 N3：令牌直接位于任务目录下时只拒绝写文件本身', async () => {
+    const s = setup()
+    const token = join(s.home, 'run', 'tasks', 't-1', 'l-1.token')
+    const r = await computeIsolationSpec({ ...s.base, leaseTokenFile: token })
+    if (!r.ok) throw new Error(r.error.message)
+    expect(r.data.deny_write).toContain(join(s.real, 'raindown-home/run/tasks/t-1/l-1.token'))
+    expect(r.data.deny_write).not.toContain(join(s.real, 'raindown-home/run/tasks/t-1'))
   })
 
   test('L4：age 私钥目录是用户主目录或其上级时返回明确错误', async () => {

@@ -296,7 +296,7 @@ export interface LevelQuery {
  * 默认级别（inbox spec "默认分级"）：
  * - awaiting_approval、question、crashed、node_lost：Interrupt；
  * - no_progress、other、待确认提案、supervisor 提问、任务提案、合并请求、未能交给任务或 supervisor 的 PR 评论：Decide；
- * - auto-report 策略记录、每日完成情况、决策回看提醒：Digest。
+ * - auto-report 策略记录、每日完成情况、决策回看提醒、隔离自检转为不通过：Digest。
  * - 任务重试：supervisor 发起为 Interrupt，用户发起为 Digest。
  */
 export function defaultInboxLevel(q: LevelQuery): InboxLevel {
@@ -317,6 +317,7 @@ export function defaultInboxLevel(q: LevelQuery): InboxLevel {
     case 'policy':
     case 'digest':
     case 'decision':
+    case 'isolation':
       return 'digest'
   }
 }

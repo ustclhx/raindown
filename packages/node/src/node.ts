@@ -17,6 +17,7 @@ import {
   type DeliveredReply,
   fail,
   HUB_TOKEN_ENV,
+  type IsolationProbeReport,
   LEASE_SLOT_KINDS,
   LEDGER_ID_RE,
   type LeaseGrant,
@@ -29,6 +30,7 @@ import {
   ok,
   outOfBandSignal,
   PROTOCOL_MESSAGE_MAX,
+  probeRunPassed,
   type RenewLeaseData,
   type ReportQuestion,
   type RepoSnapshot,
@@ -59,6 +61,11 @@ import {
   type StuckVerdict,
 } from './executor.ts'
 import { createFakeExecutor } from './fake.ts'
+import {
+  defaultMacosVersion,
+  type IsolationProbeOptions,
+  runIsolationProbe,
+} from './isolation-probe/run.ts'
 import {
   cleanLeaseTokenFiles,
   removeEmptyTaskRunDir,
@@ -151,7 +158,25 @@ export interface StartNodeOptions {
   /** 上述检查使用的环境变量（含禁用变量的检查），缺省为 `executorEnv()`；测试注入。 */
   envVars?: NodeJS.ProcessEnv
   logger?: NodeLogger
+  /**
+   * 隔离自检探针（worker-credential-isolation 3.1–3.2）：启动时、每 6 小时、macOS 版本变化时运行，结果随注册上报。
+   * 缺省不运行（测试不触碰真实的用户目录）；`raindown node start` 显式开启。
+   */
+  isolationProbe?: IsolationProbeNodeOptions
 }
+
+export interface IsolationProbeNodeOptions
+  extends Partial<Omit<IsolationProbeOptions, 'home' | 'hubUrl' | 'executors'>> {
+  /** 定期运行的间隔，默认 6 小时。 */
+  intervalMs?: number
+  /** 检查 macOS 版本是否变化的间隔，默认 1 小时。 */
+  versionCheckMs?: number
+  /** 替换探针实现（测试用）。 */
+  run?: (o: IsolationProbeOptions) => Promise<IsolationProbeReport>
+}
+
+export const ISOLATION_PROBE_INTERVAL_MS = 6 * 60 * 60_000
+export const ISOLATION_PROBE_VERSION_CHECK_MS = 60 * 60_000
 
 export interface RunningNode {
   nodeId: string
@@ -1830,6 +1855,9 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
     })
   }
 
+  /** 最近一次隔离探针结果；随注册上报。旧中枢拒绝该字段后不再上报。 */
+  let latestProbe: IsolationProbeReport | undefined
+  let probeFieldRejected = false
   const register = () =>
     client.register({
       node_id: nodeId,
@@ -1838,7 +1866,15 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
       capabilities,
       executors: registry.info(),
       concurrency,
+      ...(latestProbe && !probeFieldRejected ? { isolation_probe: latestProbe } : {}),
     })
+  /** 注册失败时，若是旧中枢不认识 isolation_probe：之后不再上报该字段，返回 true 表示应立即重试。 */
+  const dropProbeFieldIfRejected = (error: { code: string; details?: unknown }) => {
+    if (probeFieldRejected || !latestProbe || !rejectsField(error, 'isolation_probe')) return false
+    probeFieldRejected = true
+    logger.warn('中枢不接受隔离探针结果（isolation_probe），之后注册不再上报，中枢显示为未探测')
+    return true
+  }
 
   /** 各领取循环共用的注册：成功前持续重试，节点停止时返回 false。 */
   let registration: Promise<boolean> | undefined
@@ -1850,12 +1886,79 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
           logger.info(`节点 ${nodeId} 已注册到 ${hubUrl}`, { capabilities })
           return true
         }
+        if (dropProbeFieldIfRejected(r.error)) continue
         logger.warn('节点注册失败，稍后重试', r.error.code)
         await sleep(clock, retryMs, stopper.signal)
       }
       return false
     })()
     return registration
+  }
+
+  // 隔离自检探针：启动时（领取任务之前）、每 6 小时、macOS 版本变化时运行；之后的结果经重新注册上报。
+  const probeOptions = options.isolationProbe
+  let probing: Promise<void> | undefined
+  let cancelProbeTimers = () => {}
+  const runProbe = (why: string): Promise<void> => {
+    if (!probeOptions) return Promise.resolve()
+    probing ??= (async () => {
+      try {
+        const { run, intervalMs: _i, versionCheckMs: _v, ...rest } = probeOptions
+        latestProbe = await (run ?? runIsolationProbe)({
+          ...rest,
+          home,
+          hubUrl,
+          executors: registry.info(),
+        })
+        const failed = latestProbe.runs.filter((r) => !probeRunPassed(r)).length
+        logger.info(
+          `隔离自检（${why}）完成：${latestProbe.runs.length} 项执行器 × 沙箱设置，${failed} 项不通过`,
+        )
+      } catch (err) {
+        logger.warn(`隔离自检（${why}）失败`, String(err))
+      } finally {
+        probing = undefined
+      }
+    })()
+    return probing
+  }
+  /** 探针结果变化后重新注册一次（失败只记日志，领取循环在中枢丢失注册时会自行重新注册）。 */
+  const reportProbe = async () => {
+    if (stopper.signal.aborted || !registration) return
+    let r = await register()
+    if (!r.ok && dropProbeFieldIfRejected(r.error)) r = await register()
+    if (!r.ok) logger.warn('上报隔离自检结果失败', r.error.code)
+  }
+  if (probeOptions) {
+    const intervalMs = probeOptions.intervalMs ?? ISOLATION_PROBE_INTERVAL_MS
+    const versionCheckMs = probeOptions.versionCheckMs ?? ISOLATION_PROBE_VERSION_CHECK_MS
+    const macosVersion = probeOptions.macosVersion ?? defaultMacosVersion
+    let lastRun = clock.now()
+    const tick = async () => {
+      if (stopper.signal.aborted) return
+      let why: string | undefined
+      if (clock.now() - lastRun >= intervalMs) why = '定期'
+      else if (latestProbe) {
+        const v = await macosVersion()
+        if (v !== null && v !== latestProbe.macos_version) why = `macOS 版本变为 ${v}`
+      }
+      if (why) {
+        lastRun = clock.now()
+        await runProbe(why)
+        await reportProbe()
+      }
+    }
+    const step = Math.min(intervalMs, versionCheckMs)
+    const arm = () => {
+      cancelProbeTimers = clock.setTimeout(() => {
+        void tick()
+          .catch((err) => logger.warn('隔离自检调度失败', String(err)))
+          .finally(() => {
+            if (!stopper.signal.aborted) arm()
+          })
+      }, step)
+    }
+    arm()
   }
 
   const slotsRetryMs = options.slotsRetryMs ?? SLOTS_RETRY_MS
@@ -1935,6 +2038,8 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
         logger.warn(`执行器 ${p.type} 的启动清理失败`, String(err))
       }
     }
+    // 启动时的隔离自检在首次注册之前完成，首次注册即带上结果。
+    await runProbe('节点启动')
   })()
   const looping = prepared.then(() =>
     Promise.all(
@@ -1955,6 +2060,7 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
         stopper.abort()
         for (const a of acquireAborts) a.abort()
         cancelJump()
+        cancelProbeTimers()
         wakeSlots()
         await Promise.allSettled([...runners.keys()].map((r) => r.abandon()))
         await looping

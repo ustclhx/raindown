@@ -150,7 +150,8 @@ CREATE TABLE IF NOT EXISTS nodes (
   executors_json    TEXT NOT NULL,
   concurrency       INTEGER NOT NULL,
   registered_at     TEXT NOT NULL,
-  last_seen_at      TEXT
+  last_seen_at      TEXT,
+  isolation_probe_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS leases (
@@ -314,6 +315,12 @@ export const LEDGER_COLUMN_MIGRATIONS: ReadonlyArray<{
     table: 'tasks',
     column: 'repo_snapshot_json',
     ddl: 'ALTER TABLE tasks ADD COLUMN repo_snapshot_json TEXT',
+  },
+  // worker-credential-isolation 3.2：节点注册上报的最近一次隔离探针结果。
+  {
+    table: 'nodes',
+    column: 'isolation_probe_json',
+    ddl: 'ALTER TABLE nodes ADD COLUMN isolation_probe_json TEXT',
   },
   // add-m1-supervisor：supervisor 提问的选项（D11）。
   {

@@ -178,6 +178,154 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 9007199254740991
+        },
+        "isolation_probe": {
+          "type": "object",
+          "properties": {
+            "ran_at": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$",
+              "description": "ISO 8601 时间，例如 2026-10-24T08:00:00.000Z"
+            },
+            "macos_version": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 64
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "运行时的 macOS 版本"
+            },
+            "runs": {
+              "maxItems": 64,
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "executor": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9-]{0,63}$",
+                    "description": "执行器类型，例如 fake、codex-orca、claude-sdk、codex-exec"
+                  },
+                  "setting": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9-]{0,63}$",
+                    "description": "角色沙箱设置"
+                  },
+                  "declared_layer": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+                    "description": "适配器为该沙箱设置声明的施加层"
+                  },
+                  "applied_layer": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+                    "description": "探针实际运行时所用的施加层；适配器尚未施加时为 none"
+                  },
+                  "passed": {
+                    "type": "boolean",
+                    "description": "受保护项全部被拒绝、允许项全部可用（跳过与未验证不计入），且至少一个受保护项确实被拒绝"
+                  },
+                  "items": {
+                    "maxItems": 64,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "item": {
+                          "type": "string",
+                          "pattern": "^[a-z][a-z0-9_.-]{0,63}$",
+                          "description": "探针项标识，例如 read.hub_token"
+                        },
+                        "target": {
+                          "description": "尝试访问的路径、套接字或 host:port；不含任何文件内容",
+                          "type": "string",
+                          "maxLength": 1024
+                        },
+                        "expected": {
+                          "type": "string",
+                          "enum": [
+                            "deny",
+                            "allow"
+                          ]
+                        },
+                        "actual": {
+                          "type": "string",
+                          "enum": [
+                            "deny",
+                            "allow",
+                            "skipped",
+                            "unverified",
+                            "error"
+                          ]
+                        },
+                        "ok": {
+                          "description": "实际是否符合预期；skipped / unverified 为 null（既不算通过也不算失败）",
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "detail": {
+                          "description": "说明：错误码（如 EACCES）、跳过或未验证的原因",
+                          "type": "string",
+                          "maxLength": 500
+                        }
+                      },
+                      "required": [
+                        "item",
+                        "expected",
+                        "actual",
+                        "ok"
+                      ],
+                      "additionalProperties": false,
+                      "title": "Isolation probe item"
+                    }
+                  },
+                  "error": {
+                    "description": "探针无法运行的原因（例如隔离清单计算失败）；此时 passed 为 false",
+                    "type": "object",
+                    "properties": {
+                      "code": {
+                        "type": "string",
+                        "maxLength": 64
+                      },
+                      "message": {
+                        "type": "string",
+                        "maxLength": 1000
+                      }
+                    },
+                    "required": [
+                      "code",
+                      "message"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "executor",
+                  "setting",
+                  "declared_layer",
+                  "applied_layer",
+                  "passed",
+                  "items"
+                ],
+                "additionalProperties": false,
+                "title": "Isolation probe run"
+              }
+            }
+          },
+          "required": [
+            "ran_at",
+            "macos_version",
+            "runs"
+          ],
+          "additionalProperties": false,
+          "title": "Isolation probe report"
         }
       },
       "required": [

@@ -11,6 +11,8 @@ import type { execCommand } from './git.ts'
 import { isRepoRoot } from './git.ts'
 import { type Env, GIT_REPOS, type RaindownHomeSource, raindownPaths } from './home.ts'
 import { roleSandboxInfo } from './isolation/capability.ts'
+import { describeIsolationStatus, isolationStatusRows } from './isolation/probe.ts'
+import type { NodeView } from './ledger/protocol.ts'
 import { loadPoliciesConfig } from './policy/config.ts'
 import { policyVersion } from './policy/version.ts'
 import { fail, ok, type Result } from './result.ts'
@@ -82,6 +84,11 @@ export interface DoctorOptions {
   /** 凭证只检查文件是否存在；测试必须注入临时用户目录。 */
   userHome?: string
   platform?: NodeJS.Platform
+  /**
+   * 读取中枢的节点列表，用于汇总各节点的隔离自检结果（worker-credential-isolation 3.2）。
+   * 缺省不读取；CLI 的 doctor 经中枢读取，测试注入。中枢不可用时只给 info，不影响退出码。
+   */
+  isolationNodes?: () => Promise<Result<{ nodes: NodeView[] }>>
 }
 
 /** 在 PATH 中查找可执行文件，返回绝对路径。 */
@@ -515,6 +522,8 @@ export async function runDoctor(
     })
   }
 
+  if (opts.isolationNodes) checks.push(...(await isolationProbeChecks(opts.isolationNodes)))
+
   const normalized: DoctorCheck[] = checks.map((c) => ({
     ...c,
     severity: c.severity ?? (c.ok ? 'info' : 'error'),
@@ -527,6 +536,64 @@ export async function runDoctor(
   }
   if (!report.ok) return fail('failure', 'doctor_failed', formatDoctorReport(report), report)
   return ok(report)
+}
+
+/**
+ * 各节点每个执行器 × 沙箱设置的隔离状态（worker-credential-isolation 3.2）：声明的施加层、是否已施加、最近探针时间、
+ * 失败项（只列项名与路径，不含内容）、跳过项与未验证项及原因。
+ * - 探针不通过：warning（本阶段适配器尚未施加隔离，探针预期不通过，不影响退出码）；
+ * - 未探测、施加层为 none、通过：info；
+ * - 中枢不可用或读取失败：info，说明无法汇总。
+ */
+export async function isolationProbeChecks(
+  loadNodes: () => Promise<Result<{ nodes: NodeView[] }>>,
+): Promise<DoctorCheck[]> {
+  let loaded: Result<{ nodes: NodeView[] }>
+  try {
+    loaded = await loadNodes()
+  } catch (err) {
+    loaded = fail('retryable', 'hub_unavailable', (err as Error).message)
+  }
+  if (!loaded.ok)
+    return [
+      {
+        id: 'isolation.probe',
+        ok: false,
+        severity: 'info',
+        message: `无法从中枢读取节点的隔离自检结果（${loaded.error.code}）`,
+        hint: '启动中枢与节点后重新运行 raindown doctor；也可用 raindown node list 查看',
+      },
+    ]
+  if (loaded.data.nodes.length === 0)
+    return [{ id: 'isolation.probe', ok: true, message: '隔离自检：没有已注册的节点' }]
+  const checks: DoctorCheck[] = []
+  for (const node of loaded.data.nodes) {
+    for (const row of isolationStatusRows(node)) {
+      const [head, ...rest] = describeIsolationStatus(row, '       ')
+      const message = [`隔离 ${node.node_id} ${head ?? ''}`, ...rest].join('\n')
+      const id = `isolation.${node.node_id}.${row.executor}${row.setting === '—' ? '' : `.${row.setting}`}`
+      if (row.probe === 'failed')
+        checks.push({
+          id,
+          ok: false,
+          severity: 'warning',
+          message,
+          hint: row.enforced
+            ? '隔离可能失效：检查 macOS 更新与 seatbelt 配置'
+            : '适配器尚未施加隔离（tasks 第 4、5 阶段），探针如实报告受保护项可访问',
+        })
+      else if (row.probe === 'untested')
+        checks.push({
+          id,
+          ok: false,
+          severity: 'info',
+          message,
+          hint: '节点尚未上报探针结果（旧节点或刚启动）；升级并重启节点后会在启动时运行',
+        })
+      else checks.push({ id, ok: true, message })
+    }
+  }
+  return checks
 }
 
 /** supervisor 设置的一行摘要（add-m1-supervisor 1.2：doctor 显示）。 */

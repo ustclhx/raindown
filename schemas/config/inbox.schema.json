@@ -25,7 +25,8 @@
               "task_proposal",
               "merge_request",
               "decision",
-              "pr_comment"
+              "pr_comment",
+              "isolation"
             ]
           },
           "workspace": {

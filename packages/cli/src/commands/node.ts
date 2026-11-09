@@ -1,7 +1,9 @@
 import { join } from 'node:path'
 import {
   describeCredentialIsolation,
+  describeIsolationStatus,
   fail,
+  isolationStatusRows,
   type NodeView,
   ok,
   raindownPaths,
@@ -46,6 +48,9 @@ export const nodeStartCommand = defineCommand({
         // 不调用模型，按确定性条件合并 PR（add-m1-supervisor D10）。
         createPrMergeExecutor({ home }),
       ],
+      // 隔离自检探针：启动时、每 6 小时、macOS 版本变化时运行，结果随注册上报（worker-credential-isolation 3.1）。
+      // 探针只判断受保护文件能否打开，不读取内容。
+      isolationProbe: {},
     })
     if (!started.ok) return started
     const node = started.data
@@ -65,16 +70,25 @@ export const nodeStartCommand = defineCommand({
 const lastSeen = (n: NodeView) => n.last_seen_at ?? '—'
 
 /**
- * 每个执行器的凭证隔离声明（worker-credential-isolation 1.3）。目前只是声明将要支持的施加层，
- * 尚未施加，明确标为“未施加”，不能读成已隔离。
+ * 每个执行器的凭证隔离声明（worker-credential-isolation 1.3）与隔离自检结果（3.2）：
+ * 每个执行器 × 沙箱设置的声明施加层、是否已施加、最近探针时间、失败项（项名与路径）、跳过项与原因。
+ * 适配器尚未施加隔离时明确标为“未施加”，不能读成已隔离；旧节点没有探针结果时显示“未探测”。
  */
 export function isolationLines(nodes: readonly NodeView[]): string {
-  const lines = nodes.flatMap((n) =>
-    n.executors.map(
-      (e) => `  ${n.node_id} ${e.type}：${describeCredentialIsolation(e.adapter_capabilities)}`,
-    ),
-  )
-  return lines.length ? `凭证隔离（按角色沙箱设置声明的施加层）：\n${lines.join('\n')}` : ''
+  const lines = nodes.flatMap((n) => {
+    const rows = isolationStatusRows(n)
+    return n.executors.flatMap((e) => [
+      `  ${n.node_id} ${e.type}：${describeCredentialIsolation(e.adapter_capabilities)}`,
+      ...rows
+        .filter((r) => r.executor === e.type && r.setting !== '—')
+        .flatMap((r) =>
+          describeIsolationStatus(r, '        ').map((l, i) => (i === 0 ? `    ${l}` : l)),
+        ),
+    ])
+  })
+  return lines.length
+    ? `凭证隔离（按角色沙箱设置声明的施加层与自检结果）：\n${lines.join('\n')}`
+    : ''
 }
 
 /** `raindown node list`：列出已注册的节点（node-protocol "查看节点"）。 */

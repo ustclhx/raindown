@@ -87,6 +87,7 @@ test('node list 的凭证隔离：显示每个执行器的声明值与“未施�
     registered_at: '2026-11-09T00:00:00.000Z',
     last_seen_at: null,
     active_leases: 0,
+    isolation_probe: null,
   })
   const text = isolationLines([
     view('n-new', [
@@ -104,6 +105,65 @@ test('node list 的凭证隔离：显示每个执行器的声明值与“未施�
     'n-new codex-orca：danger-full-access→seatbelt、workspace-write→native、read-only→native（仅声明，未施加）',
   )
   expect(text).toContain('n-old codex-orca：未上报（按 none 处理）')
+  // 新节点还没有探针结果：每个沙箱设置显示“未探测”。
+  expect(text).toContain('codex-orca × danger-full-access：声明 seatbelt，未施加；未探测')
   expect(text).not.toContain('已施加')
   expect(isolationLines([])).toBe('')
+})
+
+test('node list 的隔离自检：显示最近探针时间、失败项与跳过项（只含项名与路径）', () => {
+  const node: NodeView = {
+    node_id: 'n-1',
+    hostname: 'h',
+    version: '0',
+    capabilities: [],
+    executors: [
+      {
+        type: 'codex-exec',
+        adapter_capabilities: {
+          ...NO_ADAPTER_CAPABILITIES,
+          credential_isolation: { layers: { 'danger-full-access': 'seatbelt' }, enforced: false },
+        },
+      },
+    ],
+    concurrency: 1,
+    registered_at: '2026-11-09T00:00:00.000Z',
+    last_seen_at: null,
+    active_leases: 0,
+    isolation_probe: {
+      ran_at: '2026-11-09T01:00:00.000Z',
+      macos_version: '15.1',
+      runs: [
+        {
+          executor: 'codex-exec',
+          setting: 'danger-full-access',
+          declared_layer: 'seatbelt',
+          applied_layer: 'none',
+          passed: false,
+          items: [
+            {
+              item: 'read.hub_token',
+              target: '/tmp/h/state/hub.token',
+              expected: 'deny',
+              actual: 'allow',
+              ok: false,
+            },
+            {
+              item: 'connect.orca_port',
+              expected: 'deny',
+              actual: 'skipped',
+              ok: null,
+              detail: 'Orca 端口未解析',
+            },
+          ],
+        },
+      ],
+    },
+  }
+  const text = isolationLines([node])
+  expect(text).toContain(
+    'codex-exec × danger-full-access：声明 seatbelt，未施加；最近探针 2026-11-09T01:00:00.000Z，macOS 15.1（实际以 none 运行）：不通过',
+  )
+  expect(text).toContain('失败 read.hub_token（/tmp/h/state/hub.token）：预期拒绝，实际 allow')
+  expect(text).toContain('跳过 connect.orca_port：Orca 端口未解析')
 })

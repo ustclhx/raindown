@@ -286,12 +286,13 @@ export function createApplier(db: Database): Applier {
         const p = e.payload
         stmt(
           `INSERT INTO nodes (node_id, hostname, version, capabilities_json, executors_json,
-             concurrency, registered_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
+             concurrency, registered_at, isolation_probe_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (node_id) DO UPDATE SET hostname = excluded.hostname,
              version = excluded.version, capabilities_json = excluded.capabilities_json,
              executors_json = excluded.executors_json, concurrency = excluded.concurrency,
-             registered_at = excluded.registered_at`,
+             registered_at = excluded.registered_at,
+             isolation_probe_json = excluded.isolation_probe_json`,
         ).run(
           p.node_id,
           p.hostname,
@@ -301,6 +302,8 @@ export function createApplier(db: Database): Applier {
           JSON.stringify(readExecutorInfo.array().parse(p.executors ?? [])),
           p.concurrency,
           e.ts,
+          // 不带探针结果的注册（旧节点）显示为未探测，不沿用之前的结果。
+          p.isolation_probe ? JSON.stringify(p.isolation_probe) : null,
         )
         return
       }
