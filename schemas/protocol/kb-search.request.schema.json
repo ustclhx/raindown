@@ -19,7 +19,6 @@
     "type": {
       "description": "仅检索指定类型",
       "type": "string",
-      "minLength": 1,
       "maxLength": 64
     },
     "includeJournal": {

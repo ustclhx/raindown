@@ -66,7 +66,7 @@ const { spawn } = require('node:child_process')
 const question = ${JSON.stringify(question)}
 const resumed = ${JSON.stringify(resumed)}
 const args = process.argv.slice(2)
-fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify({ args, cwd: process.cwd(), token: process.env.RAINDOWN_HUB_TOKEN, home: process.env.RAINDOWN_HOME, actor: process.env.RAINDOWN_ACTOR, codexHome: process.env.CODEX_HOME, leaseTokenFile: process.env.RAINDOWN_LEASE_TOKEN_FILE }))
+fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify({ args, cwd: process.cwd(), token: process.env.RAINDOWN_HUB_TOKEN, home: process.env.RAINDOWN_HOME, actor: process.env.RAINDOWN_ACTOR, codexHome: process.env.CODEX_HOME, leaseTokenFile: process.env.RAINDOWN_LEASE_TOKEN_FILE, hubUrl: process.env.RAINDOWN_HUB_URL }))
 // 故意逐 7 字节输出，覆盖 UTF-8、多行和 JSON 跨 chunk；最后一行没有换行。
 const send = text => { const b = Buffer.from(text.trimEnd()); for (let i = 0; i < b.length; i += 7) fs.writeSync(1, b.subarray(i, i + 7)) }
 ${body}
@@ -126,6 +126,7 @@ ${body}
         home: string
         codexHome?: string
         leaseTokenFile?: string
+        hubUrl?: string
       },
     launched: () => existsSync(report),
   }
@@ -178,8 +179,10 @@ describe('codex-exec 无头执行器', () => {
   test('读角色也注入唯一的任务 MCP，仅通过环境传递凭证文件路径', async () => {
     const s = setup()
     const tokenFile = join(s.dir, 'lease.token')
-    await collect(s.run({ ...s.ctx, leaseTokenFile: tokenFile }))
+    await collect(s.run({ ...s.ctx, leaseTokenFile: tokenFile, hubUrl: 'http://127.0.0.1:7477' }))
     const report = s.report()
+    // 中枢地址随派工令牌交给 MCP（不是凭证），任务绑定会话不读 config/hub.yaml。
+    expect(report.hubUrl).toBe('http://127.0.0.1:7477')
     const configs = report.args.filter((arg) => arg.startsWith('mcp_servers.raindown='))
     expect(configs).toEqual([
       codexTaskMcpConfig({ home: s.home, role: 'triage', taskId: s.ctx.taskId }),
@@ -189,7 +192,7 @@ describe('codex-exec 无头执行器', () => {
         raindown: {
           command: 'raindown',
           args: ['mcp', '--actor', 'triage', '--task', 't-test'],
-          env_vars: ['RAINDOWN_LEASE_TOKEN_FILE'],
+          env_vars: ['RAINDOWN_LEASE_TOKEN_FILE', 'RAINDOWN_HUB_URL'],
           default_tools_approval_mode: 'approve',
         },
       },

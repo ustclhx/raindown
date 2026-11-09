@@ -158,6 +158,13 @@ export interface JournalReceipt extends WriteReceipt {
   time: string
 }
 
+/**
+ * 转义正文行首的 Markdown 标题标记（`#`…`######` 后跟空白或行尾）：正文不能伪造 journal 记录标题行，
+ * 记录归属（workspace）的判定因此只取决于真正的标题行（add-worker-credential-isolation D3）。
+ */
+export const escapeJournalHeadings = (text: string): string =>
+  text.replace(/^([ \t]*)(#{1,6})(?=[ \t]|$)/gm, '$1\\$2')
+
 /** 一条 journal 记录的 Markdown：标题行带时间、操作者、workspace，下面是正文。 */
 export function renderJournalRecord(
   time: string,
@@ -166,7 +173,7 @@ export function renderJournalRecord(
   text: string,
 ): string {
   const head = [time, actor, ...(workspace ? [workspace] : [])].join(' · ')
-  return `\n## ${head}\n\n${text.trim()}\n`
+  return `\n## ${head}\n\n${escapeJournalHeadings(text.trim())}\n`
 }
 
 /** 追加一条 journal 到 `brain/journal/<YYYY-MM-DD>.md`（任何操作者都可以直接追加）。 */

@@ -18,6 +18,7 @@ import type { z } from 'zod'
 import { errorResponse } from '../app.ts'
 import { respond } from '../ledger/routes.ts'
 import { fieldIssues } from '../ledger/tasks.ts'
+import { readLimitedJson } from '../server/body.ts'
 
 /**
  * 任务绑定的知识读取路由（add-worker-credential-isolation D3；knowledge-access "任务绑定会话经中枢读取"）。
@@ -36,7 +37,7 @@ export interface KbRoutesDeps {
   home: string
 }
 
-/** 请求体上限：最长的合法请求（20 条各 500 字的条件）也远小于它。 */
+/** 请求体字节上限（先看 Content-Length，再边读边计数）：最长的合法请求也远小于它。 */
 const BODY_MAX = 32 * 1024
 
 function visibilityOf(c: Context): KbVisibility | null {
@@ -45,14 +46,9 @@ function visibilityOf(c: Context): KbVisibility | null {
 }
 
 async function parseBody<S extends z.ZodType>(c: Context, schema: S): Promise<Result<z.infer<S>>> {
-  const text = await c.req.text()
-  if (text.length > BODY_MAX) return fail('usage', 'invalid_arguments', '请求体过大')
-  let data: unknown
-  try {
-    data = JSON.parse(text)
-  } catch {
-    return fail('usage', 'invalid_arguments', '请求体不是合法的 JSON')
-  }
+  const body = await readLimitedJson(c, BODY_MAX, '请求体不是合法的 JSON 或超过 32 KiB')
+  if (!body.ok) return body
+  const data = body.data
   const parsed = schema.safeParse(data)
   if (parsed.success) return { ok: true, data: parsed.data }
   const fields = fieldIssues(parsed.error.issues, data)

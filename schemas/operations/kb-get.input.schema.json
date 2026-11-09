@@ -6,7 +6,8 @@
     "id": {
       "type": "string",
       "minLength": 1,
-      "description": "条目标识"
+      "maxLength": 512,
+      "description": "条目标识：相对 brain/ 的路径，不含 .md"
     }
   },
   "required": [

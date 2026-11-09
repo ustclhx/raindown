@@ -19,6 +19,9 @@ export const CHILD_ENV_DENYLIST: readonly string[] = [
   HUB_TOKEN_FILE_ENV,
   'RAINDOWN_LEASE_TOKEN_FILE',
   'FLOW_LEASE_TOKEN_FILE',
+  // 中枢地址只由适配器随派工令牌显式设置；节点自身环境中的值不继承，避免把 MCP 指向别处。
+  'RAINDOWN_HUB_URL',
+  'FLOW_HUB_URL',
   'FLOW_HUB_TOKEN',
   'FLOW_HUB_TOKEN_FILE',
 ]

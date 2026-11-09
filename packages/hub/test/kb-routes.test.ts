@@ -78,6 +78,27 @@ beforeAll(async () => {
     scope: 'work',
     owner: { nested: true },
   })
+  writeEntry(home, 'resources/repos/ownerless', {
+    type: 'repo',
+    title: '无归属 仓库',
+    summary: '资源类型缺少 owner',
+    scope: 'work',
+    path: '/tmp/ownerless',
+  })
+  writeEntry(home, 'notes/null-owner', {
+    type: 'note',
+    title: '无归属 空 owner',
+    summary: 'owner 为 null',
+    scope: 'work',
+    owner: null,
+  })
+  writeEntry(home, 'notes/newline-owner', {
+    type: 'note',
+    title: '无归属 换行 owner',
+    summary: 'owner 含换行',
+    scope: 'work',
+    owner: 'ws/xuanxue-saas\nws/product-res',
+  })
   writeText(
     join(home, 'brain', 'journal', '2026-11-01.md'),
     [
@@ -254,6 +275,90 @@ describe('可见范围', () => {
     expect(doc.data.body).toContain('未标 workspace 的记录')
     expect(doc.data.body).not.toContain('机密排期')
   })
+
+  test('get：没有可见记录的 journal 与不存在的日期一样返回 not_found（M1）', async () => {
+    const hidden = await call('/v1/kb/get', { id: 'journal/2026-11-02' })
+    expect(hidden.status).toBe(404)
+    expect(hidden.doc.error.message).toBe('未找到条目：journal/2026-11-02')
+    const missing = await call('/v1/kb/get', { id: 'journal/2026-11-03' })
+    expect(missing.status).toBe(404)
+    expect(missing.doc.error.message).toBe('未找到条目：journal/2026-11-03')
+  })
+
+  test('L1：缺少 owner 的资源条目与 owner 为空的条目不可见', async () => {
+    for (const id of ['resources/repos/ownerless', 'notes/null-owner', 'notes/newline-owner']) {
+      expect((await call('/v1/kb/get', { id })).status).toBe(404)
+    }
+    const { doc } = await call('/v1/kb/search', { query: '无归属' })
+    expect(ids(doc)).toEqual([])
+  })
+})
+
+describe('检索在大量别的 workspace 条目时（M2）', () => {
+  let bulk: string
+  let bulkApp: ReturnType<typeof createHubApp>
+  beforeAll(async () => {
+    bulk = tempHome('raindown-kb-bulk-')
+    const r = await initRaindownHome(bulk)
+    if (!r.ok) throw new Error(r.error.message)
+    for (let i = 0; i < 300; i++) {
+      writeEntry(bulk, `resources/repos/other-${String(i).padStart(3, '0')}`, {
+        type: 'repo',
+        title: `批量词 别的仓库 ${i}`,
+        summary: '别的 workspace',
+        scope: 'work',
+        owner: 'ws/xuanxue-saas',
+        path: `/tmp/o${i}`,
+      })
+    }
+    for (let i = 0; i < 30; i++) {
+      writeEntry(bulk, `notes/own-${String(i).padStart(2, '0')}`, {
+        type: 'note',
+        title: `批量词 笔记 ${i}`,
+        summary: '全局',
+        scope: 'work',
+      })
+    }
+    for (let d = 1; d <= 9; d++) {
+      writeText(
+        join(bulk, 'brain', 'journal', `2026-10-0${d}.md`),
+        `# 2026-10-0${d}\n\n## 09:00:00 · codex · ws/xuanxue-saas\n\n批量词 别人的日志\n`,
+      )
+    }
+    bulkApp = createHubApp({
+      taskTokens: {
+        authenticate: (t: string) => (t === TASK ? taskCaller('ws/product-res') : null),
+      },
+      mount: [{ path: '/', app: createKbRoutes({ home: bulk }) }],
+    })
+  })
+  afterAll(() => rmSync(dirname(bulk), { recursive: true, force: true }))
+
+  test('取满 limit，顺序与 CLI（同一实现、不带可见范围）中可见条目的顺序一致', async () => {
+    for (const query of ['批量词', '批量']) {
+      const res = await bulkApp.request('/v1/kb/search', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${TASK}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, limit: 25 }),
+      })
+      const doc = (await res.json()) as Doc
+      expect(doc.data.results).toHaveLength(25)
+      const full = await searchIndex(bulk, { query, limit: 1000 })
+      if (!full.ok) throw new Error(full.error.message)
+      expect(doc.data.results as unknown).toEqual(
+        full.data.results.filter((r) => r.id.startsWith('notes/')).slice(0, 25),
+      )
+    }
+  })
+
+  test('只剩别人的 journal 时不返回，也不泄露内容', async () => {
+    const res = await bulkApp.request('/v1/kb/search', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TASK}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: '别人的日志' }),
+    })
+    expect(((await res.json()) as Doc).data.results).toEqual([])
+  })
 })
 
 describe('参数校验', () => {
@@ -268,7 +373,6 @@ describe('参数校验', () => {
     ['/v1/kb/get', { id: 'notes\\x' }],
     ['/v1/kb/get', { id: '.hidden/x' }],
     ['/v1/kb/get', { id: 'x'.repeat(513) }],
-    ['/v1/kb/query', { filters: [] }],
     ['/v1/kb/query', { filters: Array.from({ length: 21 }, () => 'type=repo') }],
   ])('%s %j → 400', async (path, body) => {
     const { status, doc } = await call(path, body)
@@ -276,8 +380,50 @@ describe('参数校验', () => {
     expect(doc.error.code).toBe('invalid_arguments')
   })
 
-  test('过大的请求体被拒绝', async () => {
+  test('L3：空条件与本地一致，返回 invalid_filter', async () => {
+    const local = await queryIndex(home, [])
+    expect(local.ok ? undefined : local.error.code).toBe('invalid_filter')
+    for (const filters of [[], ['type']]) {
+      const { status, doc } = await call('/v1/kb/query', { filters })
+      expect(status).toBe(400)
+      expect(doc.error.code).toBe('invalid_filter')
+    }
+  })
+
+  test('L4：过大的请求体被拒绝（Content-Length 声明超限、或实际字节超限）', async () => {
     const { status } = await call('/v1/kb/search', { query: '干支日', pad: 'x'.repeat(40_000) })
     expect(status).toBe(400)
+    // Content-Length 声明很小，但实际是超限的流式请求体：边读边计数仍然拒绝。
+    const big = new TextEncoder().encode(
+      JSON.stringify({ query: '干支日', pad: '字'.repeat(20_000) }),
+    )
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let i = 0; i < big.length; i += 4096) controller.enqueue(big.slice(i, i + 4096))
+        controller.close()
+      },
+    })
+    const res = await app.request(
+      new Request('http://localhost/v1/kb/search', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${TASK}`, 'Content-Type': 'application/json' },
+        body: stream,
+        // 流式请求体需要 duplex: half
+        duplex: 'half',
+      }),
+    )
+    expect(res.status).toBe(400)
+    for (const length of ['abc', String(64 * 1024)]) {
+      const r = await app.request('/v1/kb/search', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${TASK}`,
+          'Content-Type': 'application/json',
+          'Content-Length': length,
+        },
+        body: JSON.stringify({ query: '干支日' }),
+      })
+      expect(r.status).toBe(400)
+    }
   })
 })

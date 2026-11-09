@@ -26,7 +26,10 @@ const must = <T>(r: Result<T>): T => {
 const cleanups: (() => Promise<void>)[] = []
 const previousTokenFile = process.env.RAINDOWN_LEASE_TOKEN_FILE
 const previousHome = process.env.RAINDOWN_HOME
+const previousHubUrl = process.env.RAINDOWN_HUB_URL
 afterEach(async () => {
+  if (previousHubUrl === undefined) delete process.env.RAINDOWN_HUB_URL
+  else process.env.RAINDOWN_HUB_URL = previousHubUrl
   if (previousTokenFile === undefined) delete process.env.RAINDOWN_LEASE_TOKEN_FILE
   else process.env.RAINDOWN_LEASE_TOKEN_FILE = previousTokenFile
   if (previousHome === undefined) delete process.env.RAINDOWN_HOME
@@ -34,17 +37,22 @@ afterEach(async () => {
   for (const fn of cleanups.splice(0).reverse()) await fn()
 })
 
-/** worker 侧的 home：只有 config/hub.yaml（用来找到中枢），没有 brain/ 与 state/。 */
-async function workerHome(port: number): Promise<string> {
+/**
+ * worker 侧的 home。给出端口时只有 config/hub.yaml（旧节点不传中枢地址时的兼容路径）；
+ * 不给时整个 home 都不存在（模拟隔离下 brain/、state/、config/ 全部不可读），中枢地址经 RAINDOWN_HUB_URL 传入。
+ */
+async function workerHome(port?: number): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'raindown-kb-worker-'))
   cleanups.push(() => rm(root, { recursive: true, force: true }))
   const home = join(root, 'home')
-  await mkdir(join(home, 'config'), { recursive: true })
-  await writeFile(join(home, 'config', 'hub.yaml'), `port: ${port}\n`)
+  if (port !== undefined) {
+    await mkdir(join(home, 'config'), { recursive: true })
+    await writeFile(join(home, 'config', 'hub.yaml'), `port: ${port}\n`)
+  }
   return home
 }
 
-test('任务绑定会话在 raindown-home 不可读时经中枢读取，结果与 CLI 一致；派工结束后被拒', async () => {
+test('任务绑定会话在 raindown-home（含 config/）不可读时经中枢读取与上报，结果与 CLI 一致；派工结束后被拒', async () => {
   const home = await initTempHome('raindown-kb-hub-')
   cleanups.push(() => rm(dirname(home), { recursive: true, force: true }))
   writeEntry(home, 'concepts/ganzhi', {
@@ -114,7 +122,9 @@ test('任务绑定会话在 raindown-home 不可读时经中枢读取，结果�
   )
   if (!lease?.dispatch_token) throw new Error('派工未携带 worker 凭证')
 
-  const worker = await workerHome(hub.port)
+  // worker 侧没有 raindown-home（brain/、state/、config/ 都不可读）：中枢地址由节点经 RAINDOWN_HUB_URL 交给 MCP。
+  const worker = await workerHome()
+  process.env.RAINDOWN_HUB_URL = `http://127.0.0.1:${hub.port}`
   const tokenFile = join(dirname(worker), 'dispatch.token')
   await writeFile(tokenFile, lease.dispatch_token, { mode: 0o600 })
   process.env.RAINDOWN_LEASE_TOKEN_FILE = tokenFile
@@ -154,8 +164,11 @@ test('任务绑定会话在 raindown-home 不可读时经中枢读取，结果�
     })
 
     // worker 侧没有读写过 raindown-home 的 brain/ 与 state/。
-    expect(existsSync(join(worker, 'brain'))).toBe(false)
-    expect(existsSync(join(worker, 'state'))).toBe(false)
+    // 上报同样不依赖 config/hub.yaml。
+    expect(
+      await callJson(mcp, 'raindown_report', { status: 'progress', summary: '正在查资料' }),
+    ).toMatchObject({ isError: false, doc: { ok: true } })
+    expect(existsSync(worker)).toBe(false)
 
     // 派工结束后凭证失效：kb 读取被拒，也不回退到本地。
     must(
@@ -262,6 +275,21 @@ test('任务绑定但没有派工令牌文件：拒绝，不改用其他中枢�
     expect((await callJson(mcp, 'kb_search', { query: '干支日' })).doc).toMatchObject({
       ok: false,
       error: { code: 'lease_token_required' },
+    })
+    // L3：MCP 工具 schema 带着与中枢相同的上限，超限在本地就以用法错误拒绝。
+    const tools = (await mcp.listTools()).tools
+    const schemaOf = (name: string) =>
+      tools.find((t) => t.name === name)?.inputSchema.properties as Record<
+        string,
+        Record<string, unknown>
+      >
+    expect(schemaOf('kb_search').limit?.maximum).toBe(100)
+    expect(schemaOf('kb_search').query?.maxLength).toBe(500)
+    expect(schemaOf('kb_query').filters?.maxItems).toBe(20)
+    expect(schemaOf('kb_get').id?.maxLength).toBe(512)
+    expect((await callJson(mcp, 'kb_search', { query: '干支日', limit: 101 })).doc).toMatchObject({
+      ok: false,
+      error: { kind: 'usage' },
     })
   } finally {
     await mcp.close()

@@ -79,6 +79,11 @@ export interface ExecutorContext {
   /** 当前 worker 派工凭证文件（0600）；只传路径到受管 MCP，不传凭证明文。 */
   leaseTokenFile?: string
   /**
+   * 中枢地址（不是凭证）：与 `leaseTokenFile` 一起作为 `RAINDOWN_HUB_URL` 交给受管 MCP，
+   * 使任务绑定会话不必读取 raindown-home 的 `config/hub.yaml`（add-worker-credential-isolation D2、D3）。
+   */
+  hubUrl?: string
+  /**
    * 上报写类任务的真实分支与 worktree（D15）：只有为本任务创建并拥有该分支的适配器（当前为 codex-orca）
    * 在 worker 启动前调用；在给定工作目录中运行的适配器不得把当前检出分支当作任务分支上报。节点随下一次续约上报，
    * 中枢写 `task.branch_reported`（每个任务一次、不可更改）。worktree 由节点 realpath 后上报；

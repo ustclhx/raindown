@@ -19,6 +19,7 @@ import { type Context, Hono } from 'hono'
 import { z } from 'zod'
 import { respond } from '../ledger/routes.ts'
 import type { LedgerStore } from '../ledger/store.ts'
+import { readLimitedJson } from '../server/body.ts'
 
 const execFileAsync = promisify(execFile)
 const githubPr =
@@ -82,39 +83,8 @@ const REPORT_WINDOW_MAX = 10
 const REPORT_ATTEMPT_MAX = 200
 
 /** 不依赖 Content-Length；逐块限制实际字节数，在 JSON 解析前限制内存。 */
-async function reportBody(c: Context): Promise<Result<unknown>> {
-  const invalid = () => fail('usage', 'invalid_arguments', '上报请求体不合法或超过 32 KiB')
-  const length = c.req.header('content-length')
-  if (length !== undefined && (!/^\d+$/.test(length) || Number(length) > REPORT_BODY_MAX))
-    return invalid()
-  const reader = c.req.raw.body?.getReader()
-  if (!reader) return invalid()
-  const chunks: Uint8Array[] = []
-  let size = 0
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      size += value.byteLength
-      if (size > REPORT_BODY_MAX) {
-        await reader.cancel()
-        return invalid()
-      }
-      chunks.push(value)
-    }
-    const bytes = new Uint8Array(size)
-    let offset = 0
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset)
-      offset += chunk.byteLength
-    }
-    return ok(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)))
-  } catch {
-    return invalid()
-  } finally {
-    reader.releaseLock()
-  }
-}
+const reportBody = (c: Context): Promise<Result<unknown>> =>
+  readLimitedJson(c, REPORT_BODY_MAX, '上报请求体不合法或超过 32 KiB')
 
 export interface WorkerReportRoutesDeps {
   ledger: LedgerStore

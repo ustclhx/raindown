@@ -229,7 +229,7 @@ export function buildCodexCommand(input: {
   codexHome: string
   worktreePath: string
   specPath: string
-  task?: { id: string; workspace: string; home: string; leaseTokenFile?: string }
+  task?: { id: string; workspace: string; home: string; leaseTokenFile?: string; hubUrl?: string }
   role: Pick<Role, 'name' | 'model' | 'effort' | 'permissions'>
 }): Result<string> {
   if (input.codexBin.includes('=')) {
@@ -272,6 +272,10 @@ export function buildCodexCommand(input: {
         RAINDOWN_HOME: input.task.home,
         ...(input.task.leaseTokenFile
           ? { RAINDOWN_LEASE_TOKEN_FILE: input.task.leaseTokenFile }
+          : {}),
+        // 中枢地址（不是凭证）随派工令牌交给受管 MCP，任务绑定会话不读 config/hub.yaml（D3）。
+        ...(input.task.leaseTokenFile && input.task.hubUrl
+          ? { RAINDOWN_HUB_URL: input.task.hubUrl }
           : {}),
       })
     : {}
@@ -1610,6 +1614,7 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
               workspace: contract.workspace,
               home: options.home,
               ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
+              ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
             },
             role,
           })

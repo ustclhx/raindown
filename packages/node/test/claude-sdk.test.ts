@@ -1977,4 +1977,27 @@ describe('supervisor 会话绑定', () => {
     for (const n of SUPERVISOR_MCP_AUTO_ALLOWED)
       expect(state.calls[0]?.allowedTools).not.toContain(`mcp__raindown__${n}`)
   })
+
+  test('任务绑定：中枢地址随派工令牌交给 MCP，任务绑定会话不读 config/hub.yaml', async () => {
+    const { query, state } = mockSdk(async function* (io) {
+      await io.nextUser()
+      yield result()
+    })
+    const ex = createClaudeSdkExecutor({
+      home: '/tmp/raindown-home-x',
+      query,
+      resolveRole: roleResolver(reviewer()),
+    })
+    const r = await ex.run(
+      contract(),
+      ctx({ leaseTokenFile: '/private/task.token', hubUrl: 'http://127.0.0.1:7477' }),
+    ).done
+    expect(r.ok && r.data.outcome).toBe('done')
+    expect(state.calls[0]?.mcpServers?.raindown).toMatchObject({
+      env: {
+        RAINDOWN_LEASE_TOKEN_FILE: '/private/task.token',
+        RAINDOWN_HUB_URL: 'http://127.0.0.1:7477',
+      },
+    })
+  })
 })

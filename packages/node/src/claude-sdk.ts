@@ -1396,7 +1396,11 @@ export function buildOptions(i: BuildOptionsInput): Options & { model: string } 
             }),
           }
         : i.ctx.leaseTokenFile
-          ? { RAINDOWN_LEASE_TOKEN_FILE: i.ctx.leaseTokenFile }
+          ? {
+              RAINDOWN_LEASE_TOKEN_FILE: i.ctx.leaseTokenFile,
+              // 中枢地址随派工令牌交给 MCP，任务绑定会话不读 config/hub.yaml（D3）。
+              ...(i.ctx.hubUrl ? { RAINDOWN_HUB_URL: i.ctx.hubUrl } : {}),
+            }
           : {}),
     },
   }

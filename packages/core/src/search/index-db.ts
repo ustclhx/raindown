@@ -8,16 +8,16 @@ import { fail, ok, type Result } from '../result.ts'
 import type { GetOutput, QueryOutput, SearchInput, SearchOutput } from '../schema/search.ts'
 import { type Database, openDatabase, type SqlValue } from '../sqlite.ts'
 import {
-  decodeScopes,
   encodeScopes,
   entryScopes,
   filterJournalBody,
   type KbVisibility,
   scopesVisible,
+  visibleScopeEncodings,
 } from './visibility.ts'
 
-// 2：entries 增加 scope 列（条目归属的 workspace，用于任务绑定读取的可见范围）。
-const INDEX_VERSION = 2
+// 2：entries 增加 scope 列（条目归属的 workspace，用于任务绑定读取的可见范围）；3：scope 改为 JSON 数组编码。
+const INDEX_VERSION = 3
 const JOURNAL_FILE = /^\d{4}-\d{2}-\d{2}\.md$/
 
 function scalar(value: unknown): string | undefined {
@@ -143,7 +143,7 @@ export async function syncIndex(home: string): Promise<Result<undefined>> {
         const fields = fieldsOf(entry.frontmatter)
         // journal 的归属按记录在读取时过滤，文件本身记为 global。
         const scope = entry.id.startsWith('journal/')
-          ? ''
+          ? encodeScopes([])
           : encodeScopes(entryScopes(entry.frontmatter))
         index
           .prepare('INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
@@ -185,11 +185,40 @@ function excerpt(text: string, query: string): string {
 const containsQuery = (text: string, query: string) =>
   text.toLowerCase().includes(query.toLowerCase())
 
+/** 带可见范围检索时每批读取的行数下限，以及最多读取的批数（只有 journal 会在读取后被过滤掉）。 */
+const VISIBLE_BATCH_MIN = 50
+const VISIBLE_BATCH_MAX = 10
+
+/**
+ * 分批读取并过滤，直到取满 `limit`、没有更多行或达到批数上限（返回已取到的）。
+ * 读取的行数因此有上界：`batch × maxBatches`。
+ */
+export function collectPaged<R, T>(
+  fetch: (offset: number, size: number) => R[],
+  keep: (row: R) => T | undefined,
+  limit: number,
+  batch = Math.max(limit * 2, VISIBLE_BATCH_MIN),
+  maxBatches = VISIBLE_BATCH_MAX,
+): T[] {
+  const out: T[] = []
+  for (let i = 0; i < maxBatches && out.length < limit; i++) {
+    const rows = fetch(i * batch, batch)
+    for (const row of rows) {
+      const kept = keep(row)
+      if (kept !== undefined) out.push(kept)
+      if (out.length >= limit) break
+    }
+    if (rows.length < batch) break
+  }
+  return out
+}
+
 /**
  * 每次检索前同步；FTS 输入统一引用为短语，短查询使用 LIKE。score 越大越相关。
  *
- * 给出 `visibility`（任务绑定经中枢读取，D3）时：不可见的条目在 SQL 中排除；journal 去掉不可见的记录后
- * 若不再包含查询词则不返回，片段按过滤后的正文重算。为了在过滤后仍能取满 `limit`，先取全部命中再截断，
+ * 给出 `visibility`（任务绑定经中枢读取，D3）时：非 journal 条目在 SQL 中按 scope 过滤（可见的 scope
+ * 编码只有有限几种，用 `IN (...)` 参数化）；journal 在读取后去掉不可见的记录，没有可见记录或不再包含查询词
+ * 时不返回，片段按过滤后的正文重算。为了过滤后仍能取满 `limit`，分批读取（有上限，见 `collectPaged`），
  * 排序与不带可见范围时相同。
  */
 export async function searchIndex(
@@ -219,37 +248,39 @@ export async function searchIndex(
       params.push(input.type)
     }
     if (input.includeJournal === false) conditions.push("e.type != 'journal'")
+    if (visibility) {
+      const encodings = visibleScopeEncodings(visibility)
+      conditions.push(`e.scope IN (${encodings.map(() => '?').join(', ')})`)
+      params.push(...encodings)
+    }
     const limit = input.limit ?? 20
-    if (!visibility) params.push(limit)
-    let rows = db
-      .prepare(`
-      SELECT e.id, e.type, e.title, e.summary, e.scope, s.body, s.field_values,
+    type Row = SearchOutput['results'][number] & { body: string; field_values: string }
+    const statement = db.prepare(`
+      SELECT e.id, e.type, e.title, e.summary, s.body, s.field_values,
         ${short ? '1.0' : '-bm25(search, 0, 5, 2, 1, 1)'} AS score,
         ${short ? "''" : "snippet(search, -1, '', '', '…', 40)"} AS snippet
       FROM search s JOIN entries e ON e.id = s.id
       WHERE ${conditions.join(' AND ')}
-      ORDER BY (e.type = 'journal'), score DESC, e.id${visibility ? '' : ' LIMIT ?'}
+      ORDER BY (e.type = 'journal'), score DESC, e.id LIMIT ? OFFSET ?
     `)
-      .all(...params) as (SearchOutput['results'][number] & {
-      scope: string
-      body: string
-      field_values: string
-    })[]
-    if (visibility) {
-      rows = rows
-        .filter((row) => scopesVisible(decodeScopes(row.scope), visibility))
-        .flatMap((row) => {
-          if (!row.id.startsWith('journal/')) return [row]
-          const body = filterJournalBody(row.body, visibility)
-          if (body === row.body) return [row]
-          // 去掉了别的 workspace 的记录：只按剩下的正文判断是否命中，片段也只从剩下的正文中取。
-          if (![row.title, row.summary, body].some((v) => containsQuery(v, query))) return []
-          return [{ ...row, body, snippet: short ? '' : excerpt(body, query) }]
-        })
-        .slice(0, limit)
-    }
+    const rows = visibility
+      ? collectPaged(
+          (offset, size) => statement.all(...params, size, offset) as Row[],
+          (row): Row | undefined => {
+            if (!row.id.startsWith('journal/')) return row
+            const body = filterJournalBody(row.body, visibility)
+            if (body === row.body) return row
+            if (body === '') return undefined
+            // 去掉了别的 workspace 的记录：只按剩下的正文判断是否命中，片段也只从剩下的正文中取。
+            if (![row.title, row.summary, body].some((v) => containsQuery(v, query)))
+              return undefined
+            return { ...row, body, snippet: short ? '' : excerpt(body, query) }
+          },
+          limit,
+        )
+      : (statement.all(...params, limit, 0) as Row[])
     return ok({
-      results: rows.map(({ body, field_values, scope: _scope, ...row }) => ({
+      results: rows.map(({ body, field_values, ...row }) => ({
         ...row,
         snippet: short
           ? excerpt(
@@ -284,16 +315,18 @@ export async function queryIndex(
     const conditions = parsed.map(
       () => 'EXISTS (SELECT 1 FROM fields f WHERE f.entry_id = e.id AND f.key = ? AND f.value = ?)',
     )
-    const params = parsed.flatMap((p) => [p?.[1] as string, p?.[2] as string])
-    const rows = db
-      .prepare(
-        `SELECT id, type, title, summary, scope FROM entries e WHERE ${conditions.join(' AND ')} ORDER BY id`,
-      )
-      .all(...params) as (QueryOutput['results'][number] & { scope: string })[]
+    const params: SqlValue[] = parsed.flatMap((p) => [p?.[1] as string, p?.[2] as string])
+    if (visibility) {
+      const encodings = visibleScopeEncodings(visibility)
+      conditions.push(`e.scope IN (${encodings.map(() => '?').join(', ')})`)
+      params.push(...encodings)
+    }
     return ok({
-      results: rows
-        .filter((row) => !visibility || scopesVisible(decodeScopes(row.scope), visibility))
-        .map(({ scope: _scope, ...row }) => row),
+      results: db
+        .prepare(
+          `SELECT id, type, title, summary FROM entries e WHERE ${conditions.join(' AND ')} ORDER BY id`,
+        )
+        .all(...params) as QueryOutput['results'],
     })
   } catch (err) {
     return fail('failure', 'query_failed', `字段查询失败：${(err as Error).message}`)
@@ -337,6 +370,10 @@ export async function getEntry(
     visibility && entry.id.startsWith('journal/')
       ? filterJournalBody(entry.body, visibility)
       : entry.body
+  // 没有可见记录的 journal 与不存在的条目一样返回 not_found，不暴露那天有日志。
+  if (body === '' && visibility && entry.id.startsWith('journal/')) {
+    return fail('failure', 'not_found', `未找到条目：${id}`)
+  }
   return ok({
     id: entry.id,
     type: textField(entry.frontmatter, 'type'),

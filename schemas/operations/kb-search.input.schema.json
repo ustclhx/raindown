@@ -6,6 +6,7 @@
     "query": {
       "type": "string",
       "minLength": 1,
+      "maxLength": 500,
       "description": "检索短语"
     },
     "limit": {
@@ -13,11 +14,12 @@
       "description": "最多返回的条目数",
       "type": "integer",
       "exclusiveMinimum": 0,
-      "maximum": 9007199254740991
+      "maximum": 100
     },
     "type": {
       "description": "仅检索指定类型",
-      "type": "string"
+      "type": "string",
+      "maxLength": 64
     },
     "includeJournal": {
       "default": true,
