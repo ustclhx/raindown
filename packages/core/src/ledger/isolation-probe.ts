@@ -82,17 +82,53 @@ export type IsolationProbeReport = z.infer<typeof isolationProbeReport>
 /** 读侧：不合法的结果按"未探测"（null）处理，不让投影读取失败。 */
 export const readIsolationProbeReport = isolationProbeReport.nullable().catch(null)
 
+/** 每次运行都必须出现、并且确实被拒绝的核心受保护项；缺任何一项都不能算通过。 */
+export const PROBE_REQUIRED_DENY_ITEMS = [
+  'read.hub_token',
+  'read.ledger_db',
+  'read.other_task_token',
+  'write.config',
+] as const
+
 /**
- * 按条目重新计算一次运行是否通过（不只信任上报的 `passed`）：没有错误，没有不符合预期的项，
- * 并且至少一个受保护项确实被拒绝（全部跳过不能算通过）。
+ * 由预期与实际重新计算 `ok`，不信任上报值：deny / allow 时为 `actual === expected`；
+ * skipped / unverified 为 null；error 为 false。
  */
-export function probeRunPassed(
-  run: Pick<IsolationProbeRun, 'items' | 'error' | 'passed'>,
-): boolean {
-  if (run.error || !run.passed) return false
-  if (run.items.some((i) => i.ok === false)) return false
-  return run.items.some((i) => i.expected === 'deny' && i.actual === 'deny' && i.ok === true)
+export function probeItemOk(i: Pick<IsolationProbeItem, 'expected' | 'actual'>): boolean | null {
+  if (i.actual === 'skipped' || i.actual === 'unverified') return null
+  if (i.actual === 'error') return false
+  return i.actual === i.expected
 }
+
+/**
+ * 按条目重新计算一次运行是否通过，**不信任上报的 `ok` 与 `passed`**：没有运行错误，没有（重新计算后）不符合预期的项，
+ * 并且核心受保护项（`PROBE_REQUIRED_DENY_ITEMS`）全部出现且确实被拒绝（全部跳过或缺项不能算通过）。
+ */
+export function probeRunPassed(run: Pick<IsolationProbeRun, 'items' | 'error'>): boolean {
+  if (run.error) return false
+  if (run.items.some((i) => probeItemOk(i) === false)) return false
+  return PROBE_REQUIRED_DENY_ITEMS.every((id) =>
+    run.items.some((i) => i.item === id && i.expected === 'deny' && i.actual === 'deny'),
+  )
+}
+
+/** 中枢写入前规范化：逐项重算 `ok`、逐次运行重算 `passed`，节点上报的这两个值一律不用。 */
+export function normalizeProbeReport(report: IsolationProbeReport): IsolationProbeReport {
+  return {
+    ...report,
+    runs: report.runs.map((run) => {
+      const items = run.items.map((i) => ({ ...i, ok: probeItemOk(i) }))
+      return {
+        ...run,
+        items,
+        passed: probeRunPassed({ items, ...(run.error ? { error: run.error } : {}) }),
+      }
+    }),
+  }
+}
+
+/** 探针结果的有效期：超过它的结果不能作为“已施加”的依据（`credentialIsolationFor`）。 */
+export const PROBE_MAX_AGE_MS = 12 * 60 * 60_000
 
 /** 某执行器 × 沙箱设置最近一次的探针运行。 */
 export function findProbeRun(

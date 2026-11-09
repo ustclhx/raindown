@@ -11,7 +11,10 @@ import {
   isolationProbeChecks,
   NO_ADAPTER_CAPABILITIES,
   type NodeView,
+  normalizeProbeReport,
   ok,
+  PROBE_REQUIRED_DENY_ITEMS,
+  probeItemOk,
   probeRegressions,
   probeRunPassed,
   runDoctor,
@@ -127,6 +130,12 @@ const run = (
         ok: !failing,
         ...(failing ? {} : { detail: 'EPERM' }),
       },
+      ...(['read.ledger_db', 'read.other_task_token', 'write.config'] as const).map((item) => ({
+        item,
+        expected: 'deny' as const,
+        actual: 'deny' as const,
+        ok: true,
+      })),
       ...(skipped
         ? [
             {
@@ -185,8 +194,28 @@ describe('通过判定与状态变化', () => {
   test('全部跳过或上报 passed 但条目失败都不算通过', () => {
     expect(probeRunPassed(run())).toBe(true)
     expect(probeRunPassed(run({ failing: true }))).toBe(false)
-    expect(probeRunPassed({ ...run(), items: run().items.slice(1) })).toBe(false)
-    expect(probeRunPassed({ ...run({ failing: true }), passed: true })).toBe(false)
+    // 缺少任一核心受保护项都不算通过（审查修复 M2）。
+    for (const id of PROBE_REQUIRED_DENY_ITEMS)
+      expect(probeRunPassed({ ...run(), items: run().items.filter((i) => i.item !== id) })).toBe(
+        false,
+      )
+    // 上报的 ok / passed 不可信：实际可读但声称 ok 的条目仍不通过。
+    const lying = run({ failing: true })
+    const claimed: IsolationProbeRun = {
+      ...lying,
+      passed: true,
+      items: lying.items.map((i) => ({ ...i, ok: true })),
+    }
+    expect(probeRunPassed(claimed)).toBe(false)
+    expect(normalizeProbeReport(probe({ ...lying, passed: true })).runs[0]).toMatchObject({
+      passed: false,
+      items: expect.arrayContaining([
+        expect.objectContaining({ item: 'read.hub_token', ok: false }),
+      ]),
+    })
+    // error 条目一律 ok=false；skipped / unverified 为 null。
+    expect(probeItemOk({ expected: 'deny', actual: 'error' })).toBe(false)
+    expect(probeItemOk({ expected: 'allow', actual: 'skipped' })).toBeNull()
     expect(probeRunPassed({ ...run(), error: { code: 'x', message: 'y' } })).toBe(false)
   })
 
@@ -201,7 +230,8 @@ describe('通过判定与状态变化', () => {
 })
 
 describe('doctor 显示隔离自检（worker-credential-isolation 3.2）', () => {
-  const checksFor = async (nodes: NodeView[]) => isolationProbeChecks(async () => ok({ nodes }))
+  const checksFor = async (nodes: NodeView[]) =>
+    isolationProbeChecks(async () => ok({ nodes }), Date.parse('2026-11-09T02:00:00.000Z'))
 
   test('未探测：info，提示升级并重启节点；施加层 none 的设置不探测；未上报能力的执行器单独说明', async () => {
     const checks = await checksFor([nodeView(null)])
@@ -216,6 +246,15 @@ describe('doctor 显示隔离自检（worker-credential-isolation 3.2）', () =>
     expect(checks.find((c) => c.id === 'isolation.n-1.fake')?.message).toContain(
       '未上报凭证隔离能力',
     )
+  })
+
+  test('审查修复 L3：结果超过 12 小时时不显示已施加', async () => {
+    const checks = await isolationProbeChecks(
+      async () => ok({ nodes: [nodeView(probe(run()), true)] }),
+      Date.parse('2026-11-09T14:00:00.000Z'),
+    )
+    const c = checks.find((x) => x.id === 'isolation.n-1.codex-exec.danger-full-access')
+    expect(c?.message).toContain('声明 seatbelt，未施加')
   })
 
   test('全部通过：ok；适配器已施加且通过时显示已施加', async () => {

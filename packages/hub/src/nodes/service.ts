@@ -21,6 +21,7 @@ import {
   type LedgerEvent,
   leaseSlotFor,
   type NodeView,
+  normalizeProbeReport,
   ok,
   probeRegressions,
   probeRunSummary,
@@ -682,8 +683,12 @@ export function createNodeService(o: NodeServiceOptions): NodeService {
       const req = parse(registerNodeRequest, body, '节点注册请求')
       if (!req.ok) return req
       const previousProbe = ledger.getNode(req.data.node_id)?.isolation_probe ?? null
+      // 节点上报的 ok / passed 不可信：写入前由中枢按预期与实际重新计算。
+      const payload = req.data.isolation_probe
+        ? { ...req.data, isolation_probe: normalizeProbeReport(req.data.isolation_probe) }
+        : req.data
       const written = ledger.append(
-        { type: 'node.registered', payload: req.data },
+        { type: 'node.registered', payload },
         // 未声明身份（unknown）或用 user token 未降级（user）时，记为该节点。
         { actor: actor === 'unknown' || actor === 'user' ? `node:${req.data.node_id}` : actor },
       )
@@ -692,7 +697,7 @@ export function createNodeService(o: NodeServiceOptions): NodeService {
         req.data.node_id,
         written.data.seq,
         previousProbe,
-        req.data.isolation_probe,
+        payload.isolation_probe,
       )
       ledger.touchNode(req.data.node_id)
       const node = ledger.getNode(req.data.node_id)

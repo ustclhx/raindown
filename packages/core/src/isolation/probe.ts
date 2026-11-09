@@ -6,6 +6,8 @@ import {
   findProbeRun,
   type IsolationProbeReport,
   type IsolationProbeRun,
+  PROBE_REQUIRED_DENY_ITEMS,
+  probeItemOk,
   probeRunPassed,
 } from '../ledger/isolation-probe.ts'
 import { credentialIsolationFor } from './capability.ts'
@@ -196,12 +198,20 @@ export function probeRunSummary(run: IsolationProbeRun): {
   unverified: string[]
 } {
   return {
-    failed: run.items
-      .filter((i) => i.ok === false)
-      .map(
-        (i) =>
-          `${itemLabel(i)}：预期${i.expected === 'deny' ? '拒绝' : '可用'}，实际 ${i.actual}${i.detail ? `（${i.detail}）` : ''}`,
-      ),
+    failed: [
+      ...run.items
+        // 按预期与实际重新计算，不使用上报的 ok。
+        .filter((i) => probeItemOk(i) === false)
+        .map(
+          (i) =>
+            `${itemLabel(i)}：预期${i.expected === 'deny' ? '拒绝' : '可用'}，实际 ${i.actual}${i.detail ? `（${i.detail}）` : ''}`,
+        ),
+      ...(run.error
+        ? []
+        : PROBE_REQUIRED_DENY_ITEMS.filter(
+            (id) => !run.items.some((i) => i.item === id && i.expected === 'deny'),
+          ).map((id) => `${id}：缺少核心受保护项`)),
+    ],
     skipped: run.items
       .filter((i) => i.actual === 'skipped')
       .map((i) => `${itemLabel(i)}：${i.detail ?? '未说明原因'}`),
@@ -225,13 +235,16 @@ export interface IsolationStatusRow {
 }
 
 /** 列出节点每个执行器 × 沙箱设置的隔离状态；执行器未上报 `credential_isolation` 时给出一行 `setting: '—'`。 */
-export function isolationStatusRows(node: {
-  executors: ReadonlyArray<{
-    type: string
-    adapter_capabilities: Pick<AdapterCapabilities, 'credential_isolation'>
-  }>
-  isolation_probe: IsolationProbeReport | null
-}): IsolationStatusRow[] {
+export function isolationStatusRows(
+  node: {
+    executors: ReadonlyArray<{
+      type: string
+      adapter_capabilities: Pick<AdapterCapabilities, 'credential_isolation'>
+    }>
+    isolation_probe: IsolationProbeReport | null
+  },
+  now: number = Date.now(),
+): IsolationStatusRow[] {
   const report = node.isolation_probe
   const rows: IsolationStatusRow[] = []
   for (const e of node.executors) {
@@ -250,7 +263,12 @@ export function isolationStatusRows(node: {
     }
     for (const setting of Object.keys(declared.layers).sort()) {
       const run = findProbeRun(report, e.type, setting)
-      const view = credentialIsolationFor(e.adapter_capabilities, setting as never, run ?? null)
+      const view = credentialIsolationFor(
+        e.adapter_capabilities,
+        setting as never,
+        run && report ? { run, ran_at: report.ran_at } : null,
+        now,
+      )
       const layer = declared.layers[setting] ?? 'none'
       rows.push({
         executor: e.type,

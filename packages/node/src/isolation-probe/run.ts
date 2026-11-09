@@ -16,8 +16,11 @@ import {
   isolationProbeItem,
   ORCA_RUNTIME_DIR,
   PROBE_FAKE_TOKEN_CONTENT,
+  PROBE_FILE_PREFIX,
   type ProbeTargets,
+  probeItemOk,
   probeRunPassed,
+  raindownPaths,
   resolveAgeKeyFile,
   runTasksDir,
 } from '@raindown/core'
@@ -162,11 +165,14 @@ function spawnProbe(
   argv: readonly string[],
   plan: unknown,
   timeoutMs: number,
+  cwd: string,
 ): Promise<IsolationProbeItem[]> {
   return new Promise((resolve, reject) => {
     const [cmd, ...args] = argv
     if (!cmd) return reject(new ProbeError('probe_spawn_failed', '启动包装返回了空命令'))
     const child = spawn(cmd, args, {
+      // 在探针的临时工作目录中运行（与 worker 在任务工作目录中运行一致）。
+      cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
@@ -274,7 +280,7 @@ async function runOne(
       executor: target.executor,
       ...(executorHome ? { executorHome } : {}),
       cwd,
-      access: target.setting === 'read-only' ? 'read' : 'write',
+      access: targetAccess(target),
       leaseTokenFile: ownToken,
       hubPort: hubPortOf(o.hubUrl),
       userHome: shared.userHome,
@@ -298,8 +304,8 @@ async function runOne(
     })
     const wrap = o.launchWrapper ?? identityLaunchWrapper
     const argv = wrap(target, [o.execPath ?? process.execPath, PROBE_CHILD_SCRIPT])
-    const items = await spawnProbe(argv, plan, o.timeoutMs ?? PROBE_TIMEOUT_MS)
-    return { ...base, items, passed: probeRunPassed({ items, passed: true }) }
+    const items = await spawnProbe(argv, plan, o.timeoutMs ?? PROBE_TIMEOUT_MS, cwd)
+    return { ...base, items, passed: probeRunPassed({ items }) }
   } catch (err) {
     if (err instanceof ProbeError) return failed(err.code, err.message)
     return failed(
@@ -314,15 +320,92 @@ async function runOne(
   }
 }
 
-/** 运行一次完整的探针：所有目标并行，返回上报用的结果。没有可探测的目标时 `runs` 为空。 */
+/** `config/` 下残留的写探针文件名（前缀 + 16 位十六进制，与 checks.ts 的随机后缀一致）。 */
+const CONFIG_LEFTOVER_RE = new RegExp(`^${PROBE_FILE_PREFIX.replace(/[.]/g, '\\.')}[0-9a-f]{16}$`)
+
+/**
+ * 删除探针残留（节点持有单实例锁时调用：节点启动时与每次探针前）：
+ * - `config/` 下写探针意外成功又未能删除的文件（只删名字精确匹配的普通文件）；
+ * - `run/tasks/isolation-probe-*` 临时任务目录。
+ */
+export async function cleanProbeLeftovers(home: string): Promise<string[]> {
+  const removed: string[] = []
+  const config = raindownPaths(home).config
+  let names: string[] = []
+  try {
+    names = await readdir(config)
+  } catch {
+    names = []
+  }
+  for (const name of names) {
+    if (!CONFIG_LEFTOVER_RE.test(name)) continue
+    const p = join(config, name)
+    const info = await lstat(p).catch(() => undefined)
+    if (info?.isFile()) {
+      await rm(p, { force: true })
+      removed.push(p)
+    }
+  }
+  await cleanStaleProbeTasks(home)
+  return removed
+}
+
+/** 某目标的工作目录是否应可写（与 runOne 中计算清单时的 access 一致）。 */
+const targetAccess = (t: ProbeTarget): 'read' | 'write' =>
+  t.setting === 'read-only' ? 'read' : 'write'
+
+/**
+ * 把同一施加层上代表目标的结果复用到另一个目标：受保护项与允许项相同，只有工作目录是否可写随角色读写类别变化，
+ * 按该目标重新设定 `write.workdir` 的预期并重算 ok 与 passed。
+ */
+function reuseRun(rep: IsolationProbeRun, target: ProbeTarget): IsolationProbeRun {
+  const items = rep.items.map((i) => {
+    if (i.item !== 'write.workdir') return i
+    const expected = targetAccess(target) === 'write' ? ('allow' as const) : ('deny' as const)
+    return { ...i, expected, ok: probeItemOk({ expected, actual: i.actual }) }
+  })
+  return {
+    executor: target.executor,
+    setting: target.setting,
+    declared_layer: target.declared_layer,
+    applied_layer: target.applied_layer,
+    items,
+    passed: probeRunPassed({ items, ...(rep.error ? { error: rep.error } : {}) }),
+    ...(rep.error ? { error: rep.error } : {}),
+  }
+}
+
+/**
+ * 运行一次完整的探针，返回上报用的结果。没有可探测的目标时 `runs` 为空。
+ * 同一实际施加层（`applied_layer`）的目标只真正运行一次（受保护文件每轮每个施加层只打开一次），
+ * 结果复用到同层的其他执行器 × 沙箱设置；不同施加层并行运行。
+ */
 export async function runIsolationProbe(o: IsolationProbeOptions): Promise<IsolationProbeReport> {
   const userHome = o.userHome ?? homedir()
-  await cleanStaleProbeTasks(o.home)
+  await cleanProbeLeftovers(o.home)
   const targets = probeTargets(o.executors)
-  const sockets = targets.length
+  const sockets: ProbeTargets = targets.length
     ? await findOrcaSockets(userHome)
-    : ({ status: 'none', reason: '' } as const)
-  const runs = await Promise.all(targets.map((t) => runOne(o, t, { userHome, sockets })))
+    : { status: 'none', reason: '' }
+  const groups = new Map<string, ProbeTarget[]>()
+  for (const t of targets) groups.set(t.applied_layer, [...(groups.get(t.applied_layer) ?? []), t])
+  const results = await Promise.all(
+    [...groups.values()].map(async (group) => {
+      const [rep, ...rest] = group as [ProbeTarget, ...ProbeTarget[]]
+      const repRun = await runOne(o, rep, { userHome, sockets })
+      return new Map<ProbeTarget, IsolationProbeRun>([
+        [rep, repRun],
+        ...rest.map((t) => [t, reuseRun(repRun, t)] as [ProbeTarget, IsolationProbeRun]),
+      ])
+    }),
+  )
+  const runs = targets.map((t) => {
+    for (const m of results) {
+      const r = m.get(t)
+      if (r) return r
+    }
+    throw new Error('探针结果缺失')
+  })
   return {
     ran_at: (o.now?.() ?? new Date()).toISOString(),
     macos_version: await (o.macosVersion ?? defaultMacosVersion)(),

@@ -151,6 +151,7 @@ export {
 } from './github.ts'
 export { type ProbeSystem, realProbeSystem, runProbeItems } from './isolation-probe/checks.ts'
 export {
+  cleanProbeLeftovers,
   defaultMacosVersion,
   findOrcaSockets,
   type IsolationProbeOptions,

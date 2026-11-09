@@ -15,11 +15,12 @@ import {
   computeIsolationSpec,
   credentialIsolationFor,
   describeCredentialIsolation,
-  type IsolationProbeRun,
   type IsolationSpec,
   type IsolationSpecInput,
   isWithin,
   NO_ADAPTER_CAPABILITIES,
+  PROBE_REQUIRED_DENY_ITEMS,
+  type ProbeEvidence,
   roleSandboxInfo,
   roleSandboxSetting,
   type SandboxSetting,
@@ -323,28 +324,47 @@ describe('credential_isolation 能力与角色沙箱设置', () => {
       ...caps,
       credential_isolation: { ...caps.credential_isolation, enforced: true },
     }
-    // enforced 由探针决定：没有探针结果、探针不通过、探针属于别的设置时都为 false。
-    const run = (passed: boolean, setting = 'bash-sandbox-off'): IsolationProbeRun => ({
-      executor: 'claude-sdk',
-      setting,
-      declared_layer: 'seatbelt',
-      applied_layer: 'seatbelt',
-      passed,
-      items: [
-        { item: 'read.hub_token', expected: 'deny', actual: passed ? 'deny' : 'allow', ok: passed },
-      ],
+    // enforced 由探针决定：没有探针结果、探针不通过、探针属于别的设置、结果过期时都为 false。
+    const NOW = Date.parse('2026-11-09T12:00:00.000Z')
+    const run = (
+      passed: boolean,
+      setting = 'bash-sandbox-off',
+      ran_at = '2026-11-09T06:00:00.000Z',
+    ): ProbeEvidence => ({
+      ran_at,
+      run: {
+        executor: 'claude-sdk',
+        setting,
+        declared_layer: 'seatbelt',
+        applied_layer: 'seatbelt',
+        passed,
+        items: PROBE_REQUIRED_DENY_ITEMS.map((item) => ({
+          item,
+          expected: 'deny' as const,
+          actual: passed ? ('deny' as const) : ('allow' as const),
+          ok: passed,
+        })),
+      },
     })
+    const on = (
+      c: typeof caps,
+      e: ProbeEvidence | null,
+      setting: SandboxSetting = 'bash-sandbox-off',
+    ) => credentialIsolationFor(c, setting, e, NOW).enforced
     expect(credentialIsolationFor(enforced, 'bash-sandbox-off').enforced).toBe(false)
-    expect(credentialIsolationFor(enforced, 'bash-sandbox-off', run(false)).enforced).toBe(false)
-    expect(credentialIsolationFor(enforced, 'bash-sandbox-off', run(true)).enforced).toBe(true)
-    expect(
-      credentialIsolationFor(enforced, 'bash-sandbox-off', run(true, 'bash-sandbox-on')).enforced,
-    ).toBe(false)
+    expect(on(enforced, run(false))).toBe(false)
+    expect(on(enforced, run(true))).toBe(true)
+    expect(on(enforced, run(true, 'bash-sandbox-on'))).toBe(false)
     // 适配器未施加（enforced: false）时，即使探针通过也不算已施加。
-    expect(credentialIsolationFor(caps, 'bash-sandbox-off', run(true)).enforced).toBe(false)
-    expect(
-      credentialIsolationFor(enforced, 'bash-sandbox-on', run(true, 'bash-sandbox-on')).enforced,
-    ).toBe(false)
+    expect(on(caps, run(true))).toBe(false)
+    expect(on(enforced, run(true, 'bash-sandbox-on'), 'bash-sandbox-on')).toBe(false)
+    // 审查修复 L3：超过 12 小时的结果不算已施加。
+    expect(on(enforced, run(true, 'bash-sandbox-off', '2026-11-08T23:59:00.000Z'))).toBe(false)
+    // 审查修复 M2：上报的 ok / passed 不可信，按预期与实际重新计算。
+    const lying = run(false)
+    lying.run.passed = true
+    lying.run.items = lying.run.items.map((i) => ({ ...i, ok: true }))
+    expect(on(enforced, lying)).toBe(false)
     expect(describeCredentialIsolation(caps)).toBe(
       'bash-sandbox-off→seatbelt、bash-sandbox-on→none（仅声明，未施加）',
     )

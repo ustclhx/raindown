@@ -547,6 +547,7 @@ export async function runDoctor(
  */
 export async function isolationProbeChecks(
   loadNodes: () => Promise<Result<{ nodes: NodeView[] }>>,
+  now: number = Date.now(),
 ): Promise<DoctorCheck[]> {
   let loaded: Result<{ nodes: NodeView[] }>
   try {
@@ -568,7 +569,7 @@ export async function isolationProbeChecks(
     return [{ id: 'isolation.probe', ok: true, message: '隔离自检：没有已注册的节点' }]
   const checks: DoctorCheck[] = []
   for (const node of loaded.data.nodes) {
-    for (const row of isolationStatusRows(node)) {
+    for (const row of isolationStatusRows(node, now)) {
       const [head, ...rest] = describeIsolationStatus(row, '       ')
       const message = [`隔离 ${node.node_id} ${head ?? ''}`, ...rest].join('\n')
       const id = `isolation.${node.node_id}.${row.executor}${row.setting === '—' ? '' : `.${row.setting}`}`

@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import type { IsolationProbeReport } from '@raindown/core'
+import { createFakeExecutor } from '../src/fake.ts'
 import type { IsolationProbeOptions } from '../src/isolation-probe/run.ts'
 import { type Bench, bench, type Intercept } from './harness.ts'
 
@@ -132,4 +133,72 @@ test('未开启探针时不运行（缺省），注册不带结果', async () =>
   const b = current
   await settle(b, () => b.ledger.getNode('n-bench') !== null)
   expect(b.ledger.getNode('n-bench')?.isolation_probe).toBeNull()
+})
+
+test('审查修复 L3：探针运行抛错时改为上报带错误的不通过结果，不再沿用之前的结果', async () => {
+  const base = createFakeExecutor()
+  const fake = {
+    ...base,
+    adapterCapabilities: {
+      ...base.adapterCapabilities,
+      credential_isolation: { layers: { 'danger-full-access': 'seatbelt' }, enforced: true },
+    },
+  }
+  let n = 0
+  current = await bench({
+    executors: [fake],
+    isolationProbe: {
+      run: async () => {
+        n++
+        if (n === 1) return report(1)
+        throw new Error('子进程无法启动')
+      },
+      intervalMs: 10_000,
+      versionCheckMs: 10_000,
+      macosVersion: async () => '15.1',
+    },
+  })
+  const b = current
+  await settle(b, () => b.ledger.getNode('n-bench')?.isolation_probe != null)
+  await b.clock.advance(10_000)
+  await settle(b, () => b.ledger.getNode('n-bench')?.isolation_probe?.runs[0]?.error !== undefined)
+  const probe = b.ledger.getNode('n-bench')?.isolation_probe
+  expect(probe?.runs).toEqual([
+    expect.objectContaining({
+      executor: 'fake',
+      setting: 'danger-full-access',
+      passed: false,
+      items: [],
+      error: expect.objectContaining({ code: 'probe_failed' }),
+    }),
+  ])
+  expect(probe?.macos_version).toBe('15.1')
+})
+
+test('审查修复 L2：stop() 等待进行中的探针结束', async () => {
+  let release = () => {}
+  let finished = false
+  current = await bench({
+    isolationProbe: {
+      run: () =>
+        new Promise<IsolationProbeReport>((resolve) => {
+          release = () => {
+            finished = true
+            resolve(report(1))
+          }
+        }),
+      macosVersion: async () => '15.1',
+    },
+  })
+  const b = current
+  let stopped = false
+  const stopping = b.node.stop().then(() => {
+    stopped = true
+  })
+  for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 1))
+  expect(stopped).toBe(false)
+  release()
+  await stopping
+  expect(finished).toBe(true)
+  expect(stopped).toBe(true)
 })

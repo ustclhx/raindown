@@ -62,8 +62,10 @@ import {
 } from './executor.ts'
 import { createFakeExecutor } from './fake.ts'
 import {
+  cleanProbeLeftovers,
   defaultMacosVersion,
   type IsolationProbeOptions,
+  probeTargets,
   runIsolationProbe,
 } from './isolation-probe/run.ts'
 import {
@@ -1749,6 +1751,8 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
   // 调用方（startNode）已持有节点单实例锁，不会误删并行节点的文件。
   await cleanWakeTokenDir(home)
   await cleanLeaseTokenFiles(home)
+  // 隔离探针的残留（config/ 下未能删除的写探针文件、run/tasks/isolation-probe-*）。
+  for (const p of await cleanProbeLeftovers(home)) logger.warn(`已删除残留的隔离探针文件 ${p}`)
   // CODEX_HOME 从 state/ 迁到 run/（worker-credential-isolation D2）；失败时保留旧位置继续使用。
   const codexHomes = await migrateCodexHomes(home, (message) => logger.warn(message))
   for (const dir of codexHomes.migrated) logger.info(`CODEX_HOME 已迁移到 ${dir}`)
@@ -1915,6 +1919,18 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
           `隔离自检（${why}）完成：${latestProbe.runs.length} 项执行器 × 沙箱设置，${failed} 项不通过`,
         )
       } catch (err) {
+        // 不能继续上报之前（可能通过）的结果：改为每个目标都带错误的不通过结果。
+        const message = `探针运行失败：${String(err).slice(0, 500)}`
+        latestProbe = {
+          ran_at: new Date(clock.now()).toISOString(),
+          macos_version: latestProbe?.macos_version ?? null,
+          runs: probeTargets(registry.info()).map((t) => ({
+            ...t,
+            passed: false,
+            items: [],
+            error: { code: 'probe_failed', message },
+          })),
+        }
         logger.warn(`隔离自检（${why}）失败`, String(err))
       } finally {
         probing = undefined
@@ -2061,6 +2077,8 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
         for (const a of acquireAborts) a.abort()
         cancelJump()
         cancelProbeTimers()
+        // 等待进行中的探针结束（它会删除自己造的临时令牌与工作目录）。
+        await probing
         wakeSlots()
         await Promise.allSettled([...runners.keys()].map((r) => r.abandon()))
         await looping

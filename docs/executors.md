@@ -1004,13 +1004,15 @@ triage 则需先得到一条真实提问，再用文字回复验证 exec resume�
 ### 运行方式
 
 - 入口：`runIsolationProbe`（节点进程内）为每个执行器 × 沙箱设置（声明的施加层不是 `none`）计算隔离清单（`computeIsolationSpec`），
-  推导探针清单（core 的 `buildProbePlan`），再启动子进程 `child.ts` 逐项尝试。子进程在节点进程之外运行，清单经 stdin 传入，
-  结果经 stdout 返回，环境变量只传 `PATH` 与 `HOME`。
+  推导探针清单（core 的 `buildProbePlan`），再启动子进程 `child.ts` 逐项尝试。子进程在节点进程之外、以探针的临时工作目录为 cwd 运行，
+  清单经 stdin 传入，结果经 stdout 返回，环境变量只传 `PATH` 与 `HOME`。
+- 同一实际施加层（`applied_layer`）的组合每轮只真正运行一次（受保护文件每轮每个施加层只打开一次），结果复用到同层的其他执行器 × 沙箱设置；
+  复用时只按各自的读写类别重新设定 `write.workdir` 的预期。本阶段全部是 `none`，所以每轮只运行一次。
 - 子进程按与 worker 相同的包裹方式启动：接口接受一个“启动包装”（`launchWrapper`），本阶段为恒等；
   4.x 施加 seatbelt 后在这里加上 `sandbox-exec`，探针与 worker 走同一施加层。
 - 运行前在 `run/tasks/isolation-probe-other-<hex>/dispatch-tokens/` 造一个内容明显为假的“他人任务”令牌，
   在 `run/tasks/isolation-probe-self-<hex>/` 造“本任务”令牌，在系统临时目录建工作目录；结束后全部删除
-  （中断残留由下次运行与节点启动清理删除）。
+  （中断残留由下次运行与节点启动清理删除；节点启动时还会删除 `config/` 下名字精确为 `.raindown-isolation-probe-<16 位十六进制>` 的残留普通文件）。
 - 运行时机：节点启动时（首次注册之前）、每 6 小时、macOS 版本（`sw_vers -productVersion`，每小时检查一次）与上次探针不同时。
   只有 `raindown node start` 开启探针；`startNode` 缺省不运行（测试不触碰真实用户目录）。
 
@@ -1023,7 +1025,7 @@ triage 则需先得到一条真实提问，再用文字回复验证 exec resume�
 | `read.other_task_token` | 拒绝 | 同上，临时伪造的他人任务令牌 |
 | `read.age_key` | 拒绝 | 同上，age 私钥文件（默认 `~/.config/sops/age/keys.txt`） |
 | `read.hub_token_via_symlink` | 拒绝 | 在工作目录建指向 hub.token 的符号链接再读取（验证 realpath 规范化），用后删除 |
-| `write.config` | 拒绝 | 在 `config/` 下独占新建探针文件；意外成功时立即删除 |
+| `write.config` | 拒绝 | 在 `config/` 下独占新建探针文件；新建成功即记为“可写”，随后立即删除，删除失败时在说明中写出残留路径 |
 | `connect.orca_socket.<n>` | 拒绝 | 对 Orca 运行时目录（及 `daemon/`）中的 unix 套接字只 `connect`，不发送任何数据；没有套接字时为“跳过” |
 | `connect.orca_port.<端口>` | 拒绝 | 对解析出的 Orca 本机端口只建立 TCP 连接后立即关闭；端口未解析时为“跳过” |
 | `debug.process` | 拒绝 | **未验证**，原因见下 |
@@ -1035,7 +1037,10 @@ triage 则需先得到一条真实提问，再用文字回复验证 exec resume�
   结果只含项名、路径、预期、实际与错误码（`EACCES`、`EPERM` 等），不含错误消息正文。测试用带特征字符串的假文件断言输出中不出现内容。
 - 判定：`EACCES`/`EPERM`/`EROFS` 为拒绝；`ENOENT` 为跳过（目标不存在，无法验证）；连接得到 `ECONNREFUSED` 记为拒绝并注明歧义
   （seatbelt 拒绝 unix 连接时 bun 报的也是 `ECONNREFUSED`，与失效套接字、无人监听的端口无法区分）；其他错误为失败。
-- **通过**：没有不符合预期的项、没有运行错误，并且至少一个受保护项确实被拒绝。跳过与未验证不计入通过或失败，但会显示。
+- **通过**：没有不符合预期的项、没有运行错误，并且核心受保护项 `read.hub_token`、`read.ledger_db`、`read.other_task_token`、`write.config`
+  全部出现且确实被拒绝。跳过与未验证不计入通过或失败，但会显示（核心项被跳过同样不能通过）。
+- `ok` 与 `passed` 由中枢按预期与实际重新计算后才写入（deny/allow 为 `actual === expected`，skipped/unverified 为 null，error 为 false），节点上报的值不用。
+- 探针运行本身抛错时，节点改为上报每个目标都带 `probe_failed` 错误的不通过结果，不继续上报之前的结果。
 - 跨进程调试为什么未验证：不需要 sudo、不触碰真实进程的检查都区分不了“隔离生效”与“系统本来就不允许”——`task_for_pid` 需要调试授权，
   未授权的探针进程无论是否隔离都会失败；探针能起的 `/bin/sleep`、bun 都是平台或加固二进制，本来就拒绝 attach。
   探针不 attach 任何进程；seatbelt 配置（4.1）显式拒绝 `mach-priv-task-port`、`mach-task-name`，由配置生成测试覆盖。
@@ -1044,7 +1049,9 @@ triage 则需先得到一条真实提问，再用文字回复验证 exec resume�
 ### 上报与显示
 
 - 结果随节点注册上报（注册请求的可选字段 `isolation_probe`：运行时间、macOS 版本、每个执行器 × 沙箱设置的 `{item, target, expected, actual, ok, detail}`）。
-  中枢投影保存最近一次结果；旧节点不上报或注册不带结果时显示“未探测”。旧中枢不认识该字段时，节点告警一次并改为不带结果注册。
+  中枢投影保存最近一次结果；从未上报过的节点（旧节点）显示“未探测”。不带结果的注册（节点重启后探针尚未完成等）沿用之前的结果，
+  使“通过 → 不通过”的比较不被打断。旧中枢不认识该字段时，节点告警一次并改为不带结果注册。
+- `enforced` 还要求结果不超过 12 小时（`PROBE_MAX_AGE_MS`）：过期结果不算已施加。
 - `raindown node list` 与 `raindown doctor`（经中枢读取节点列表汇总）显示每个执行器 × 沙箱设置：声明的施加层、是否已施加、
   最近探针时间与 macOS 版本、失败项（项名与路径）、跳过项与原因、未验证项与原因。
 - 探针从通过变为不通过时，中枢写一条 Digest 级收件箱条目（来源 `isolation`）；结果未变化、首次就不通过或从未探测变为不通过都不写。

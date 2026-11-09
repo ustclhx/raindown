@@ -20,8 +20,8 @@ import {
 export interface ProbeSystem {
   /** 打开并读取最多 1 字节；成功返回读到的字节数（内容不返回）。 */
   readOneByte(path: string): Promise<number>
-  /** 以独占方式新建文件（不写内容），成功后立即删除。 */
-  createAndRemove(path: string): Promise<void>
+  /** 以独占方式新建文件（不写内容）；删除由调用方随后用 `unlink` 完成。 */
+  createExclusive(path: string): Promise<void>
   symlink(target: string, path: string): Promise<void>
   unlink(path: string): Promise<void>
   connectUnix(path: string, timeoutMs: number): Promise<void>
@@ -49,10 +49,9 @@ export const realProbeSystem: ProbeSystem = {
       await fh.close()
     }
   },
-  async createAndRemove(path) {
+  async createExclusive(path) {
     const fh = await open(path, 'wx', 0o600)
     await fh.close()
-    await unlink(path)
   },
   symlink: (target, path) => symlink(target, path),
   unlink: (path) => unlink(path),
@@ -151,10 +150,17 @@ async function attempt(item: ProbePlanItem, plan: ProbePlan, sys: ProbeSystem): 
       const path = probeTempPath(target, sys.random())
       try {
         // 成功即立即删除（受保护目录意外可写时不留下探针文件）。
-        await sys.createAndRemove(path)
-        return { actual: 'allow' }
+        await sys.createExclusive(path)
       } catch (err) {
         return fileOutcome(err)
+      }
+      // 新建成功即为“可写”（不论之后能否删除）；随后立即删除，删除失败时在说明中写出残留路径
+      // （节点启动清理会删除 config/ 下残留的探针文件）。
+      try {
+        await sys.unlink(path)
+        return { actual: 'allow' }
+      } catch (err) {
+        return { actual: 'allow', detail: `探针文件未能删除，残留 ${path}（${errCode(err)}）` }
       }
     }
     case 'unix_connect':

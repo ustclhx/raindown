@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { existsSync, readdirSync } from 'node:fs'
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -13,7 +13,12 @@ import {
   runTasksDir,
 } from '@raindown/core'
 import { type ProbeSystem, runProbeItems } from '../src/isolation-probe/checks.ts'
-import { findOrcaSockets, probeTargets, runIsolationProbe } from '../src/isolation-probe/run.ts'
+import {
+  cleanProbeLeftovers,
+  findOrcaSockets,
+  probeTargets,
+  runIsolationProbe,
+} from '../src/isolation-probe/run.ts'
 
 /** 假受保护文件的特征字符串：断言探针输出中绝不出现。 */
 const MARKER = 'PROBE-MARKER-must-not-leak'
@@ -210,10 +215,8 @@ describe('未施加隔离（受保护项可读）', () => {
         return [...argv]
       },
     })
-    expect(seen.sort()).toEqual([
-      'codex-exec/danger-full-access/none',
-      'codex-exec/workspace-write/none',
-    ])
+    // 同一实际施加层（none）只启动一次，代表目标为排序后的第一个。
+    expect(seen).toEqual(['codex-exec/danger-full-access/none'])
     expect(report.runs.every((r) => r.items.length > 0)).toBe(true)
   })
 })
@@ -267,7 +270,7 @@ describe('模拟已隔离（注入的文件系统接口拒绝受保护项）', (
         if (!allowed(resolve(p))) throw eperm()
         return 1
       },
-      createAndRemove: async (p) => {
+      createExclusive: async (p) => {
         if (!allowed(p)) throw eperm()
       },
       symlink: async (t, p) => {
@@ -297,7 +300,7 @@ describe('模拟已隔离（注入的文件系统接口拒绝受保护项）', (
       actual: 'unverified',
       ok: null,
     })
-    expect(probeRunPassed({ items, passed: true })).toBe(true)
+    expect(probeRunPassed({ items })).toBe(true)
   })
 
   test('任一受保护项可读即不通过；允许项不可用同样不通过', async () => {
@@ -306,7 +309,7 @@ describe('模拟已隔离（注入的文件系统接口拒绝受保护项）', (
       actual: 'allow',
       ok: false,
     })
-    expect(probeRunPassed({ items: leaky, passed: true })).toBe(false)
+    expect(probeRunPassed({ items: leaky })).toBe(false)
     const noHub = await runProbeItems(
       plan,
       deniedSystem({
@@ -316,7 +319,7 @@ describe('模拟已隔离（注入的文件系统接口拒绝受保护项）', (
       }),
     )
     expect(noHub.find((i) => i.item === 'connect.hub')).toMatchObject({ actual: 'deny', ok: false })
-    expect(probeRunPassed({ items: noHub, passed: true })).toBe(false)
+    expect(probeRunPassed({ items: noHub })).toBe(false)
   })
 
   test('受保护项全部不存在（跳过）不能算通过', async () => {
@@ -330,21 +333,23 @@ describe('模拟已隔离（注入的文件系统接口拒绝受保护项）', (
       }),
     )
     expect(items.every((i) => i.actual === 'skipped')).toBe(true)
-    expect(probeRunPassed({ items, passed: true })).toBe(false)
+    expect(probeRunPassed({ items })).toBe(false)
   })
 
   test('写探针意外成功时立即删除；符号链接用后删除', async () => {
     const created: string[] = []
+    const removed: string[] = []
     const links: string[] = []
     const sys = deniedSystem({
-      createAndRemove: async (p) => {
+      createExclusive: async (p) => {
         created.push(p)
       },
       symlink: async (_t, p) => {
         links.push(p)
       },
       unlink: async (p) => {
-        links.splice(links.indexOf(p), 1)
+        if (links.includes(p)) links.splice(links.indexOf(p), 1)
+        else removed.push(p)
       },
     })
     const items = await runProbeItems(plan, sys)
@@ -352,8 +357,98 @@ describe('模拟已隔离（注入的文件系统接口拒绝受保护项）', (
       actual: 'allow',
       ok: false,
     })
-    // createAndRemove 本身负责创建后立即删除；这里确认探针文件名带固定前缀，便于识别。
     expect(created.every((p) => p.includes('.raindown-isolation-probe-'))).toBe(true)
+    expect(removed.sort()).toEqual(created.sort())
     expect(links).toEqual([])
+  })
+
+  test('审查修复 M1：新建成功但删除失败仍记为可写（不是拒绝），说明中写出残留路径', async () => {
+    const sys = deniedSystem({
+      createExclusive: async () => {},
+      unlink: async () => {
+        throw eperm()
+      },
+    })
+    const items = await runProbeItems(plan, sys)
+    const config = items.find((i) => i.item === 'write.config')
+    expect(config).toMatchObject({ actual: 'allow', ok: false })
+    expect(config?.detail).toContain('未能删除，残留 /h/config/.raindown-isolation-probe-')
+    expect(probeRunPassed({ items })).toBe(false)
+  })
+})
+
+describe('审查修复', () => {
+  test('M1/L1：节点启动清理删除 config/ 下残留的探针文件（只删名字精确匹配的普通文件）', async () => {
+    const s = await setup()
+    const config = join(s.home, 'config')
+    const leftover = join(config, '.raindown-isolation-probe-0123456789abcdef')
+    const keepShort = join(config, '.raindown-isolation-probe-0123')
+    const keepDir = join(config, '.raindown-isolation-probe-fedcba9876543210')
+    await writeFile(leftover, 'x')
+    await writeFile(keepShort, 'x')
+    await mkdir(keepDir)
+    const staleTask = join(runTasksDir(s.home), 'isolation-probe-self-abc')
+    await mkdir(join(staleTask, 'dispatch-tokens'), { recursive: true })
+    expect(await cleanProbeLeftovers(s.home)).toEqual([leftover])
+    expect(existsSync(leftover)).toBe(false)
+    expect(existsSync(keepShort)).toBe(true)
+    expect(existsSync(keepDir)).toBe(true)
+    expect(existsSync(staleTask)).toBe(false)
+  })
+
+  test('L4：同一实际施加层只运行一次，结果复用到同层其他组合；只读角色的工作目录预期按各自角色设定', async () => {
+    const s = await setup()
+    const launched: string[] = []
+    const executors: ExecutorInfo[] = [
+      codexExec(),
+      {
+        type: 'codex-orca',
+        adapter_capabilities: {
+          ...NO_ADAPTER_CAPABILITIES,
+          credential_isolation: {
+            layers: { 'danger-full-access': 'seatbelt', 'read-only': 'native' },
+            enforced: false,
+          },
+        },
+      },
+    ]
+    const report = await runIsolationProbe({
+      ...probeOptions(s, executors),
+      launchWrapper: (target, argv) => {
+        launched.push(`${target.executor}/${target.setting}`)
+        return [...argv]
+      },
+    })
+    expect(launched.length).toBe(1)
+    expect(report.runs.map((r) => `${r.executor}/${r.setting}`)).toEqual([
+      'codex-exec/danger-full-access',
+      'codex-exec/workspace-write',
+      'codex-orca/danger-full-access',
+      'codex-orca/read-only',
+    ])
+    const workdir = (setting: string) =>
+      report.runs
+        .find((r) => r.executor === 'codex-orca' && r.setting === setting)
+        ?.items.find((i) => i.item === 'write.workdir')
+    expect(workdir('danger-full-access')).toMatchObject({ expected: 'allow', ok: true })
+    expect(workdir('read-only')).toMatchObject({ expected: 'deny', actual: 'allow', ok: false })
+  })
+
+  test('L6：探针子进程在临时工作目录中运行', async () => {
+    const s = await setup()
+    const script = join(s.root, 'cwd-child.ts')
+    // 替身子进程：把自己的工作目录写到文件，输出合法的空结果。
+    const marker = join(s.root, 'cwd.txt')
+    await writeFile(
+      script,
+      `import { writeFileSync } from 'node:fs'\nwriteFileSync(${JSON.stringify(marker)}, process.cwd())\nprocess.stdout.write('{"items":[]}')\n`,
+    )
+    await runIsolationProbe({
+      ...probeOptions(s),
+      launchWrapper: (_t, argv) => [argv[0] as string, script],
+    })
+    const cwd = await readFile(marker, 'utf8')
+    expect(cwd).toContain('raindown-isolation-probe-')
+    expect(cwd.startsWith(await realpath(s.tmp))).toBe(true)
   })
 })
