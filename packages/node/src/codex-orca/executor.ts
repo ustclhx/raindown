@@ -23,6 +23,7 @@ import {
 import { z } from 'zod'
 import { type NodeClock, sleep, systemClock } from '../clock.ts'
 import {
+  CODEX_CREDENTIAL_ISOLATION,
   codexShellEnvPolicyConfig,
   codexTaskMcpConfig,
   orcaCodexHome,
@@ -416,6 +417,7 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
       resume_session: false,
       raindown_mcp: true,
       out_of_band_detection: true,
+      credential_isolation: CODEX_CREDENTIAL_ISOLATION,
     },
     classify: classifyCodexOrca,
     run(contract: TaskContract, ctx: ExecutorContext): ExecutorRun {

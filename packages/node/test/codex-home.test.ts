@@ -4,6 +4,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   rmSync,
@@ -15,6 +16,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   execCodexHome,
+  migrateCodexHomes,
   orcaCodexHome,
   prepareCodexHome,
   readCodexHome,
@@ -77,9 +79,11 @@ describe('Raindown 管理的 Codex 目录', () => {
     const s = setup()
     const orca = orcaCodexHome(s.home)
     const exec = execCodexHome(s.home)
-    expect(readCodexHome(s.home)).toBe(join(s.home, 'state', 'codex-read-home'))
-    expect(orca).toBe(join(s.home, 'state', 'codex-orca-home'))
-    expect(exec).toBe(join(s.home, 'state', 'codex-exec-home'))
+    expect(readCodexHome(s.home)).toBe(
+      join(s.home, 'run', 'executors', 'codex-exec', 'codex-read-home'),
+    )
+    expect(orca).toBe(join(s.home, 'run', 'executors', 'codex-orca', 'codex-home'))
+    expect(exec).toBe(join(s.home, 'run', 'executors', 'codex-exec', 'codex-home'))
     for (const dir of [orca, exec]) {
       expect(await prepareCodexHome(dir, s.source)).toEqual({ ok: true, data: dir })
       mkdirSync(join(dir, 'sessions'))
@@ -194,5 +198,117 @@ describe('Raindown 管理的 Codex 目录', () => {
     expect(existsSync(auth)).toBe(false)
     expect((await prepareCodexHome(s.isolated, s.source)).ok).toBe(true)
     expect(existsSync(auth)).toBe(false)
+  })
+})
+
+describe('CODEX_HOME 从 state/ 迁到 run/', () => {
+  function legacyHome() {
+    const root = mkdtempSync(join(tmpdir(), 'raindown-codex-migrate-'))
+    dirs.push(root)
+    const home = join(root, 'raindown-home')
+    const legacy = {
+      orca: join(home, 'state', 'codex-orca-home'),
+      exec: join(home, 'state', 'codex-exec-home'),
+      read: join(home, 'state', 'codex-read-home'),
+    }
+    for (const [name, dir] of Object.entries(legacy)) {
+      mkdirSync(join(dir, 'sessions'), { recursive: true })
+      writeFileSync(join(dir, 'sessions', 'rollout.jsonl'), `会话-${name}`)
+    }
+    return { root, home, legacy }
+  }
+
+  test('迁移保留会话，旧位置留下指向新位置的链接；重复运行幂等', async () => {
+    const { home, legacy } = legacyHome()
+    // 迁移前继续使用旧位置。
+    expect(orcaCodexHome(home)).toBe(legacy.orca)
+    const logs: string[] = []
+    const first = await migrateCodexHomes(home, (m) => logs.push(m))
+    const current = {
+      orca: join(home, 'run', 'executors', 'codex-orca', 'codex-home'),
+      exec: join(home, 'run', 'executors', 'codex-exec', 'codex-home'),
+      read: join(home, 'run', 'executors', 'codex-exec', 'codex-read-home'),
+    }
+    expect(first.migrated.sort()).toEqual(Object.values(current).sort())
+    expect(logs).toEqual([])
+    expect(orcaCodexHome(home)).toBe(current.orca)
+    expect(execCodexHome(home)).toBe(current.exec)
+    expect(readCodexHome(home)).toBe(current.read)
+    for (const name of ['orca', 'exec', 'read'] as const) {
+      expect(readFileSync(join(current[name], 'sessions', 'rollout.jsonl'), 'utf8')).toBe(
+        `会话-${name}`,
+      )
+      expect(lstatSync(legacy[name]).isSymbolicLink()).toBe(true)
+      // 升级前启动、环境里是旧路径的存活终端仍能按真实路径重新挂接。
+      expect(await sameCodexHome(legacy[name], current[name])).toBe(true)
+    }
+    for (const dir of [
+      join(home, 'run'),
+      join(home, 'run', 'executors'),
+      join(home, 'run', 'executors', 'codex-orca'),
+    ])
+      expect(lstatSync(dir).mode & 0o777).toBe(0o700)
+
+    // 临时链接已全部换到旧位置，不留残余。
+    expect(readdirSync(join(home, 'state')).filter((n) => n.endsWith('.link'))).toEqual([])
+    const second = await migrateCodexHomes(home, (m) => logs.push(m))
+    expect(second.migrated).toEqual([])
+    expect(logs).toEqual([])
+    expect(readFileSync(join(current.orca, 'sessions', 'rollout.jsonl'), 'utf8')).toBe('会话-orca')
+  })
+
+  test('没有旧目录时什么也不做', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'raindown-codex-migrate-'))
+    dirs.push(root)
+    const logs: string[] = []
+    expect(await migrateCodexHomes(join(root, 'raindown-home'), (m) => logs.push(m))).toEqual({
+      migrated: [],
+    })
+    expect(logs).toEqual([])
+    expect(existsSync(join(root, 'raindown-home', 'run'))).toBe(false)
+  })
+
+  test('新旧位置同时存在时保留旧位置继续使用并记日志', async () => {
+    const { home, legacy } = legacyHome()
+    const current = join(home, 'run', 'executors', 'codex-orca', 'codex-home')
+    mkdirSync(current, { recursive: true })
+    symlinkSync(join(home, 'auth-source', 'auth.json'), join(legacy.orca, 'auth.json'))
+    writeFileSync(join(current, 'auth.json'), '{"placeholder":true}')
+    const logs: string[] = []
+    const result = await migrateCodexHomes(home, (m) => logs.push(m))
+    expect(result.migrated).not.toContain(current)
+    const conflict = logs.find((m) => m.includes('同时存在')) ?? ''
+    // 只报告两处 auth.json 的存在性与是否为链接，不含内容。
+    expect(conflict).toContain(`${legacy.orca}：auth.json 是链接`)
+    expect(conflict).toContain(`${current}：auth.json 是普通文件`)
+    expect(conflict).not.toContain('placeholder')
+    expect(lstatSync(legacy.orca).isDirectory()).toBe(true)
+    expect(orcaCodexHome(home)).toBe(legacy.orca)
+    expect(readFileSync(join(legacy.orca, 'sessions', 'rollout.jsonl'), 'utf8')).toBe('会话-orca')
+  })
+
+  test('rename 失败时保留旧位置继续使用，不丢登录状态', async () => {
+    const { home, legacy } = legacyHome()
+    // run/ 是普通文件：无法创建新位置，迁移失败。
+    writeFileSync(join(home, 'run'), '占位')
+    const logs: string[] = []
+    const result = await migrateCodexHomes(home, (m) => logs.push(m))
+    expect(result.migrated).toEqual([])
+    expect(logs.length).toBe(3)
+    expect(logs.every((m) => m.includes('继续使用旧位置'))).toBe(true)
+    expect(readdirSync(join(home, 'state')).filter((n) => n.endsWith('.link'))).toEqual([])
+    for (const name of ['orca', 'exec', 'read'] as const) {
+      expect(lstatSync(legacy[name]).isDirectory()).toBe(true)
+      expect(readFileSync(join(legacy[name], 'sessions', 'rollout.jsonl'), 'utf8')).toBe(
+        `会话-${name}`,
+      )
+    }
+    expect(orcaCodexHome(home)).toBe(legacy.orca)
+    expect(execCodexHome(home)).toBe(legacy.exec)
+    expect(readCodexHome(home)).toBe(legacy.read)
+    // 修复后再次启动即可完成迁移。
+    rmSync(join(home, 'run'))
+    expect((await migrateCodexHomes(home, () => {})).migrated.length).toBe(3)
+    expect(orcaCodexHome(home)).toBe(join(home, 'run', 'executors', 'codex-orca', 'codex-home'))
   })
 })

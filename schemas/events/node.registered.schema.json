@@ -108,6 +108,47 @@
                   },
                   "out_of_band_detection": {
                     "type": "boolean"
+                  },
+                  "credential_isolation": {
+                    "description": "凭证隔离的施加层声明；旧节点不上报时视为未知（按 none 处理）",
+                    "type": "object",
+                    "properties": {
+                      "layers": {
+                        "type": "object",
+                        "propertyNames": {
+                          "type": "string",
+                          "pattern": "^[a-z][a-z0-9-]{0,63}$"
+                        },
+                        "additionalProperties": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "enum": [
+                                "seatbelt",
+                                "native",
+                                "separate_user",
+                                "none"
+                              ]
+                            },
+                            {
+                              "type": "string",
+                              "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                            }
+                          ]
+                        },
+                        "description": "按角色沙箱设置声明的施加层（已知取值：seatbelt、native、separate_user、none；不认识的取值按 none）；已知设置：danger-full-access、workspace-write、read-only、bash-sandbox-off、bash-sandbox-on、in-node。未列出的设置视为 none"
+                      },
+                      "enforced": {
+                        "type": "boolean",
+                        "description": "适配器当前是否真正施加上述隔离。false 表示只是声明将要支持的施加层，尚未施加，不能显示为已隔离；自检结果另行上报"
+                      }
+                    },
+                    "required": [
+                      "layers",
+                      "enforced"
+                    ],
+                    "additionalProperties": false,
+                    "title": "Credential isolation"
                   }
                 },
                 "required": [

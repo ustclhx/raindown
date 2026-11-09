@@ -2,10 +2,16 @@ import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { initRaindownHome, raindownPaths } from '@raindown/core'
+import {
+  initRaindownHome,
+  NO_ADAPTER_CAPABILITIES,
+  type NodeView,
+  raindownPaths,
+} from '@raindown/core'
 import { runHub } from '@raindown/hub'
-import { createFakeExecutor, startNode } from '@raindown/node'
+import { CODEX_CREDENTIAL_ISOLATION, createFakeExecutor, startNode } from '@raindown/node'
 import { commands } from '../src/commands/index.ts'
+import { isolationLines } from '../src/commands/node.ts'
 import { runCli } from '../src/run.ts'
 
 /** `raindown node list`（node-protocol "查看节点"）：临时 RAINDOWN_HOME，真实中枢与节点。 */
@@ -49,6 +55,7 @@ test('raindown node list：输出节点 id、能力与最近活动时间', async
   expect(out).toContain('cli-host')
   expect(out).toContain('browser, executor:fake')
   expect(out).toMatch(/\d{4}-\d{2}-\d{2}T/)
+  expect(out).toContain(`${node.data.nodeId} fake：none（仅声明，未施加）`)
 
   const json = JSON.parse((await runCli(['node', 'list', '--json'], commands)).stdout)
   expect(json.data.nodes[0]).toMatchObject({
@@ -67,4 +74,36 @@ test('raindown node list：输出节点 id、能力与最近活动时间', async
 test('raindown node list：中枢从未启动时返回可重试错误（退出码 3）', async () => {
   const r = await runCli(['node', 'list'], commands)
   expect(r.exitCode).toBe(3)
+})
+
+test('node list 的凭证隔离：显示每个执行器的声明值与“未施加”，旧节点显示未上报', () => {
+  const view = (node_id: string, executors: NodeView['executors']): NodeView => ({
+    node_id,
+    hostname: 'h',
+    version: '0',
+    capabilities: [],
+    executors,
+    concurrency: 1,
+    registered_at: '2026-11-09T00:00:00.000Z',
+    last_seen_at: null,
+    active_leases: 0,
+  })
+  const text = isolationLines([
+    view('n-new', [
+      {
+        type: 'codex-orca',
+        adapter_capabilities: {
+          ...NO_ADAPTER_CAPABILITIES,
+          credential_isolation: CODEX_CREDENTIAL_ISOLATION,
+        },
+      },
+    ]),
+    view('n-old', [{ type: 'codex-orca', adapter_capabilities: NO_ADAPTER_CAPABILITIES }]),
+  ])
+  expect(text).toContain(
+    'n-new codex-orca：danger-full-access→seatbelt、workspace-write→native、read-only→native（仅声明，未施加）',
+  )
+  expect(text).toContain('n-old codex-orca：未上报（按 none 处理）')
+  expect(text).not.toContain('已施加')
+  expect(isolationLines([])).toBe('')
 })

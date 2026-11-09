@@ -311,7 +311,7 @@ describe('启动', () => {
     expect(created).toMatchObject({ title: '[Raindown] t-orca-1' })
     expect(created.worktreePath).toBe(h?.worktree ?? '')
     expect(created.command).toContain(
-      `RAINDOWN_ACTOR=dev FLOW_ACTOR=dev CODEX_HOME=${join(h?.home ?? '', 'state/codex-orca-home')} codex`,
+      `RAINDOWN_ACTOR=dev FLOW_ACTOR=dev CODEX_HOME=${join(h?.home ?? '', 'run/executors/codex-orca/codex-home')} codex`,
     )
     expect(created.command).toContain('RAINDOWN_TASK_ID=t-orca-1 FLOW_TASK_ID=t-orca-1')
     expect(created.command).toContain(
@@ -332,7 +332,7 @@ describe('启动', () => {
 
   test('启动前清理隔离配置和规则，不改用户的 Codex 目录', async () => {
     const s = await start({}, () => {
-      const dir = join(h?.home ?? '', 'state/codex-orca-home')
+      const dir = join(h?.home ?? '', 'run/executors/codex-orca/codex-home')
       const source = join(h?.root ?? '', 'user-codex')
       mkdirSync(join(dir, 'rules'), { recursive: true })
       mkdirSync(source, { recursive: true })
@@ -345,7 +345,7 @@ describe('启动', () => {
       )
     })
     await ready(s)
-    const dir = join(h?.home ?? '', 'state/codex-orca-home')
+    const dir = join(h?.home ?? '', 'run/executors/codex-orca/codex-home')
     const config = readFileSync(join(dir, 'config.toml'), 'utf8')
     expect(config.replace(/^#.*$/gm, '').trim()).toBe('')
     expect(existsSync(join(dir, 'rules'))).toBe(false)
@@ -1029,7 +1029,7 @@ describe('deliver 与 cancel', () => {
       readFileSync(join(home.home, 'state/tasks/t-orca-1/orca.json'), 'utf8'),
     )
     expect(state.replies['r-1']).toMatchObject({ done: true })
-    expect(state.codex_home).toBe(join(home.home, 'state/codex-orca-home'))
+    expect(state.codex_home).toBe(join(home.home, 'run/executors/codex-orca/codex-home'))
 
     const second = await start({}, (o) => o.show('question'), { home, resume: { reply } })
     await until(

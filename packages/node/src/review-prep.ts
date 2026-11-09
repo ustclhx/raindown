@@ -1,7 +1,16 @@
 import { existsSync } from 'node:fs'
 import { mkdir, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { fail, gitSha, ok, type Result, raindownPaths, type TaskContract } from '@raindown/core'
+import {
+  fail,
+  gitSha,
+  ok,
+  type Result,
+  raindownPaths,
+  runTasksDir,
+  type TaskContract,
+  taskRunDir,
+} from '@raindown/core'
 import {
   type GitConfigPair,
   type GitHubCli,
@@ -14,6 +23,7 @@ import {
   UNTRUSTED_CHECKOUT_ENV,
   untrustedCheckoutConfig,
 } from './github.ts'
+import { removeEmptyTaskRunDir } from './lease-token.ts'
 
 /**
  * claude-sdk 审查准备（add-m1-supervisor D10；tasks 5.2；executor-claude-sdk "审查任务的准备与结构化输出"）。
@@ -27,16 +37,24 @@ import {
  *    检出时中和 hook、fsmonitor 与全部已配置的 filter driver（`untrustedCheckoutConfig`），并设 `GIT_LFS_SKIP_SMUDGE=1`；
  * 5. 任务结束后移除 worktree、任务专用 ref 与私有目录；节点启动时清理本节点残留的私有目录并 `git worktree prune`。
  *
- * 私有目录：`<raindown-home>/state/review/<node-id>/<task-id>/`，内含 `worktree/`、`pr.diff` 与 `meta.json`（登记仓库路径，
- * 供启动清理使用）。git 一律带 `-c core.hooksPath=/dev/null`，不运行仓库 hook。
+ * 私有目录：`<raindown-home>/run/tasks/<task-id>/review/<node-id>/`，内含 `worktree/`、`pr.diff` 与 `meta.json`（登记仓库路径，
+ * 供启动清理使用）。位于 `state/` 之外，是本任务私有目录的一部分，隔离时随本任务目录放行（worker-credential-isolation D2）。
+ * 旧版本放在 `state/review/<node-id>/<task-id>/`，启动清理同时清理旧位置。git 一律带 `-c core.hooksPath=/dev/null`，不运行仓库 hook。
  */
 
 export const REVIEW_DIFF_FILE = 'pr.diff'
 const META_FILE = 'meta.json'
 const WORKTREE_DIR = 'worktree'
 
-export const reviewRoot = (home: string, nodeId: string) =>
-  join(raindownPaths(home).state, 'review', nodeId)
+const REVIEW_DIR = 'review'
+
+/** 本节点某个审查任务的私有目录。 */
+export const reviewDir = (home: string, nodeId: string, taskId: string) =>
+  join(taskRunDir(home, taskId), REVIEW_DIR, nodeId)
+
+/** 旧版本的审查目录根（`state/review/<node-id>/`），只用于启动清理。 */
+export const legacyReviewRoot = (home: string, nodeId: string) =>
+  join(raindownPaths(home).state, REVIEW_DIR, nodeId)
 
 export interface PreparedReview {
   pr: PrRef
@@ -103,12 +121,17 @@ export async function prepareReview(input: PrepareReviewInput): Promise<Result<P
   if (!gitSha.safeParse(head).success)
     return fail('failure', 'review_prep_failed', `gh 返回的 head 不是提交 sha：${head}`)
 
-  const root = reviewRoot(input.home, input.nodeId)
-  const dir = join(root, input.taskId)
+  const dir = reviewDir(input.home, input.nodeId, input.taskId)
   // 同一任务上一次尝试的残留（例如节点崩溃）：先清理。
   await removeReviewDir(dir, input.git)
   await mkdir(dir, { recursive: true, mode: 0o700 })
-  const cleanup = () => removeReviewDir(dir, input.git)
+  const cleanup = async () => {
+    await removeReviewDir(dir, input.git)
+    await removeEmptyTaskRunDir(input.home, input.taskId, [
+      join(REVIEW_DIR, input.nodeId),
+      REVIEW_DIR,
+    ])
+  }
   const bail = async (r: Result<never>): Promise<Result<never>> => {
     await cleanup()
     return r
@@ -217,21 +240,37 @@ async function removeReviewDir(dir: string, gitOptions?: GitOptions): Promise<vo
   }
 }
 
-/** 节点启动时清理本节点残留的审查私有目录（上一次运行崩溃或被杀时留下的）。 */
+/**
+ * 节点启动时清理本节点残留的审查私有目录（上一次运行崩溃或被杀时留下的）：新位置 `run/tasks/<任务>/review/<node-id>/`
+ * 与旧位置 `state/review/<node-id>/<任务>/`。其他节点的目录不动；清理后删除变空的目录。
+ */
 export async function cleanupStaleReviews(
   home: string,
   nodeId: string,
   gitOptions?: GitOptions,
 ): Promise<void> {
   if (!safeName(nodeId)) return
-  const root = reviewRoot(home, nodeId)
+  let tasks: string[]
+  try {
+    tasks = await readdir(runTasksDir(home))
+  } catch {
+    tasks = []
+  }
+  for (const task of tasks) {
+    if (!safeName(task)) continue
+    const dir = reviewDir(home, nodeId, task)
+    if (!existsSync(dir)) continue
+    await removeReviewDir(dir, gitOptions)
+    await removeEmptyTaskRunDir(home, task, [join(REVIEW_DIR, nodeId), REVIEW_DIR])
+  }
+  const legacy = legacyReviewRoot(home, nodeId)
   let names: string[]
   try {
-    names = await readdir(root)
+    names = await readdir(legacy)
   } catch {
     return
   }
-  for (const name of names) await removeReviewDir(join(root, name), gitOptions)
+  for (const name of names) await removeReviewDir(join(legacy, name), gitOptions)
 }
 
 /** 审查任务的首条用户消息附加说明：PR、记录的 head、diff 位置与输出要求。 */

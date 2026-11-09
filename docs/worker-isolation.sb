@@ -1,5 +1,6 @@
 ;; worker 外层 seatbelt 配置样例（add-worker-credential-isolation 1.1 实测用，非产品代码）
 ;; 说明见 docs/executors.md 的“隔离实测”一节。
+;; 注意：样例按 1.1 实测时的布局（派工令牌、CODEX_HOME 在 state/ 下）编写；1.2 起它们已移到 run/，不再位于被拒目录内。
 ;;
 ;; 配置本身不含任何路径，全部经 sandbox-exec -D 传入（参数值按字面量处理，含引号、括号也不会改变配置结构）：
 ;;

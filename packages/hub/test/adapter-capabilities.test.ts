@@ -1,9 +1,11 @@
-import { afterEach, beforeEach, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import {
   type AdapterCapabilities,
+  credentialIsolationFor,
   type ExecutorInfo,
   NO_ADAPTER_CAPABILITIES,
   openDatabase,
+  roleSandboxSetting,
 } from '@raindown/core'
 import { createNodeProtocol } from '../src/index.ts'
 import { tempLedger } from './ledger-helpers.ts'
@@ -163,3 +165,168 @@ test.each(['event', 'projection'] as const)(
     ])
   },
 )
+
+describe('凭证隔离能力 credential_isolation（worker-credential-isolation 1.3）', () => {
+  const declared: AdapterCapabilities = {
+    ...NO_ADAPTER_CAPABILITIES,
+    raindown_mcp: true,
+    credential_isolation: {
+      layers: {
+        'danger-full-access': 'seatbelt',
+        'workspace-write': 'native',
+        'read-only': 'native',
+      },
+      enforced: false,
+    },
+  }
+
+  test('注册保存按沙箱设置声明的施加层与未施加状态，重放后不变', async () => {
+    const { store, service } = await setup()
+    const executors: ExecutorInfo[] = [{ type: 'codex-exec', adapter_capabilities: declared }]
+    const registered = service.registerNode({ ...registration, executors }, 'unknown')
+    expect(registered.ok && registered.data.node.executors).toEqual(executors)
+    expect(store.rebuild().ok).toBe(true)
+    const caps = store.getNode(registration.node_id)?.executors[0]?.adapter_capabilities
+    expect(caps).toEqual(declared)
+    const dev = { executor: 'codex-exec', permissions: { sandbox: 'danger-full-access' } }
+    expect(
+      credentialIsolationFor(caps ?? NO_ADAPTER_CAPABILITIES, roleSandboxSetting(dev)),
+    ).toEqual({ reported: true, layer: 'seatbelt', enforced: false })
+    expect(
+      credentialIsolationFor(
+        caps ?? NO_ADAPTER_CAPABILITIES,
+        roleSandboxSetting({ executor: 'codex-exec' }),
+      ),
+    ).toEqual({ reported: true, layer: 'native', enforced: false })
+  })
+
+  test('旧节点不上报时投影为未上报（按 none 处理），不影响注册', async () => {
+    const { store, service } = await setup()
+    const registered = service.registerNode(
+      { ...registration, executors: [{ type: 'codex-orca', mode: 'interactive' }] },
+      'unknown',
+    )
+    expect(registered.ok).toBe(true)
+    const caps = store.getNode(registration.node_id)?.executors[0]?.adapter_capabilities
+    expect(caps?.credential_isolation).toBeUndefined()
+    expect(
+      credentialIsolationFor(
+        caps ?? NO_ADAPTER_CAPABILITIES,
+        roleSandboxSetting({
+          executor: 'codex-orca',
+          permissions: { sandbox: 'danger-full-access' },
+        }),
+      ),
+    ).toEqual({ reported: false, layer: 'none', enforced: false })
+  })
+
+  test('HTTP 注册接受未来的沙箱设置键与格式合法的未知施加层（查询按 none），格式错误仍拒绝', async () => {
+    const { routes } = await setup()
+    const register = (credential_isolation: unknown) =>
+      routes.request('/v1/nodes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...registration,
+          executors: [
+            {
+              type: 'custom-harness',
+              adapter_capabilities: { ...NO_ADAPTER_CAPABILITIES, credential_isolation },
+            },
+          ],
+        }),
+      })
+    const future = await register({ layers: { 'future-sandbox': 'seatbelt' }, enforced: false })
+    expect(future.status).toBe(200)
+    expect(await future.json()).toHaveProperty(
+      'data.node.executors.0.adapter_capabilities.credential_isolation',
+      { layers: { 'future-sandbox': 'seatbelt' }, enforced: false },
+    )
+    expect(
+      (await register({ layers: { 'read-only': 'Bad Layer!' }, enforced: false })).status,
+    ).toBe(400)
+    const unknownLayer = await register({ layers: { 'read-only': 'future-layer' }, enforced: true })
+    expect(unknownLayer.status).toBe(200)
+    const body = (await unknownLayer.json()) as {
+      data: { node: { executors: Array<{ adapter_capabilities: AdapterCapabilities }> } }
+    }
+    const caps = body.data.node.executors[0]?.adapter_capabilities ?? NO_ADAPTER_CAPABILITIES
+    expect(caps.credential_isolation?.layers).toEqual({ 'read-only': 'future-layer' })
+    // 新节点的未知施加层不能被当作已支持的隔离。
+    expect(credentialIsolationFor(caps, 'read-only')).toEqual({
+      reported: true,
+      layer: 'none',
+      enforced: false,
+    })
+    expect((await register({ layers: {}, enforced: 'no' })).status).toBe(400)
+  })
+
+  test.each(['event', 'projection'] as const)(
+    '读取 %s 中不认识的施加层与不合法字段时逐项降级，不影响其他能力',
+    async (source) => {
+      const { path, store, service } = await setup()
+      expect(
+        service.registerNode(
+          { ...registration, executors: [{ type: 'custom-harness' }] },
+          'unknown',
+        ).ok,
+      ).toBe(true)
+      const executors = [
+        {
+          type: 'custom-harness',
+          adapter_capabilities: {
+            ...NO_ADAPTER_CAPABILITIES,
+            inject_while_running: true,
+            credential_isolation: {
+              layers: {
+                'danger-full-access': 'future-layer',
+                'read-only': 'native',
+                'workspace-write': 42,
+              },
+              enforced: 'unknown',
+              future_field: 1,
+            },
+          },
+        },
+        {
+          type: 'other-harness',
+          adapter_capabilities: { ...NO_ADAPTER_CAPABILITIES, credential_isolation: 'seatbelt' },
+        },
+      ]
+      const db = await openDatabase(path)
+      try {
+        if (source === 'projection') {
+          db.prepare('UPDATE nodes SET executors_json = ? WHERE node_id = ?').run(
+            JSON.stringify(executors),
+            registration.node_id,
+          )
+        } else {
+          db.prepare('INSERT INTO events (ts, type, actor, payload_json) VALUES (?, ?, ?, ?)').run(
+            '2026-11-09T00:00:00.000Z',
+            'node.registered',
+            'node:n-adapter',
+            JSON.stringify({ ...registration, executors, concurrency: 1 }),
+          )
+        }
+      } finally {
+        db.close()
+      }
+      if (source === 'event') expect(store.rebuild().ok).toBe(true)
+      const stored = store.getNode(registration.node_id)?.executors
+      expect(stored?.[0]?.adapter_capabilities).toEqual({
+        ...NO_ADAPTER_CAPABILITIES,
+        inject_while_running: true,
+        credential_isolation: {
+          layers: {
+            'danger-full-access': 'future-layer',
+            'read-only': 'native',
+            'workspace-write': 'none',
+          },
+          enforced: false,
+        },
+      })
+      expect(stored?.[1]?.adapter_capabilities).toEqual(NO_ADAPTER_CAPABILITIES)
+      expect(stored?.[1]?.adapter_capabilities.credential_isolation).toBeUndefined()
+    },
+  )
+})

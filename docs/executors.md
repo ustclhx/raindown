@@ -40,7 +40,7 @@
 
 ### 能力声明
 
-适配器在节点注册时随 `type`、`mode` 上报五项能力，中枢存入节点投影；旧节点没有上报时按最保守的取值处理，不按执行器类型名推断。
+适配器在节点注册时随 `type`、`mode` 上报五项交互能力与凭证隔离声明，中枢存入节点投影；旧节点没有上报时按最保守的取值处理，不按执行器类型名推断。
 
 | 能力 | 取值与含义 | 当前谁读取、做什么 |
 | --- | --- | --- |
@@ -49,6 +49,7 @@
 | `resume_session` | 进程结束后能否继续同一个 harness 会话；重新挂接存活终端不算恢复 | 只入账、展示 |
 | `raindown_mcp` | 是否加载任务绑定的 Raindown MCP，能否调用 `raindown_report`；只加载知识库 MCP 不算 | 节点：派工令牌文件写入失败时，声明为 true 的适配器以 `failed(lease_token_write_failed)` 结束本次派工，其余只记警告 |
 | `out_of_band_detection` | 能否发现绕过 Raindown 的批准，以及会话、工作目录被外部移除 | 只入账、展示 |
+| `credential_isolation` | `{layers, enforced}`：按角色沙箱设置声明的施加层（`seatbelt`、`native`、`separate_user`、`none`），以及当前是否已真正施加。见下文「凭证隔离声明」 | 只入账、展示（`raindown node list`）；后续用于 `isolation: required` 的派送 |
 
 另一个注册字段 `task_inputs` 声明执行器会处理派工输入；中枢只对声明了它的执行器随派工下发 PR 输入，旧节点不声明，输入保持待送达。
 
@@ -65,6 +66,31 @@ supervisor 是否代答提问看的是卡住的 `basis`（见下文「上报与�
 | `claude-sdk` | structured | true | true | true | false | true |
 | `pr-merge` | none | false | false | false | false | false |
 | `fake` | structured | true | true | false | false | true |
+
+### 凭证隔离声明
+
+`credential_isolation`（add-worker-credential-isolation 1.3）按角色的沙箱设置分别声明施加层，取值见 design D1：
+
+| 执行器 | 沙箱设置（`roleSandboxSetting`） | 声明的施加层 |
+| --- | --- | --- |
+| `codex-orca`、`codex-exec` | `danger-full-access`（含 bypass） | `seatbelt` |
+| `codex-orca`、`codex-exec` | `workspace-write`、`read-only` | `native` |
+| `claude-sdk` | `bash-sandbox-off`（Raindown 目前不开启 bash 沙箱） | `seatbelt` |
+| `claude-sdk` | `bash-sandbox-on` | `none` |
+| `pr-merge` | `in-node` | `none` |
+| `fake` | — | `none` |
+
+- 角色的沙箱设置由 core 的 `roleSandboxSetting` 从角色配置推出：codex-exec 取 `permissions.sandbox`（缺省 read-only）；
+  codex-orca 取 `permissions.sandbox`，其次 `permissions.config.sandbox_mode`，都没有时无法确定，按 `none` 处理。
+  表中没有列出的设置同样按 `none`。查询用 `credentialIsolationFor`。
+- **目前全部适配器都是 `enforced: false`**：只声明将要支持的施加层，尚未施加任何隔离（施加见 tasks 第 4、5 阶段）。
+  `raindown node list` 在每个执行器后标出“仅声明，未施加”，不能读成已隔离。自检结果（tasks 3.x）另行上报，不复用这个字段。
+- 旧节点不上报时投影中没有该字段，显示“未上报（按 none 处理）”，不影响派工。注册时沙箱设置的键与施加层都只校验格式：
+  较新节点上报的未知施加层（例如将来的新取值）照常入账，`node list` 标为“未知，按 none”，`credentialIsolationFor` 按 `none` 处理，
+  不会被当作已支持的隔离；格式不合法（非小写标识）返回 400。读取账本与投影时不合法字段逐项降级。
+- `config.sandbox_mode` 的值按 TOML 解析，带引号（`'"danger-full-access"'`）时去掉引号再比较。codex-orca 经
+  `config.profile` / `config.default_permissions` 间接指定沙箱、或没有任何沙箱设置时无法确定，按 `none` 处理，
+  `raindown doctor` 对这类角色给出 info 提示与原因。
 
 ### 授权请求
 
@@ -132,7 +158,7 @@ codex-orca 在 `gh pr list` 等查询中改在登记仓库目录执行，worktre
 加载 Raindown MCP 的 worker 必须绑定当前任务与派工（与 supervisor 的唤醒绑定是两套凭证，不能互相套用）：
 
 - 中枢在派工时签发 `fls_` 前缀的派工令牌（与节点续约用的 `lease_token` 分离），只存在中枢内存、不入账本；中枢重启后全部失效，节点续约时补发。每次请求都重新核对租约仍有效、任务未结束、派工次数与角色一致、本次派工没有结束。
-- 节点把令牌写入 `state/tasks/<task>/dispatch-tokens/<lease>.token`（目录 0700、文件 0600，原子替换），派工结束即删除。适配器只拿到 `ctx.leaseTokenFile` 路径。
+- 节点把令牌写入 `run/tasks/<task>/dispatch-tokens/<lease>.token`（各级目录 0700、文件 0600，原子替换），派工结束即删除。适配器只拿到 `ctx.leaseTokenFile` 路径。
 - MCP 启动命令为 `raindown mcp --actor <role> --task <id>`，经 `RAINDOWN_LEASE_TOKEN_FILE` 传文件路径，不传凭证明文。MCP 启动时向中枢查询绑定；命令行的 task/workspace 只用于核对，不一致时拒绝启动。
 - Codex 由 worker 进程环境向 MCP 透传路径（见下文「Codex 进程环境中的凭证路径」）；Claude 只在 MCP 子进程环境中设置路径。
 
@@ -237,9 +263,45 @@ Raindown 启动的所有 Codex worker（`codex-orca` 和 `codex-exec` 的全部�
 用户级的模型、provider 等设置也不会继承；角色需要的设置写在 `permissions.config`（经 `-c` 传入），
 模型与推理强度也可以用角色的 `model` / `effort`。
 
-- 有效类别为 read 的 `codex-exec`：`<raindown-home>/state/codex-read-home/`；
-- `codex-orca`：`<raindown-home>/state/codex-orca-home/`；
-- 其他 `codex-exec`（写类角色）：`<raindown-home>/state/codex-exec-home/`。
+- 有效类别为 read 的 `codex-exec`：`<raindown-home>/run/executors/codex-exec/codex-read-home/`；
+- `codex-orca`：`<raindown-home>/run/executors/codex-orca/codex-home/`；
+- 其他 `codex-exec`（写类角色）：`<raindown-home>/run/executors/codex-exec/codex-home/`。
+
+#### `run/` 目录
+
+worker 需要访问的节点运行目录放在 raindown-home 下的 `run/`，与 `state/` 分开，使隔离可以整体拒绝 `state/`
+（add-worker-credential-isolation D2；被拒目录内放行单个路径还需要逐级祖先元数据规则，见「隔离实测」）：
+
+- `run/executors/<执行器>/<harness 子目录>/`：执行器级的 harness 目录，目前是上面的 CODEX_HOME；
+- `run/tasks/<任务>/dispatch-tokens/<租约>.token`：任务私有目录中的派工令牌；
+- `run/tasks/<任务>/review/<node-id>/`：claude-sdk 审查任务的私有目录（`worktree/`、`pr.diff`、`meta.json`）。
+
+各级目录 0700。任务结束、审查清理与节点启动清理后，变空的 `run/tasks/<任务>/` 被删除（只用 rmdir，不递归删除内容）。
+节点自己的任务状态（任务说明 `spec.md`、`orca.json`）、唤醒令牌、日志与锁仍在 `state/`。
+
+隔离清单（core 的 `computeIsolationSpec`）对 raindown-home 整体拒绝、只保留 `run/`（覆盖 `state/`、`config/`、`brain/`、`raw/`、
+根目录文件与将来新增的子目录），再在 `run/executors/` 只保留本执行器、在 `run/executors/<执行器>/` 只保留本次的 harness 子目录
+（codex-exec 的读角色 `codex-read-home` 与写角色 `codex-home` 互相读不到）、在 `run/tasks/` 只保留本任务。
+保留目录必须是真实的直接子目录，是符号链接时报错（`isolation_keep_symlink`），任务 id、执行器名必须是单个安全的路径段。
+存在的遗留数据目录（`FLOW_HOME`、`RAINDOWN_HOME`、`~/flow-home`、`~/raindown-home` 中不是本 home 的那些）一并拒绝。
+age 私钥目录（`~/.config/sops/age/`）若被配置成用户主目录或其上级，返回 `isolation_age_key_dir_too_broad`，需要把私钥放进单独目录。
+只读语义显式写成写拒绝：派工令牌、`access: read` 的 harness 目录，以及只读角色的工作目录。
+共用同一 CODEX_HOME 的 codex-orca 任务之间会话记录仍可读，属于 design Risks 中登记的已知残留。
+
+codex-orca 的终端命令以 `"$(cat state/tasks/<id>/spec.md)"` 把任务说明作为第一条消息传入。施加外层 seatbelt 时（tasks 4.2），
+spec.md 只能由沙箱外的外层 shell 读取，`sandbox-exec` 只包裹 `codex` 本身；`state/` 下的路径不能出现在 worker 的允许清单里，
+`computeIsolationSpec` 对位于 `state/` 下的工作目录返回 `isolation_allow_in_deny`。
+
+升级迁移：节点启动时（持有节点锁之后）把旧位置 `state/codex-orca-home`、`state/codex-exec-home`、`state/codex-read-home`
+在同一文件系统内 rename 到新位置，并在旧位置留下指向新位置的符号链接，升级前启动的存活 Codex 终端因此仍可用、仍能按真实路径重挂接。
+迁移幂等：旧位置已是链接或不存在时跳过。新旧位置同时存在或 rename 失败（例如跨文件系统）时，记警告并继续使用旧位置，登录状态与会话不丢失；
+修复后下次启动再迁移。旧位置的派工令牌不迁移：节点重启后所有租约凭证都已失效，启动清理同时清理 `run/tasks/` 与 `state/tasks/` 中的令牌文件。
+确认没有使用旧路径的存活终端后，可以删除 `state/` 下这三个链接。审查目录不迁移：启动清理同时清理旧位置 `state/review/<node-id>/` 的残留。
+
+降级（回到不认识 `run/` 的旧版本）：先停止节点并关闭仍在运行的 Codex 终端，然后对三个目录分别删除旧位置的链接、把目录移回去，例如
+`rm state/codex-orca-home && mv run/executors/codex-orca/codex-home state/codex-orca-home`
+（`codex-exec-home` 对应 `run/executors/codex-exec/codex-home`，`codex-read-home` 对应 `run/executors/codex-exec/codex-read-home`）。
+`run/tasks/` 中只有派工令牌与审查残留，旧版本启动时不会使用，可以直接删除。
 
 目录按执行器及只读用途固定，保留会话记录供 `exec resume <session id>` 和 Orca 终端重挂接使用，
 无需按任务清理会话目录，同时减少不同适配器之间的配置污染。并发任务由 Codex 的会话 id 区分，
@@ -614,7 +676,8 @@ supervisor 唤醒会话使用唤醒绑定，自动放行的 Raindown 工具为 `
    不允许多余字段），`reviewed_sha` 由执行器填入第 2 步记录的 head；结构化输出缺失、不合规或 `error_max_structured_output_retries`
    → `failed(review_output_invalid)`。`summary` 仍是最后一段文字（没有文字时由结论生成）；
 7. 任务结束（任何结果）后移除 worktree、任务专用 ref 与私有目录；节点启动时清理本节点残留的私有目录并 `git worktree prune`。
-   私有目录为 `<raindown-home>/state/review/<node-id>/<task-id>/`。
+   私有目录为 `<raindown-home>/run/tasks/<task-id>/review/<node-id>/`（位于 `state/` 之外，见「`run/` 目录」）；
+   启动清理同时清理旧位置 `state/review/<node-id>/` 的残留。
 
 审查任务恢复执行（回复后重新排队）时不恢复旧会话：旧会话可能看过另一个 head，回复附在新的任务说明之后，重新准备。
 不在 `reviewer_roles` 中的角色即使带 `inputs.review` 也按普通任务运行，不做准备。中枢入账时，结果不是 done、合同没有
@@ -632,9 +695,9 @@ supervisor 唤醒会话使用唤醒绑定，自动放行的 Raindown 工具为 `
   `readRoleMayUse` 为假的调用直接拒绝；`canUseTool` 同样拒绝、不做策略预检、不进审批。允许的 Raindown 工具只有自动放行清单中的那些；
   StructuredOutput 只在配置了结构化输出时可用。会话设 `strictMcpConfig: true` 与 `ENABLE_CLAUDEAI_MCP_SERVERS=false`：
   不加载 `.mcp.json`、用户设置、插件中的 MCP 服务器与 claude.ai connector。
-- codex-exec：继续使用 `codex-read-home` 和只读沙箱；完整的配置隔离、凭证链接与恢复约定见上文「Codex 配置隔离」。
+- codex-exec：继续使用只读目录（`run/executors/codex-exec/codex-read-home`）和只读沙箱；完整的配置隔离、凭证链接与恢复约定见上文「Codex 配置隔离」。
   只读角色需要的 `permissions.config` 只允许 `model`、`model_reasoning_effort`，否则推断为 write；
-  写类角色也隔离，改用 `codex-exec-home`。`codexExecPermissions` 可用的键与 core 的
+  写类角色也隔离，改用 `run/executors/codex-exec/codex-home`。`codexExecPermissions` 可用的键与 core 的
   `CODEX_EXEC_KNOWN_PERMISSION_KEYS` 由防漂移测试保持一致。
   - **为什么不用 `-c`（Codex 0.164.0 实测，2026-10-26）**：在临时 `CODEX_HOME` 的 `config.toml` 中配置
     `[mcp_servers.userfoo] command = "/bin/sh", args = ["-c", "touch <标记>"]` 与一个指向 `http://127.0.0.1:1/v1` 的 provider，
@@ -1134,6 +1197,7 @@ spawnClaudeCodeProcess: ({ command, args, cwd, env, signal }) =>
   放行后，worker 能读到同一执行器其他任务的会话记录（实测读到了伪造的 `sessions/other-task/rollout.jsonl`），
   也能经 `auth.json` 链接读到 Codex 登录凭证。harness 和它执行的命令在同一个沙箱里，外层 seatbelt 无法区分两者。
 - 派工令牌同样位于被拒目录内，需要逐级的祖先元数据规则。把 CODEX_HOME 与任务私有目录移出 `state/`，配置会简单很多。
+- 后续：1.2 已把 CODEX_HOME 与派工令牌移到 `run/`（见「`run/` 目录」），上文实测时的路径是迁移前的布局。
 
 ### 施加层建议（D1：适配器 × 沙箱设置）
 

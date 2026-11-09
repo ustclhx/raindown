@@ -10,6 +10,7 @@ import { reservedNameVariants } from './entries.ts'
 import type { execCommand } from './git.ts'
 import { isRepoRoot } from './git.ts'
 import { type Env, GIT_REPOS, type RaindownHomeSource, raindownPaths } from './home.ts'
+import { roleSandboxInfo } from './isolation/capability.ts'
 import { loadPoliciesConfig } from './policy/config.ts'
 import { policyVersion } from './policy/version.ts'
 import { fail, ok, type Result } from './result.ts'
@@ -443,6 +444,19 @@ export async function runDoctor(
           hint: '需要允许本机 AI 身份创建时，加上 creatable_by（例如 ["*"] 或 ["reviewer"]）；见 docs/executors.md',
         })
       }
+    }
+    for (const role of roles.data.roles) {
+      // 只对已知执行器提示；无法确定的沙箱设置在凭证隔离上按 none 处理（worker-credential-isolation 1.3）。
+      if (!(KNOWN_EXECUTORS as readonly string[]).includes(role.executor)) continue
+      const sandbox = roleSandboxInfo(role)
+      if (sandbox.setting || !sandbox.reason || role.executor === 'fake') continue
+      checks.push({
+        id: `role.${role.name}.sandbox`,
+        ok: false,
+        severity: 'info',
+        message: `config/roles/${role.name}.yaml：无法确定沙箱设置（${sandbox.reason}），凭证隔离按 none 处理`,
+        hint: '需要凭证隔离时在 permissions.sandbox 中显式写出 danger-full-access、workspace-write 或 read-only；见 docs/executors.md「凭证隔离声明」',
+      })
     }
     checks.push(...checkRoleKinds(roles.data.roles))
   }

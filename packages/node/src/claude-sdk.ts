@@ -550,6 +550,12 @@ export function createClaudeSdkExecutor(options: ClaudeSdkExecutorOptions): Exec
       resume_session: true,
       raindown_mcp: true,
       out_of_band_detection: false,
+      // D1：bash 沙箱关闭时经 spawnClaudeCodeProcess 包裹外层 seatbelt；开启时原生 denyRead 只覆盖 Bash，不提供。
+      // 本阶段只声明，尚未施加。
+      credential_isolation: {
+        layers: { 'bash-sandbox-off': 'seatbelt', 'bash-sandbox-on': 'none' },
+        enforced: false,
+      },
     },
     classify: classifyClaudeSdk,
     // 节点启动时清理本节点残留的审查 worktree 与私有目录（D10）。

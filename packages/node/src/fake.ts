@@ -80,6 +80,7 @@ export function createFakeExecutor(options: FakeExecutorOptions = {}): ExecutorP
       resume_session: true,
       raindown_mcp: false,
       out_of_band_detection: false,
+      credential_isolation: { layers: {}, enforced: false },
     },
     classify: classifyFake,
     run(contract: TaskContract, ctx: ExecutorContext): ExecutorRun {

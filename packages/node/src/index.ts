@@ -52,7 +52,14 @@ export {
   prepareReadCodexHome,
   readCodexHome,
 } from './codex-exec.ts'
-export { execCodexHome, orcaCodexHome, prepareCodexHome, sameCodexHome } from './codex-home.ts'
+export {
+  CODEX_CREDENTIAL_ISOLATION,
+  execCodexHome,
+  migrateCodexHomes,
+  orcaCodexHome,
+  prepareCodexHome,
+  sameCodexHome,
+} from './codex-home.ts'
 export {
   analyzeTail,
   BUSY_RE,
@@ -145,6 +152,7 @@ export {
 export {
   cleanLeaseTokenFiles,
   leaseTokenDir,
+  removeEmptyTaskRunDir,
   removeLeaseTokenFile,
   writeLeaseTokenFile,
 } from './lease-token.ts'
@@ -192,12 +200,13 @@ export {
 } from './precheck.ts'
 export {
   cleanupStaleReviews,
+  legacyReviewRoot,
   type PreparedReview,
   prepareReview,
   REVIEW_DIFF_FILE,
   REVIEW_REF_PREFIX,
+  reviewDir,
   reviewRef,
-  reviewRoot,
 } from './review-prep.ts'
 export {
   cleanWakeTokenDir,

@@ -43,6 +43,7 @@ import {
 } from '@raindown/core'
 import { createNodeHubClient, type FetchLike, type NodeHubClient } from './client.ts'
 import { type NodeClock, sleep, systemClock } from './clock.ts'
+import { migrateCodexHomes } from './codex-home.ts'
 import type { CommandRunner } from './codex-orca/orca.ts'
 import { dualRaindownEnv, executorEnv } from './env.ts'
 import {
@@ -58,7 +59,12 @@ import {
   type StuckVerdict,
 } from './executor.ts'
 import { createFakeExecutor } from './fake.ts'
-import { cleanLeaseTokenFiles, removeLeaseTokenFile, writeLeaseTokenFile } from './lease-token.ts'
+import {
+  cleanLeaseTokenFiles,
+  removeEmptyTaskRunDir,
+  removeLeaseTokenFile,
+  writeLeaseTokenFile,
+} from './lease-token.ts'
 import { acquireNodeLock } from './node-lock.ts'
 import { createPolicyPrecheck, type Precheck, type PrecheckRequest } from './precheck.ts'
 import {
@@ -1401,6 +1407,8 @@ class LeaseRunner {
         await this.tokenWrites
         if (wakeTokenFile) await removeWakeTokenFile(wakeTokenFile).catch(() => {})
         if (this.leaseTokenFile) await removeLeaseTokenFile(this.leaseTokenFile).catch(() => {})
+        // 任务私有目录变空时一并删除（审查目录由执行器在会话结束时清理）。
+        await removeEmptyTaskRunDir(this.env.home, this.grant.task_id).catch(() => {})
       }
     }
     this.runEnded = true
@@ -1713,6 +1721,9 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
   // 调用方（startNode）已持有节点单实例锁，不会误删并行节点的文件。
   await cleanWakeTokenDir(home)
   await cleanLeaseTokenFiles(home)
+  // CODEX_HOME 从 state/ 迁到 run/（worker-credential-isolation D2）；失败时保留旧位置继续使用。
+  const codexHomes = await migrateCodexHomes(home, (message) => logger.warn(message))
+  for (const dir of codexHomes.migrated) logger.info(`CODEX_HOME 已迁移到 ${dir}`)
 
   const id =
     options.nodeId !== undefined ? ok(options.nodeId) : await loadOrCreateNodeId(home, host)
