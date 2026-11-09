@@ -2117,7 +2117,7 @@ describe('外层 seatbelt（worker-credential-isolation 4.4）', () => {
     const spawnFn = seatbeltSpawner([fake, '-f', '/x/isolation.sb'], (d) => errs.push(d))
     const child = spawnFn({
       command: '/bin/echo',
-      args: ['--version'],
+      args: ['hello-arg'],
       cwd: s.root,
       env: { PATH: process.env.PATH },
       signal: new AbortController().signal,
@@ -2131,9 +2131,10 @@ describe('外层 seatbelt（worker-credential-isolation 4.4）', () => {
       '-f',
       '/x/isolation.sb',
       '/bin/echo',
-      '--version',
+      'hello-arg',
     ])
-    expect(out.join('')).toBe('--version\n')
+    // 不用 --version 之类的参数：Linux 的 echo（uutils）会把它当作自己的选项。
+    expect(out.join('')).toBe('hello-arg\n')
   })
 
   test('seatbeltSpawner：sandbox-exec 不存在时只发出 error，原因写入 stderr 回调（审查第一轮 L2）', async () => {
