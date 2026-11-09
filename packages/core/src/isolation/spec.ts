@@ -1,6 +1,8 @@
+import { existsSync } from 'node:fs'
+import { lstat } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
-import { raindownPaths } from '../home.ts'
+import { basename, dirname, join } from 'node:path'
+import { type Env, raindownPaths, resolveRaindownHome } from '../home.ts'
 import { fail, ok, type Result } from '../result.ts'
 import { resolveAgeKeyFile } from '../secrets.ts'
 import {
@@ -35,8 +37,9 @@ export interface HarnessPath {
 }
 
 /**
- * 拒绝 `dir` 下除 `keep` 子树以外的全部内容（读写），`dir` 本身不拒绝。
- * 用于 `run/tasks/`（只保留本任务目录）与 `run/executors/`（只保留本执行器目录）：
+ * 拒绝 `dir` 下除 `keep` 子树以外的全部内容（读写），`dir` 本身不拒绝；`keep` 总是 `dir` 的直接子目录且不是符号链接。
+ * 依次用于：raindown-home（只保留 `run/`）、`run/executors/`（只保留本执行器）、`run/executors/<执行器>/`
+ * （只保留本次的 harness 子目录，给出 `executorHome` 时）、`run/tasks/`（只保留本任务）。
  * 允许项因此不落在被拒目录内，也不需要为祖先目录额外生成元数据规则。
  */
 export interface DenyChildrenExcept {
@@ -70,12 +73,18 @@ export interface IsolationSpec {
 export interface IsolationSpecInput {
   /** raindown-home。 */
   home: string
+  /** 任务 id；必须是单个安全的路径段（不能是 `.`、`..`，不含 `/`）。 */
   taskId: string
-  /** 执行器类型，例如 `codex-orca`。 */
+  /** 执行器类型，例如 `codex-orca`；同样必须是单个安全的路径段。 */
   executor: string
+  /**
+   * `run/executors/<执行器>/` 下本次使用的 harness 子目录名（例如 `codex-home`、`codex-read-home`）。
+   * 给出时同一执行器的其他子目录也拒绝（codex-exec 的读角色读不到写角色的会话，反之亦然）。
+   */
+  executorHome?: string
   /** 本任务工作目录。 */
   cwd: string
-  /** 角色的读写类别：write 时工作目录可写，否则只读。 */
+  /** 角色的读写类别：write 时工作目录可写；read 时工作目录只读（显式写拒绝）。 */
   access: 'read' | 'write'
   /** 本次派工令牌文件（只读放行这一个文件），必须位于本任务私有目录 `run/tasks/<任务>/` 内。 */
   leaseTokenFile?: string
@@ -87,10 +96,20 @@ export interface IsolationSpecInput {
   userHome?: string
   /** age 私钥文件；缺省按 secrets 的规则（`<userHome>/.config/sops/age/keys.txt`）。 */
   ageKeyFile?: string
-  /** 节点锁文件与日志目录；缺省为 `state/node.lock` 与 `state/logs/`（位于 `state/` 内时被合并）。 */
+  /** 节点锁文件与日志目录；缺省为 `state/node.lock` 与 `state/logs/`（位于 raindown-home 内时被整体拒绝覆盖）。 */
   nodeLockFile?: string
   logsDir?: string
+  /**
+   * 其他可能的数据目录（遗留 home）。缺省按 home 解析规则的候选：`FLOW_HOME`、`RAINDOWN_HOME`、
+   * `<userHome>/flow-home`、`<userHome>/raindown-home`；只收录存在、且与本 home 互不包含的目录。
+   */
+  legacyHomes?: readonly string[]
+  /** 解析遗留 home 时读取的环境变量；缺省为 `process.env`。 */
+  env?: Env
 }
+
+/** 与节点写派工令牌时相同的路径段规则：不以 `.` 开头，因此排除 `.` 与 `..`。 */
+const SAFE_SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/
 
 const validPort = (p: unknown): p is number =>
   typeof p === 'number' && Number.isInteger(p) && p > 0 && p < 65536
@@ -119,48 +138,130 @@ const bad = (code: string, message: string, details?: unknown) =>
   fail('usage', code, message, details)
 
 /**
+ * `dir` 下只保留 `segment` 子目录。保留项必须是真实的直接子目录：不能是符号链接（否则任务 A 的目录可以指向任务 B），
+ * 规范化后仍须是 `dir` 的直接子项且名字不变。
+ */
+async function keepChild(dir: string, segment: string): Promise<Result<DenyChildrenExcept>> {
+  const raw = join(dir, segment)
+  try {
+    if ((await lstat(raw)).isSymbolicLink())
+      return bad('isolation_keep_symlink', `保留目录 ${raw} 是符号链接，拒绝放行`)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+  }
+  const d = await canonicalPath(dir)
+  const keep = await canonicalPath(raw)
+  if (dirname(keep) !== d || basename(keep) !== segment)
+    return bad(
+      'isolation_keep_mismatch',
+      `保留目录 ${raw} 规范化后（${keep}）不是 ${d} 的直接子目录 ${segment}`,
+    )
+  return ok({ dir: d, keep })
+}
+
+async function legacyHomeCandidates(
+  input: IsolationSpecInput,
+  userHome: string,
+): Promise<string[]> {
+  const env = input.env ?? process.env
+  const raw =
+    input.legacyHomes ??
+    [
+      env.FLOW_HOME?.trim()
+        ? resolveRaindownHome({ RAINDOWN_HOME: env.FLOW_HOME }, userHome)
+        : undefined,
+      env.RAINDOWN_HOME?.trim()
+        ? resolveRaindownHome({ RAINDOWN_HOME: env.RAINDOWN_HOME }, userHome)
+        : undefined,
+      join(userHome, 'flow-home'),
+      join(userHome, 'raindown-home'),
+    ].filter((p): p is string => p !== undefined)
+  const home = await canonicalPath(input.home)
+  const found: string[] = []
+  for (const p of raw) {
+    const real = await canonicalPath(p)
+    if (!existsSync(real) || isWithin(real, home) || isWithin(home, real)) continue
+    found.push(real)
+  }
+  return found
+}
+
+/**
  * 计算一次派工的受保护/允许资源清单（design D2）。只计算，不施加。
- * 允许项落在被拒目录内时返回 `isolation_allow_in_deny`：不静默生成祖先元数据规则，调用方应修正目录布局。
+ * - raindown-home 整体拒绝，只保留 `run/`（覆盖 state/、config/、brain/、raw/、根目录文件与将来新增的子目录）；
+ *   `run/executors/`、`run/tasks/` 再只保留本执行器（及其 harness 子目录）、本任务；
+ * - 允许项落在被拒目录内时返回 `isolation_allow_in_deny`：不静默生成祖先元数据规则，调用方应修正目录布局。
  */
 export async function computeIsolationSpec(
   input: IsolationSpecInput,
 ): Promise<Result<IsolationSpec>> {
   if (!validPort(input.hubPort)) return bad('invalid_hub_port', `中枢端口不合法：${input.hubPort}`)
+  for (const [field, value] of [
+    ['taskId', input.taskId],
+    ['executor', input.executor],
+    ...(input.executorHome !== undefined ? [['executorHome', input.executorHome]] : []),
+  ] as const) {
+    if (!SAFE_SEGMENT.test(value))
+      return bad('invalid_isolation_input', `${field} 不能用作单个路径段：${JSON.stringify(value)}`)
+  }
   try {
     const paths = raindownPaths(input.home)
     const userHome = input.userHome ?? homedir()
     const c = canonicalPath
 
-    const protectedDirs = await Promise.all([
-      c(paths.state),
-      c(paths.config),
-      c(paths.brain),
-      c(
-        dirname(
-          resolveAgeKeyFile(
-            input.ageKeyFile === undefined ? {} : { ageKeyFile: input.ageKeyFile },
-            userHome,
-          ),
+    const ageDir = await c(
+      dirname(
+        resolveAgeKeyFile(
+          input.ageKeyFile === undefined ? {} : { ageKeyFile: input.ageKeyFile },
+          userHome,
         ),
       ),
-      c(join(userHome, LAUNCH_AGENTS_DIR)),
-      c(join(userHome, ORCA_RUNTIME_DIR)),
-      c(input.nodeLockFile ?? join(paths.state, 'node.lock')),
-      c(input.logsDir ?? paths.logs),
-    ])
-    const deny = minimal(protectedDirs)
-    const orcaDir = await c(join(userHome, ORCA_RUNTIME_DIR))
+    )
+    const realUserHome = await c(userHome)
+    if (isWithin(ageDir, realUserHome))
+      return bad(
+        'isolation_age_key_dir_too_broad',
+        `age 私钥目录 ${ageDir} 是用户主目录或其上级，无法只拒绝私钥；请把私钥放进单独的目录（例如 ~/.config/sops/age/）`,
+      )
 
-    const ownTask = await c(taskRunDir(input.home, input.taskId))
-    const ownExecutor = await c(executorRunDir(input.home, input.executor))
-    const denyChildren: DenyChildrenExcept[] = [
-      { dir: await c(runExecutorsDir(input.home)), keep: ownExecutor },
-      { dir: await c(runTasksDir(input.home)), keep: ownTask },
+    const keeps: DenyChildrenExcept[] = []
+    const entries: Array<[string, string]> = [
+      [input.home, 'run'],
+      [runExecutorsDir(input.home), input.executor],
+      ...(input.executorHome !== undefined
+        ? [[executorRunDir(input.home, input.executor), input.executorHome] as [string, string]]
+        : []),
+      [runTasksDir(input.home), input.taskId],
     ]
+    for (const [dir, segment] of entries) {
+      const k = await keepChild(dir, segment)
+      if (!k.ok) return k
+      keeps.push(k.data)
+    }
+    const realHome = await c(input.home)
+    const realRun = await c(paths.run)
+    const ownTask = await c(taskRunDir(input.home, input.taskId))
+    // 已被 raindown-home 整体拒绝覆盖的项不再单列。
+    const coveredByHome = (p: string) => isWithin(realHome, p) && !isWithin(realRun, p)
+
+    const deny = minimal(
+      [
+        ageDir,
+        await c(join(userHome, LAUNCH_AGENTS_DIR)),
+        await c(join(userHome, ORCA_RUNTIME_DIR)),
+        await c(input.nodeLockFile ?? join(paths.state, 'node.lock')),
+        await c(input.logsDir ?? paths.logs),
+        ...(await legacyHomeCandidates(input, userHome)),
+      ].filter((p) => !coveredByHome(p)),
+    )
+    const orcaDir = await c(join(userHome, ORCA_RUNTIME_DIR))
 
     const cwd = await c(input.cwd)
     const allowRead: string[] = [cwd]
-    const allowWrite: string[] = input.access === 'write' ? [cwd] : []
+    const allowWrite: string[] = []
+    const readOnly: string[] = []
+    if (input.access === 'write') allowWrite.push(cwd)
+    else readOnly.push(cwd)
     if (input.leaseTokenFile !== undefined) {
       const token = await c(input.leaseTokenFile)
       if (token === ownTask || !isWithin(ownTask, token))
@@ -169,11 +270,13 @@ export async function computeIsolationSpec(
           `派工令牌文件 ${token} 不在本任务私有目录 ${ownTask} 内`,
         )
       allowRead.push(token)
+      readOnly.push(token)
     }
     for (const h of input.harnessPaths ?? []) {
       const p = await c(h.path)
       allowRead.push(p)
       if (h.access === 'write') allowWrite.push(p)
+      else readOnly.push(p)
     }
 
     for (const allowed of uniqueSorted([...allowRead, ...allowWrite])) {
@@ -183,7 +286,7 @@ export async function computeIsolationSpec(
           allowed,
           denied: inside,
         })
-      for (const dc of denyChildren) {
+      for (const dc of keeps) {
         if (allowed !== dc.dir && isWithin(dc.dir, allowed) && !isWithin(dc.keep, allowed))
           return bad(
             'isolation_allow_in_deny',
@@ -191,6 +294,14 @@ export async function computeIsolationSpec(
             { allowed, denied: dc.dir },
           )
       }
+    }
+    for (const writable of allowWrite) {
+      const ro = readOnly.find((r) => isWithin(r, writable))
+      if (ro)
+        return bad('isolation_allow_in_deny', `可写路径 ${writable} 位于只读路径 ${ro} 内`, {
+          allowed: writable,
+          denied: ro,
+        })
     }
 
     const orcaPorts = await resolvePorts(input)
@@ -200,8 +311,8 @@ export async function computeIsolationSpec(
 
     return ok({
       deny_read: deny,
-      deny_write: deny,
-      deny_children_except: denyChildren,
+      deny_write: minimal([...deny, ...readOnly]),
+      deny_children_except: keeps,
       allow_read: uniqueSorted(allowRead),
       allow_write: uniqueSorted(allowWrite),
       deny_unix_sockets: [orcaDir],

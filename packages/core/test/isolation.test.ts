@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -7,12 +15,22 @@ import {
   computeIsolationSpec,
   credentialIsolationFor,
   describeCredentialIsolation,
+  type IsolationSpec,
   type IsolationSpecInput,
   isWithin,
   NO_ADAPTER_CAPABILITIES,
+  roleSandboxInfo,
   roleSandboxSetting,
   type SandboxSetting,
 } from '../src/index.ts'
+
+/** 按清单判断路径是否不可读（拒绝项，或 deny_children_except 的 dir 子树中 keep 以外的部分）。 */
+function readDenied(spec: IsolationSpec, path: string): boolean {
+  if (spec.deny_read.some((d) => isWithin(d, path))) return true
+  return spec.deny_children_except.some(
+    (dc) => path !== dc.dir && isWithin(dc.dir, path) && !isWithin(dc.keep, path),
+  )
+}
 
 const roots: string[] = []
 afterEach(() => {
@@ -38,6 +56,7 @@ function setup() {
     hubPort: 7801,
     userHome,
     resolveOrcaPorts: () => [60211, 10129],
+    env: {},
   }
   return { root, real, home, userHome, work, base }
 }
@@ -55,24 +74,23 @@ describe('computeIsolationSpec', () => {
     if (!r.ok) throw new Error(r.error.message)
     const R = (p: string) => join(s.real, p)
     const protectedDirs = [
-      R('raindown-home/brain'),
-      R('raindown-home/config'),
-      R('raindown-home/state'),
       R('user/.config/sops/age'),
       R('user/Library/Application Support/orca'),
       R('user/Library/LaunchAgents'),
     ].sort()
-    // 节点锁与日志位于 state/ 内，被合并。
+    const realToken = R('raindown-home/run/tasks/t-1/dispatch-tokens/l-1.token')
+    // raindown-home 内的受保护项（state/、config/、brain/、节点锁与日志）由整体拒绝覆盖，不单列。
     expect(r.data.deny_read).toEqual(protectedDirs)
-    expect(r.data.deny_write).toEqual(protectedDirs)
+    // 令牌只读：显式写拒绝。
+    expect(r.data.deny_write).toEqual([...protectedDirs, realToken].sort())
     expect(r.data.deny_children_except).toEqual([
+      { dir: R('raindown-home'), keep: R('raindown-home/run') },
       {
         dir: R('raindown-home/run/executors'),
         keep: R('raindown-home/run/executors/codex-orca'),
       },
       { dir: R('raindown-home/run/tasks'), keep: R('raindown-home/run/tasks/t-1') },
     ])
-    const realToken = R('raindown-home/run/tasks/t-1/dispatch-tokens/l-1.token')
     const realCodex = R('raindown-home/run/executors/codex-orca/codex-home')
     expect(r.data.allow_read).toEqual([realCodex, realToken, R('work')].sort())
     expect(r.data.allow_write).toEqual([realCodex, R('work')].sort())
@@ -83,6 +101,19 @@ describe('computeIsolationSpec', () => {
     expect(r.data.deny_local_ports).toEqual([10129, 60211])
     expect(r.data.orca_ports).toEqual({ status: 'resolved', ports: [10129, 60211] })
     expect(r.data.deny_process_debug).toEqual(['mach-priv-task-port', 'mach-task-name'])
+    for (const p of [
+      'raindown-home/state/hub.token',
+      'raindown-home/config/policies.yaml',
+      'raindown-home/brain/index.md',
+      'raindown-home/raw/inbox/x.md',
+      'raindown-home/future-dir/x',
+      'raindown-home/root-file.txt',
+      'raindown-home/run/tasks/t-2/dispatch-tokens/l-9.token',
+      'raindown-home/run/executors/codex-exec/codex-home/auth.json',
+    ])
+      expect({ p, denied: readDenied(r.data, R(p)) }).toEqual({ p, denied: true })
+    for (const p of [realToken, realCodex, R('work/src/a.ts')])
+      expect({ p, denied: readDenied(r.data, p) }).toEqual({ p, denied: false })
   })
 
   test('只读角色的工作目录只读；age 私钥目录跟随显式的私钥文件位置', async () => {
@@ -95,6 +126,7 @@ describe('computeIsolationSpec', () => {
     if (!r.ok) throw new Error(r.error.message)
     expect(r.data.allow_read).toEqual([join(s.real, 'work')])
     expect(r.data.allow_write).toEqual([])
+    expect(r.data.deny_write).toContain(join(s.real, 'work'))
     expect(r.data.deny_read).toContain(join(s.real, 'keys', 'age'))
     expect(r.data.deny_read).not.toContain(join(s.real, 'user', '.config', 'sops', 'age'))
   })
@@ -115,7 +147,11 @@ describe('computeIsolationSpec', () => {
       expect(p.startsWith(s.real)).toBe(true)
       expect(p.includes('/alias/')).toBe(false)
     }
-    expect(r.data.deny_read).toContain(join(s.real, 'raindown-home', 'state'))
+    expect(readDenied(r.data, join(s.real, 'raindown-home', 'state', 'hub.token'))).toBe(true)
+    expect(r.data.deny_children_except[0]).toEqual({
+      dir: join(s.real, 'raindown-home'),
+      keep: join(s.real, 'raindown-home', 'run'),
+    })
     if (process.platform === 'darwin' && existsSync('/private/var')) {
       expect(await canonicalPath('/var/raindown-isolation-does-not-exist')).toBe(
         '/private/var/raindown-isolation-does-not-exist',
@@ -135,7 +171,7 @@ describe('computeIsolationSpec', () => {
     // brain/ 与 run/ 都不存在，仍然列出。
     const r = await computeIsolationSpec({ ...s.base, cwd: join(alias, 'work', 'not-yet') })
     if (!r.ok) throw new Error(r.error.message)
-    expect(r.data.deny_read).toContain(join(s.real, 'raindown-home', 'brain'))
+    expect(readDenied(r.data, join(s.real, 'raindown-home', 'brain'))).toBe(true)
     expect(r.data.allow_write).toEqual([join(s.real, 'work', 'not-yet')])
   })
 
@@ -291,5 +327,187 @@ describe('credential_isolation 能力与角色沙箱设置', () => {
       'bash-sandbox-off→seatbelt、bash-sandbox-on→none（仅声明，未施加）',
     )
     expect(describeCredentialIsolation(NO_ADAPTER_CAPABILITIES)).toBe('未上报（按 none 处理）')
+  })
+})
+
+describe('审查修复（第一轮）', () => {
+  test('M1：taskId / executor 不是单个安全路径段时报错', async () => {
+    const s = setup()
+    for (const override of [
+      { taskId: '..' },
+      { taskId: '.' },
+      { taskId: 'a/b' },
+      { taskId: '' },
+      { executor: '..' },
+      { executor: 'x/../y' },
+      { executorHome: '..' },
+    ]) {
+      const r = await computeIsolationSpec({ ...s.base, ...override })
+      expect({ override, code: r.ok ? 'ok' : r.error.code }).toEqual({
+        override,
+        code: 'invalid_isolation_input',
+      })
+    }
+  })
+
+  test('M1：本任务目录是指向其他任务目录的符号链接时报错，不放行其他任务的令牌', async () => {
+    const s = setup()
+    const tasks = join(s.home, 'run', 'tasks')
+    mkdirSync(join(tasks, 'B', 'dispatch-tokens'), { recursive: true })
+    writeFileSync(join(tasks, 'B', 'dispatch-tokens', 'l-1.token'), 'placeholder')
+    symlinkSync(join(tasks, 'B'), join(tasks, 'A'))
+    const r = await computeIsolationSpec({
+      ...s.base,
+      taskId: 'A',
+      leaseTokenFile: join(tasks, 'A', 'dispatch-tokens', 'l-1.token'),
+    })
+    expect(r.ok ? 'ok' : r.error.code).toBe('isolation_keep_symlink')
+    // 执行器目录与 run/ 本身同样不能是链接。
+    const s2 = setup()
+    mkdirSync(join(s2.home, 'run', 'executors', 'codex-exec'), { recursive: true })
+    symlinkSync(
+      join(s2.home, 'run', 'executors', 'codex-exec'),
+      join(s2.home, 'run', 'executors', 'codex-orca'),
+    )
+    const r2 = await computeIsolationSpec(s2.base)
+    expect(r2.ok ? 'ok' : r2.error.code).toBe('isolation_keep_symlink')
+    const s3 = setup()
+    mkdirSync(join(s3.root, 'elsewhere'))
+    symlinkSync(join(s3.root, 'elsewhere'), join(s3.home, 'run'))
+    const r3 = await computeIsolationSpec(s3.base)
+    expect(r3.ok ? 'ok' : r3.error.code).toBe('isolation_keep_symlink')
+  })
+
+  test('M2：工作目录在 state/ 下（如任务说明所在的 state/tasks/<id>/）时返回 isolation_allow_in_deny', async () => {
+    const s = setup()
+    for (const cwd of [
+      join(s.home, 'state', 'tasks', 't-1'),
+      join(s.home, 'state', 'review', 'n-1', 't-1', 'worktree'),
+    ]) {
+      const r = await computeIsolationSpec({ ...s.base, cwd })
+      expect(r.ok ? 'ok' : r.error.code).toBe('isolation_allow_in_deny')
+    }
+    // 审查目录的新位置在本任务私有目录内，可以放行。
+    const review = join(s.home, 'run', 'tasks', 't-1', 'review', 'n-1', 'worktree')
+    const r = await computeIsolationSpec({ ...s.base, access: 'read', cwd: review })
+    expect(r.ok).toBe(true)
+  })
+
+  test('L4：存在的遗留 home 一并拒绝；与本 home 相同或互相包含的候选忽略', async () => {
+    const s = setup()
+    const flowHome = join(s.userHome, 'flow-home')
+    mkdirSync(join(flowHome, 'state'), { recursive: true })
+    const envHome = join(s.root, 'env-flow-home')
+    mkdirSync(envHome)
+    const r = await computeIsolationSpec({
+      ...s.base,
+      env: { FLOW_HOME: envHome, RAINDOWN_HOME: s.home },
+    })
+    if (!r.ok) throw new Error(r.error.message)
+    expect(r.data.deny_read).toContain(join(s.real, 'user', 'flow-home'))
+    expect(r.data.deny_read).toContain(join(s.real, 'env-flow-home'))
+    expect(r.data.deny_read).not.toContain(join(s.real, 'raindown-home'))
+    // 不存在的候选（user/raindown-home）不列出。
+    expect(r.data.deny_read).not.toContain(join(s.real, 'user', 'raindown-home'))
+    // 显式给出 legacyHomes 时只用给出的值。
+    const explicit = await computeIsolationSpec({ ...s.base, legacyHomes: [envHome, s.root] })
+    if (!explicit.ok) throw new Error(explicit.error.message)
+    expect(explicit.data.deny_read).toContain(join(s.real, 'env-flow-home'))
+    expect(explicit.data.deny_read).not.toContain(join(s.real, 'user', 'flow-home'))
+    expect(explicit.data.deny_read).not.toContain(s.real)
+  })
+
+  test('L4：age 私钥目录是用户主目录或其上级时返回明确错误', async () => {
+    const s = setup()
+    for (const ageKeyFile of [join(s.userHome, 'keys.txt'), join(s.root, 'keys.txt')]) {
+      const r = await computeIsolationSpec({ ...s.base, ageKeyFile })
+      expect(r.ok ? 'ok' : r.error.code).toBe('isolation_age_key_dir_too_broad')
+    }
+  })
+
+  test('L5：只读 harness 目录与令牌显式写拒绝；codex-exec 读写角色的 harness 子目录互相拒绝', async () => {
+    const s = setup()
+    const exec = join(s.home, 'run', 'executors', 'codex-exec')
+    const readHome = join(exec, 'codex-read-home')
+    const r = await computeIsolationSpec({
+      ...s.base,
+      executor: 'codex-exec',
+      executorHome: 'codex-read-home',
+      access: 'read',
+      harnessPaths: [
+        { path: readHome, access: 'write' },
+        { path: join(s.root, 'claude-config'), access: 'read' },
+      ],
+    })
+    if (!r.ok) throw new Error(r.error.message)
+    const R = (p: string) => join(s.real, p)
+    expect(r.data.deny_write).toContain(R('claude-config'))
+    expect(r.data.deny_write).not.toContain(
+      R('raindown-home/run/executors/codex-exec/codex-read-home'),
+    )
+    expect(r.data.deny_children_except).toContainEqual({
+      dir: R('raindown-home/run/executors/codex-exec'),
+      keep: R('raindown-home/run/executors/codex-exec/codex-read-home'),
+    })
+    expect(
+      readDenied(r.data, R('raindown-home/run/executors/codex-exec/codex-home/sessions/x.jsonl')),
+    ).toBe(true)
+    // 读角色不能把写角色的目录当作 harness 目录放行。
+    const crossed = await computeIsolationSpec({
+      ...s.base,
+      executor: 'codex-exec',
+      executorHome: 'codex-read-home',
+      harnessPaths: [{ path: join(exec, 'codex-home'), access: 'write' }],
+    })
+    expect(crossed.ok ? 'ok' : crossed.error.code).toBe('isolation_allow_in_deny')
+    // 可写路径不能位于只读路径内。
+    const nested = await computeIsolationSpec({
+      ...s.base,
+      access: 'read',
+      harnessPaths: [{ path: join(s.work, '.cache'), access: 'write' }],
+    })
+    expect(nested.ok ? 'ok' : nested.error.code).toBe('isolation_allow_in_deny')
+  })
+
+  test('L6：config.sandbox_mode 的 TOML 引号去掉后比较；profile 间接指定时无法确定并给出原因', () => {
+    expect(
+      roleSandboxSetting({
+        executor: 'codex-orca',
+        permissions: { config: { sandbox_mode: '"danger-full-access"' } },
+      }),
+    ).toBe('danger-full-access')
+    expect(
+      roleSandboxSetting({
+        executor: 'codex-orca',
+        permissions: { config: { sandbox_mode: "'workspace-write'" } },
+      }),
+    ).toBe('workspace-write')
+    expect(
+      roleSandboxSetting({ executor: 'codex-orca', permissions: { sandbox: '"read-only"' } }),
+    ).toBe('read-only')
+    const viaProfile = roleSandboxInfo({
+      executor: 'codex-orca',
+      permissions: { config: { profile: 'dev', sandbox_mode: 'danger-full-access' } },
+    })
+    expect(viaProfile.setting).toBeUndefined()
+    expect(viaProfile.reason).toContain('config.profile')
+    expect(roleSandboxInfo({ executor: 'codex-orca' }).reason).toContain('由 Codex 自行决定')
+    // codex-exec 总是传 -s，profile 不影响。
+    expect(
+      roleSandboxSetting({ executor: 'codex-exec', permissions: { config: { profile: 'x' } } }),
+    ).toBe('read-only')
+  })
+
+  test('L3：未知施加层按 none，展示时标明未知', () => {
+    const caps = {
+      ...NO_ADAPTER_CAPABILITIES,
+      credential_isolation: { layers: { 'read-only': 'future-layer' }, enforced: true },
+    }
+    expect(credentialIsolationFor(caps, 'read-only')).toEqual({
+      reported: true,
+      layer: 'none',
+      enforced: false,
+    })
+    expect(describeCredentialIsolation(caps)).toContain('future-layer（未知，按 none）')
   })
 })

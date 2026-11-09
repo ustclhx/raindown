@@ -93,7 +93,7 @@ export async function migrateCodexHomes(
     try {
       await lstat(loc.current)
       log(
-        `CODEX_HOME 新旧位置同时存在（${loc.legacy}、${loc.current}），继续使用旧位置；请确认后手动合并`,
+        `CODEX_HOME 新旧位置同时存在（${loc.legacy}：${await authState(loc.legacy)}；${loc.current}：${await authState(loc.current)}），继续使用旧位置；请确认后手动合并`,
       )
       continue
     } catch (err) {
@@ -102,10 +102,23 @@ export async function migrateCodexHomes(
         continue
       }
     }
+    // 先在旧目录旁建好指向新位置的临时链接，rename 目录后立即把链接 rename 到旧位置，
+    // 旧路径不存在的窗口只有两次 rename 之间。
+    const tmpLink = `${loc.legacy}.${randomBytes(8).toString('hex')}.link`
     try {
       await ensureRunDirs(dirname(loc.current), raindownPaths(home).run)
+      await symlink(loc.current, tmpLink)
+    } catch (err) {
+      await rm(tmpLink, { force: true }).catch(() => {})
+      log(
+        `迁移 CODEX_HOME ${loc.legacy} → ${loc.current} 失败，继续使用旧位置：${(err as Error).message}`,
+      )
+      continue
+    }
+    try {
       await rename(loc.legacy, loc.current)
     } catch (err) {
+      await rm(tmpLink, { force: true }).catch(() => {})
       log(
         `迁移 CODEX_HOME ${loc.legacy} → ${loc.current} 失败，继续使用旧位置：${(err as Error).message}`,
       )
@@ -113,13 +126,24 @@ export async function migrateCodexHomes(
     }
     migrated.push(loc.current)
     try {
-      await symlink(loc.current, loc.legacy)
+      await rename(tmpLink, loc.legacy)
     } catch (err) {
+      await rm(tmpLink, { force: true }).catch(() => {})
       // 新位置已生效；只有升级前启动的存活终端会因此无法重挂接。
       log(`已迁移到 ${loc.current}，但无法在旧位置留下链接：${(err as Error).message}`)
     }
   }
   return { migrated }
+}
+
+/** 只报告 auth.json 的存在性与是否为链接，不读取内容。 */
+async function authState(dir: string): Promise<string> {
+  try {
+    const info = await lstat(join(dir, 'auth.json'))
+    return info.isSymbolicLink() ? 'auth.json 是链接' : 'auth.json 是普通文件'
+  } catch (err) {
+    return missing(err) ? '没有 auth.json' : `auth.json 无法检查（${(err as Error).message}）`
+  }
 }
 
 /** 逐级创建 `run/` 到 `dir` 的目录并收紧为 0700（已存在的目录也收紧，拒绝符号链接）。 */

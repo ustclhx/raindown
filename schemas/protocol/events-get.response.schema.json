@@ -5340,15 +5340,23 @@
                                           "pattern": "^[a-z][a-z0-9-]{0,63}$"
                                         },
                                         "additionalProperties": {
-                                          "type": "string",
-                                          "enum": [
-                                            "seatbelt",
-                                            "native",
-                                            "separate_user",
-                                            "none"
+                                          "anyOf": [
+                                            {
+                                              "type": "string",
+                                              "enum": [
+                                                "seatbelt",
+                                                "native",
+                                                "separate_user",
+                                                "none"
+                                              ]
+                                            },
+                                            {
+                                              "type": "string",
+                                              "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                                            }
                                           ]
                                         },
-                                        "description": "按角色沙箱设置声明的施加层；已知设置：danger-full-access、workspace-write、read-only、bash-sandbox-off、bash-sandbox-on、in-node。未列出的设置视为 none"
+                                        "description": "按角色沙箱设置声明的施加层（已知取值：seatbelt、native、separate_user、none；不认识的取值按 none）；已知设置：danger-full-access、workspace-write、read-only、bash-sandbox-off、bash-sandbox-on、in-node。未列出的设置视为 none"
                                       },
                                       "enforced": {
                                         "type": "boolean",

@@ -5,7 +5,8 @@ import { raindownPaths } from '../home.ts'
 /**
  * `run/` 的布局（add-worker-credential-isolation D2）：
  * - `run/executors/<执行器>/`：执行器级的 harness 目录，例如 Raindown 管理的 CODEX_HOME；
- * - `run/tasks/<任务 id>/`：任务私有目录，目前只放派工令牌（`dispatch-tokens/<租约>.token`）。
+ * - `run/tasks/<任务 id>/`：任务私有目录：派工令牌（`dispatch-tokens/<租约>.token`）与 claude-sdk 审查目录
+ *   （`review/<node-id>/`）。
  * 各级目录均为 0700。节点自己的任务状态（任务说明、orca.json 等）仍在 `state/tasks/<id>/`。
  */
 export const runExecutorsDir = (home: string) => join(raindownPaths(home).run, 'executors')

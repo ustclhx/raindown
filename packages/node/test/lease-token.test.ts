@@ -3,11 +3,12 @@ import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { taskRunDir } from '@raindown/core'
 import {
   cleanLeaseTokenFiles,
   leaseTokenDir,
+  removeEmptyTaskRunDir,
   removeLeaseTokenFile,
   writeLeaseTokenFile,
 } from '../src/lease-token.ts'
@@ -128,6 +129,8 @@ test.each(['done', 'abandon'] as const)('节点只传派工凭证文件路径，
     expect(path).toBeDefined()
     expect(seen).toBe(token)
     expect(existsSync(path ?? '')).toBe(false)
+    // 派工结束后变空的任务私有目录 run/tasks/<任务>/ 一并删除。
+    expect(existsSync(dirname(dirname(path ?? '')))).toBe(false)
   } finally {
     await b.close()
   }
@@ -461,4 +464,28 @@ test('启动期间续约保留最新 token，释放后的迟到续约不会重�
     resumeLateRenew()
     await b.close()
   }
+})
+
+test('启动清理与 removeEmptyTaskRunDir 只删除变空的任务私有目录', async () => {
+  const home = await tempHome()
+  await writeLeaseTokenFile(home, 't-empty', 'l-1', 'token')
+  await writeLeaseTokenFile(home, 't-busy', 'l-1', 'token')
+  const artifact = join(taskRunDir(home, 't-busy'), 'review', 'n-1', 'pr.diff')
+  await mkdir(dirname(artifact), { recursive: true })
+  await writeFile(artifact, 'diff')
+  await cleanLeaseTokenFiles(home)
+  expect(existsSync(taskRunDir(home, 't-empty'))).toBe(false)
+  expect(existsSync(leaseTokenDir(home, 't-busy'))).toBe(false)
+  expect(existsSync(artifact)).toBe(true)
+  // 非空、不存在、不安全的 id 都不报错，也不删除内容。
+  await removeEmptyTaskRunDir(home, 't-busy')
+  await removeEmptyTaskRunDir(home, 't-missing')
+  await removeEmptyTaskRunDir(home, '..')
+  expect(existsSync(artifact)).toBe(true)
+  // 目录本身是符号链接时 rmdir 失败，链接目标不受影响。
+  const outside = join(home, 'outside')
+  await mkdir(outside)
+  await symlink(outside, taskRunDir(home, 't-link'))
+  await removeEmptyTaskRunDir(home, 't-link')
+  expect(existsSync(outside)).toBe(true)
 })

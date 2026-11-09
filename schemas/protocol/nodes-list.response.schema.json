@@ -99,12 +99,20 @@
                               },
                               "additionalProperties": {
                                 "default": "none",
-                                "type": "string",
-                                "enum": [
-                                  "seatbelt",
-                                  "native",
-                                  "separate_user",
-                                  "none"
+                                "anyOf": [
+                                  {
+                                    "type": "string",
+                                    "enum": [
+                                      "seatbelt",
+                                      "native",
+                                      "separate_user",
+                                      "none"
+                                    ]
+                                  },
+                                  {
+                                    "type": "string",
+                                    "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+                                  }
                                 ]
                               }
                             },

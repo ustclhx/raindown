@@ -107,6 +107,29 @@ describe('raindown doctor', () => {
     )
   })
 
+  test('无法确定沙箱设置的角色给出 info 提示（凭证隔离按 none）；默认模板不提示', async () => {
+    const home = tempHome('raindown-doctor-sandbox-')
+    await initRaindownHome(home)
+    writeText(
+      join(home, 'config/roles/profiled.yaml'),
+      'name: profiled\nexecutor: codex-orca\nprompt: 测试\npermissions:\n  config:\n    profile: dev\n',
+    )
+    writeText(
+      join(home, 'config/roles/quoted.yaml'),
+      'name: quoted\nexecutor: codex-orca\nprompt: 测试\npermissions:\n  config:\n    sandbox_mode: \'"danger-full-access"\'\n',
+    )
+    const report = reportOf(await runDoctor(home, 'RAINDOWN_HOME'))
+    const hints = report.checks.filter((c) => c.id.endsWith('.sandbox'))
+    expect(hints).toEqual([
+      expect.objectContaining({
+        id: 'role.profiled.sandbox',
+        severity: 'info',
+        message: expect.stringContaining('config.profile'),
+      }),
+    ])
+    expect(report.ok).toBe(true)
+  })
+
   test('显示每个角色的有效类别；声明放宽时给出警告', async () => {
     const home = tempHome('raindown-doctor-kind-')
     await initRaindownHome(home)

@@ -59,7 +59,12 @@ import {
   type StuckVerdict,
 } from './executor.ts'
 import { createFakeExecutor } from './fake.ts'
-import { cleanLeaseTokenFiles, removeLeaseTokenFile, writeLeaseTokenFile } from './lease-token.ts'
+import {
+  cleanLeaseTokenFiles,
+  removeEmptyTaskRunDir,
+  removeLeaseTokenFile,
+  writeLeaseTokenFile,
+} from './lease-token.ts'
 import { acquireNodeLock } from './node-lock.ts'
 import { createPolicyPrecheck, type Precheck, type PrecheckRequest } from './precheck.ts'
 import {
@@ -1402,6 +1407,8 @@ class LeaseRunner {
         await this.tokenWrites
         if (wakeTokenFile) await removeWakeTokenFile(wakeTokenFile).catch(() => {})
         if (this.leaseTokenFile) await removeLeaseTokenFile(this.leaseTokenFile).catch(() => {})
+        // 任务私有目录变空时一并删除（审查目录由执行器在会话结束时清理）。
+        await removeEmptyTaskRunDir(this.env.home, this.grant.task_id).catch(() => {})
       }
     }
     this.runEnded = true

@@ -4,6 +4,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   rmSync,
@@ -248,6 +249,8 @@ describe('CODEX_HOME 从 state/ 迁到 run/', () => {
     ])
       expect(lstatSync(dir).mode & 0o777).toBe(0o700)
 
+    // 临时链接已全部换到旧位置，不留残余。
+    expect(readdirSync(join(home, 'state')).filter((n) => n.endsWith('.link'))).toEqual([])
     const second = await migrateCodexHomes(home, (m) => logs.push(m))
     expect(second.migrated).toEqual([])
     expect(logs).toEqual([])
@@ -269,10 +272,16 @@ describe('CODEX_HOME 从 state/ 迁到 run/', () => {
     const { home, legacy } = legacyHome()
     const current = join(home, 'run', 'executors', 'codex-orca', 'codex-home')
     mkdirSync(current, { recursive: true })
+    symlinkSync(join(home, 'auth-source', 'auth.json'), join(legacy.orca, 'auth.json'))
+    writeFileSync(join(current, 'auth.json'), '{"placeholder":true}')
     const logs: string[] = []
     const result = await migrateCodexHomes(home, (m) => logs.push(m))
     expect(result.migrated).not.toContain(current)
-    expect(logs.some((m) => m.includes('同时存在'))).toBe(true)
+    const conflict = logs.find((m) => m.includes('同时存在')) ?? ''
+    // 只报告两处 auth.json 的存在性与是否为链接，不含内容。
+    expect(conflict).toContain(`${legacy.orca}：auth.json 是链接`)
+    expect(conflict).toContain(`${current}：auth.json 是普通文件`)
+    expect(conflict).not.toContain('placeholder')
     expect(lstatSync(legacy.orca).isDirectory()).toBe(true)
     expect(orcaCodexHome(home)).toBe(legacy.orca)
     expect(readFileSync(join(legacy.orca, 'sessions', 'rollout.jsonl'), 'utf8')).toBe('会话-orca')
@@ -287,6 +296,7 @@ describe('CODEX_HOME 从 state/ 迁到 run/', () => {
     expect(result.migrated).toEqual([])
     expect(logs.length).toBe(3)
     expect(logs.every((m) => m.includes('继续使用旧位置'))).toBe(true)
+    expect(readdirSync(join(home, 'state')).filter((n) => n.endsWith('.link'))).toEqual([])
     for (const name of ['orca', 'exec', 'read'] as const) {
       expect(lstatSync(legacy[name]).isDirectory()).toBe(true)
       expect(readFileSync(join(legacy[name], 'sessions', 'rollout.jsonl'), 'utf8')).toBe(

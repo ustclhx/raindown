@@ -25,11 +25,13 @@ export const SANDBOX_SETTINGS = [
 ] as const
 export type SandboxSetting = (typeof SANDBOX_SETTINGS)[number]
 const sandboxSettingKey = z.string().regex(/^[a-z][a-z0-9-]{0,63}$/)
+/** 写侧接受格式合法的未知施加层（较新节点的新取值不会让旧中枢拒绝注册），读侧与查询按 none 处理。 */
+const futureLayer = z.string().regex(/^[a-z][a-z0-9_-]{0,63}$/)
 
 export const credentialIsolation = z
   .object({
-    layers: z.record(sandboxSettingKey, isolationLayer).meta({
-      description: `按角色沙箱设置声明的施加层；已知设置：${SANDBOX_SETTINGS.join('、')}。未列出的设置视为 none`,
+    layers: z.record(sandboxSettingKey, isolationLayer.or(futureLayer)).meta({
+      description: `按角色沙箱设置声明的施加层（已知取值：${ISOLATION_LAYERS.join('、')}；不认识的取值按 none）；已知设置：${SANDBOX_SETTINGS.join('、')}。未列出的设置视为 none`,
     }),
     enforced: z.boolean().meta({
       description:
@@ -39,9 +41,12 @@ export const credentialIsolation = z
   .meta({ title: 'Credential isolation' })
 export type CredentialIsolation = z.infer<typeof credentialIsolation>
 
-/** 读侧逐项降级：不认识的施加层值按 none（方向保守），layers 或 enforced 不合法时分别退回空表与 false。 */
+/**
+ * 读侧逐项降级：格式合法的未知施加层原样保留（展示时标明“未知”，`credentialIsolationFor` 按 none 处理），
+ * 不合法的取值按 none；layers 或 enforced 不合法时分别退回空表与 false。
+ */
 const readCredentialIsolation = z.object({
-  layers: z.record(z.string(), isolationLayer.catch('none')).catch({}),
+  layers: z.record(z.string(), isolationLayer.or(futureLayer).catch('none')).catch({}),
   enforced: z.boolean().catch(false),
 })
 

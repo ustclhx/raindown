@@ -16,10 +16,11 @@ import {
   createClaudeSdkExecutor,
   type ExecutorContext,
   type ExecutorOutcome,
+  legacyReviewRoot,
   READ_ROLE_TOOLS,
   REVIEW_DIFF_FILE,
   readRoleMayUse,
-  reviewRoot,
+  reviewDir as reviewDirOf,
 } from '../src/index.ts'
 import { fakeGh, gitEnv, PR_URL, sh, type TempRepo, tempRepo } from './github-helpers.ts'
 
@@ -213,7 +214,7 @@ async function preToolUse(
   return out.hookSpecificOutput?.permissionDecision ?? 'pass'
 }
 
-const reviewDir = (r: TempRepo, task = 't-review') => join(reviewRoot(r.home, 'n-test'), task)
+const reviewDir = (r: TempRepo, task = 't-review') => reviewDirOf(r.home, 'n-test', task)
 
 const reasonOf = (o: ExecutorOutcome) =>
   o.outcome === 'failed' || o.outcome === 'done' ? o.result.reason : undefined
@@ -276,6 +277,9 @@ describe('审查准备', () => {
     expect(o?.allowedTools).toContain('StructuredOutput')
     // 结束后移除 worktree 与私有目录，登记仓库里不留 worktree 记录。
     expect(existsSync(reviewDir(r))).toBe(false)
+    // 审查目录位于 state/ 之外的本任务私有目录；结束后变空的任务目录一并删除。
+    expect(reviewDir(r)).toBe(join(r.home, 'run', 'tasks', 't-review', 'review', 'n-test'))
+    expect(existsSync(join(r.home, 'run', 'tasks', 't-review'))).toBe(false)
     expect(sh(r.repo, 'worktree', 'list')).not.toContain('worktree')
     // 任务专用 ref 已删除；会话不加载任何设置来源，只用 Raindown MCP，git 覆盖经环境注入。
     expect(sh(r.repo, 'for-each-ref', 'refs/raindown/')).toBe('')
@@ -458,16 +462,27 @@ describe('审查准备', () => {
     mkdirSync(dir, { recursive: true })
     writeFileSync(join(dir, 'meta.json'), JSON.stringify({ repo: r.repo }))
     sh(r.repo, 'worktree', 'add', '--detach', join(dir, 'worktree'), r.base)
-    const other = join(reviewRoot(r.home, 'n-other'), 't-x')
+    const other = reviewDirOf(r.home, 'n-other', 't-x')
     mkdirSync(other, { recursive: true })
+    // 旧位置 state/review/<node>/<task>/ 的残留同样清理，其他节点的旧目录不动。
+    const legacy = join(legacyReviewRoot(r.home, 'n-test'), 't-old')
+    mkdirSync(legacy, { recursive: true })
+    writeFileSync(join(legacy, 'meta.json'), JSON.stringify({ repo: r.repo }))
+    sh(r.repo, 'worktree', 'add', '--detach', join(legacy, 'worktree'), r.base)
+    const legacyOther = join(legacyReviewRoot(r.home, 'n-other'), 't-y')
+    mkdirSync(legacyOther, { recursive: true })
     const { query } = mockQuery(async function* () {
       yield resultMsg()
     })
     const ex = createClaudeSdkExecutor({ home: r.home, query, git: { env: gitEnv } })
     await ex.prepare?.({ nodeId: 'n-test' })
     expect(existsSync(dir)).toBe(false)
+    expect(existsSync(join(r.home, 'run', 'tasks', 't-stale'))).toBe(false)
     expect(sh(r.repo, 'worktree', 'list')).not.toContain('t-stale')
     expect(existsSync(other)).toBe(true)
+    expect(existsSync(legacy)).toBe(false)
+    expect(sh(r.repo, 'worktree', 'list')).not.toContain('t-old')
+    expect(existsSync(legacyOther)).toBe(true)
     // 没有残留目录时不报错。
     await cleanupStaleReviews(r.home, 'n-none')
   })

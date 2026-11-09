@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { chmod, lstat, mkdir, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, readdir, rename, rm, rmdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { raindownPaths, runTasksDir, taskRunDir } from '@raindown/core'
 
@@ -57,22 +57,46 @@ export async function removeLeaseTokenFile(path: string): Promise<void> {
 }
 
 /**
+ * 删除变空的任务私有目录：依次尝试删除 `subdirs`（相对 `run/tasks/<任务>/`，由深到浅）与任务目录本身。
+ * 只用 rmdir：非空目录、符号链接与不存在的路径都保持原样，不抛出。
+ */
+export async function removeEmptyTaskRunDir(
+  home: string,
+  taskId: string,
+  subdirs: readonly string[] = [TOKEN_DIR],
+): Promise<void> {
+  if (!SAFE_SEGMENT.test(taskId)) return
+  const root = taskRunDir(home, taskId)
+  for (const dir of [...subdirs.map((d) => join(root, d)), root]) {
+    try {
+      await rmdir(dir)
+    } catch {
+      // 非空、不存在或不是目录：留给之后的清理。
+    }
+  }
+}
+
+/**
  * 节点已持有单实例锁。只清理受管目录中的凭证文件，不递归删除任务产物或跟随符号链接。
  * 同时清理新位置（`run/tasks/`）与旧位置（`state/tasks/`）：节点重启后所有租约凭证都已失效，旧位置的凭证不必迁移。
  */
 export async function cleanLeaseTokenFiles(home: string): Promise<void> {
-  await cleanTokenRoot(runTasksDir(home))
+  for (const task of await cleanTokenRoot(runTasksDir(home)))
+    await removeEmptyTaskRunDir(home, task, [TOKEN_DIR])
   await cleanTokenRoot(legacyTasksDir(home))
 }
 
-async function cleanTokenRoot(tasks: string): Promise<void> {
+/** 清理一个任务根目录下的凭证文件，返回检查过的任务 id。 */
+async function cleanTokenRoot(tasks: string): Promise<string[]> {
+  const seen: string[] = []
   const info = await lstat(tasks).catch((err: NodeJS.ErrnoException) => {
     if (err.code === 'ENOENT') return undefined
     throw err
   })
-  if (!info?.isDirectory() || info.isSymbolicLink()) return
+  if (!info?.isDirectory() || info.isSymbolicLink()) return seen
   for (const task of await readdir(tasks, { withFileTypes: true })) {
     if (!task.isDirectory() || !SAFE_SEGMENT.test(task.name)) continue
+    seen.push(task.name)
     const dir = join(tasks, task.name, TOKEN_DIR)
     const tokens = await lstat(dir).catch((err: NodeJS.ErrnoException) => {
       if (err.code === 'ENOENT') return undefined
@@ -85,4 +109,5 @@ async function cleanTokenRoot(tasks: string): Promise<void> {
       }
     }
   }
+  return seen
 }

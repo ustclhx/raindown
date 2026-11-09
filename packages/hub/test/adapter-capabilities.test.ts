@@ -220,7 +220,7 @@ describe('凭证隔离能力 credential_isolation（worker-credential-isolation 
     ).toEqual({ reported: false, layer: 'none', enforced: false })
   })
 
-  test('HTTP 注册接受未来的沙箱设置键，施加层取值错误仍拒绝', async () => {
+  test('HTTP 注册接受未来的沙箱设置键与格式合法的未知施加层（查询按 none），格式错误仍拒绝', async () => {
     const { routes } = await setup()
     const register = (credential_isolation: unknown) =>
       routes.request('/v1/nodes', {
@@ -243,8 +243,21 @@ describe('凭证隔离能力 credential_isolation（worker-credential-isolation 
       { layers: { 'future-sandbox': 'seatbelt' }, enforced: false },
     )
     expect(
-      (await register({ layers: { 'read-only': 'future-layer' }, enforced: false })).status,
+      (await register({ layers: { 'read-only': 'Bad Layer!' }, enforced: false })).status,
     ).toBe(400)
+    const unknownLayer = await register({ layers: { 'read-only': 'future-layer' }, enforced: true })
+    expect(unknownLayer.status).toBe(200)
+    const body = (await unknownLayer.json()) as {
+      data: { node: { executors: Array<{ adapter_capabilities: AdapterCapabilities }> } }
+    }
+    const caps = body.data.node.executors[0]?.adapter_capabilities ?? NO_ADAPTER_CAPABILITIES
+    expect(caps.credential_isolation?.layers).toEqual({ 'read-only': 'future-layer' })
+    // 新节点的未知施加层不能被当作已支持的隔离。
+    expect(credentialIsolationFor(caps, 'read-only')).toEqual({
+      reported: true,
+      layer: 'none',
+      enforced: false,
+    })
     expect((await register({ layers: {}, enforced: 'no' })).status).toBe(400)
   })
 
@@ -265,7 +278,11 @@ describe('凭证隔离能力 credential_isolation（worker-credential-isolation 
             ...NO_ADAPTER_CAPABILITIES,
             inject_while_running: true,
             credential_isolation: {
-              layers: { 'danger-full-access': 'future-layer', 'read-only': 'native' },
+              layers: {
+                'danger-full-access': 'future-layer',
+                'read-only': 'native',
+                'workspace-write': 42,
+              },
               enforced: 'unknown',
               future_field: 1,
             },
@@ -300,7 +317,11 @@ describe('凭证隔离能力 credential_isolation（worker-credential-isolation 
         ...NO_ADAPTER_CAPABILITIES,
         inject_while_running: true,
         credential_isolation: {
-          layers: { 'danger-full-access': 'none', 'read-only': 'native' },
+          layers: {
+            'danger-full-access': 'future-layer',
+            'read-only': 'native',
+            'workspace-write': 'none',
+          },
           enforced: false,
         },
       })

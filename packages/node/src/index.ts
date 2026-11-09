@@ -152,6 +152,7 @@ export {
 export {
   cleanLeaseTokenFiles,
   leaseTokenDir,
+  removeEmptyTaskRunDir,
   removeLeaseTokenFile,
   writeLeaseTokenFile,
 } from './lease-token.ts'
@@ -199,12 +200,13 @@ export {
 } from './precheck.ts'
 export {
   cleanupStaleReviews,
+  legacyReviewRoot,
   type PreparedReview,
   prepareReview,
   REVIEW_DIFF_FILE,
   REVIEW_REF_PREFIX,
+  reviewDir,
   reviewRef,
-  reviewRoot,
 } from './review-prep.ts'
 export {
   cleanWakeTokenDir,
