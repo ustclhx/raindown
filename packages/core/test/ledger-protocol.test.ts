@@ -387,7 +387,7 @@ describe('守护进程配置', () => {
         capabilities: [],
         concurrency: 1,
         reserved: { supervisor: 1, reply: 1 },
-        isolation: { enforce: false },
+        isolation: { enforce: false, extra_write: [] },
       },
     })
   })

@@ -21,6 +21,7 @@ import type { IsolationSpec } from './spec.ts'
  * - `read`：打开并读取最多 1 字节，字节立即丢弃，不记录、不上报、不打印；
  * - `read_via_symlink`：在探针工作目录里建一个指向目标的符号链接，经链接读取（验证 realpath 规范化），结束后删除链接；
  * - `write_new`：在目标目录下以独占方式新建一个探针文件，成功则立即删除；
+ * - `create_file`：以独占方式新建**指定路径**的文件（例如模拟的 shell 启动文件），成功则立即删除；只用于探针自建的临时目录；
  * - `open_write`：以读写方式打开已有文件后立即关闭，不写入、不截断（验证本任务的 seatbelt 配置不可改写）；
  * - `rename`：把探针自己在临时位置造的目录改名，成功则立即改回（验证受保护路径的祖先目录不可改名；绝不对真实目录使用）；
  * - `unix_connect` / `tcp_connect`：只建立连接后立即关闭，不发送任何数据；
@@ -31,6 +32,7 @@ export const PROBE_KINDS = [
   'read',
   'read_via_symlink',
   'write_new',
+  'create_file',
   'open_write',
   'rename',
   'unix_connect',
@@ -100,14 +102,27 @@ export interface ProbePlanInput {
   renameTarget?: string
   /** 本次探针实际使用的 seatbelt 配置文件（施加 seatbelt 时存在；不存在时该项按目标不存在跳过）。 */
   profilePath?: string
+  /**
+   * 写白名单探针（tasks 4.6）：探针自建的临时 home 中模拟的 shell 启动文件路径（例如 `<临时 home>/.zshenv`），
+   * 位于写白名单之外；绝不指向真实的用户主目录。缺省时该项记为跳过。
+   */
+  shellStartupFile?: string
+  /** 探针自建的临时仓库（按登记仓库同规则计算白名单）中 `.git/hooks/` 下的文件路径。缺省时该项记为跳过。 */
+  gitHookFile?: string
+  /** 同一临时仓库的 `.git/objects/`：写类角色应可写（worktree 必需），只读角色应拒绝。 */
+  gitObjectsDir?: string
 }
 
 const isWithinPath = (parent: string, child: string) =>
   child === parent || child.startsWith(parent.endsWith('/') ? parent : `${parent}/`)
 
+/** 按清单的写白名单与写拒绝判断某路径是否应可写（写拒绝优先）。 */
+const writableBySpec = (spec: IsolationSpec, path: string, allow: readonly string[]) =>
+  allow.some((p) => isWithinPath(p, path)) && !spec.deny_write.some((p) => isWithinPath(p, path))
+
 /**
  * 从隔离清单推导探针清单。受保护项总是预期拒绝（不因清单遗漏而改成允许，遗漏会以失败项暴露）；
- * 工作目录是否可写按清单的 `allow_write` 决定；Orca 端口取清单中解析出的端口，未解析时记为跳过。
+ * 工作目录是否可写按清单的 `allow_write` 与 `deny_write` 决定；Orca 端口取清单中解析出的端口，未解析时记为跳过。
  */
 export function buildProbePlan(input: ProbePlanInput): ProbePlan {
   const paths = raindownPaths(input.home)
@@ -205,7 +220,45 @@ export function buildProbePlan(input: ProbePlanInput): ProbePlan {
     expected: 'deny',
     unverified: PROCESS_DEBUG_UNVERIFIED,
   })
-  const cwdWritable = input.spec.allow_write.some((p) => isWithinPath(p, input.cwd))
+  // 写白名单（tasks 4.6）：白名单之外的模拟 shell 启动文件、登记仓库同规则下的 .git/hooks 都应拒绝。
+  items.push(
+    input.shellStartupFile
+      ? {
+          item: 'write.shell_startup',
+          kind: 'create_file',
+          expected: 'deny',
+          target: input.shellStartupFile,
+        }
+      : {
+          item: 'write.shell_startup',
+          kind: 'create_file',
+          expected: 'deny',
+          skip: '没有提供探针的临时 home',
+        },
+    input.gitHookFile
+      ? {
+          item: 'write.git_hooks',
+          kind: 'create_file',
+          expected: 'deny',
+          target: input.gitHookFile,
+        }
+      : {
+          item: 'write.git_hooks',
+          kind: 'create_file',
+          expected: 'deny',
+          skip: '没有提供探针的临时仓库',
+        },
+  )
+  if (input.gitObjectsDir)
+    items.push({
+      item: 'write.git_objects',
+      kind: 'write_new',
+      expected: writableBySpec(input.spec, input.gitObjectsDir, input.spec.allow_write_git)
+        ? 'allow'
+        : 'deny',
+      target: input.gitObjectsDir,
+    })
+  const cwdWritable = writableBySpec(input.spec, input.cwd, input.spec.allow_write)
   items.push(
     {
       item: 'write.workdir',

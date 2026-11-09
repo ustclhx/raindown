@@ -1026,18 +1026,20 @@ isolation:
   没有改用 `sandbox-exec -p <配置文本>`：codex-orca 的终端命令是一行 shell 文本，多行配置（含 `;;` 注释）需要额外改写与引号。
   执行结束、节点启动清理时删除。
 - 结构：`(version 1)(allow default)`，之后依次是：
-  1. 最窄允许项（工作目录、派工令牌、harness 目录、中枢端口）；
+  0. `(deny file-write*)`：写入是白名单（4.6，见下文「写白名单」）；
+  1. 最窄允许项（工作目录、派工令牌、harness 目录、中枢端口）与写白名单；白名单内再挖掉登记仓库的 git 目录、`.git` 指针文件与 harness 配置（1a），
+     再放行 worktree 必需的 git 部分（1b）；
   2. `deny_read` → `(deny file-read* (subpath …))`，`deny_write` → `(deny file-write* (subpath …))`；
   3. `deny_children_except` → `(deny file-read* file-write* (require-all (subpath <dir>) (require-not (literal <dir>)) (require-not (subpath <keep>))))`；
-  4. **受保护路径的全部祖先目录**（每个 `deny_read` / `deny_write` / unix 套接字目录的上级直到 `/`，以及 `deny_children_except` 的 `dir`
-     本身及其上级）→ `(deny file-write* (literal …))`（审查第一轮 H1）：拒绝规则按路径匹配，改名任何一级祖先目录（`mv home home2`）
+  4. **受保护路径的全部祖先目录**（每个 `deny_read` / `deny_write` / unix 套接字目录、1a 中挖掉的位置的上级直到 `/`，以及 `deny_children_except` 的 `dir`
+     本身及其上级）→ `(deny file-write* (literal …))`（审查第一轮 H1；挖掉的位置为 4.6 新增：否则改名工作目录后其中的 `.git` 指针不再匹配）：拒绝规则按路径匹配，改名任何一级祖先目录（`mv home home2`）
      就能在新路径下读到受保护文件。`literal` 只拒绝对目录节点本身的写（改名、删除、改属性），在这些目录里新建、修改、改名其他文件、
      子目录与符号链接不受影响（macOS 实测覆盖工作目录、CODEX_HOME、本任务目录、用户主目录）；
   5. Orca 运行时目录 → `(deny network-outbound (remote unix-socket (subpath …)))`；已解析的 Orca 端口 → `(deny network-outbound (remote ip "*:<端口>"))`；
      **其他本机端口不拒绝**；
   6. `(deny mach-priv-task-port (target others))`、`(deny mach-task-name (target others))`。
 - **允许项写在拒绝项之前（拒绝优先）**，与 `IsolationSpec` 的约定一致：`computeIsolationSpec` 已保证允许项不落在任何读拒绝目录内，
-  在 `allow default` 下允许项只作记录；而只读语义（派工令牌、令牌目录、只读工作目录）以写拒绝表示，写在最后才能保证它们即使位于可写目录内也不可写。
+  在 `allow default` 下读放行只作记录，写放行只抵消第 0 步的默认写拒绝；而只读语义（派工令牌、令牌目录、只读工作目录）以写拒绝表示，写在最后才能保证它们即使位于可写目录内也不可写。
 - 路径一律内联为 SBPL 字符串字面量，严格转义 `\` 与 `"`；路径含控制字符（C0、DEL、C1，含 NUL、换行、回车、制表符）或不是绝对路径时返回
   `isolation_profile_invalid_path`、不生成配置；端口与操作名同样校验。没有过滤器的规则（会拒绝全部操作）从不生成。
   没有改用 `sandbox-exec -D KEY=VALUE` + `(param …)`：配置文件因此自包含，探针与 worker 共用同一份文件与同一条命令前缀，
@@ -1076,6 +1078,94 @@ isolation:
   supervisor 角色是只读配置，属于协调者；这一边界在 6.1 的角色要求中需要单独处理。
 - claude-sdk 的 `spawnClaudeCodeProcess` 启动失败（例如 `sandbox-exec` 不存在）时不会让节点崩溃，原因写入 stderr 尾部（脱敏后）随失败结果上报。
 
+### 写白名单（worker-credential-isolation 4.6）
+
+用户 2026-11-09 选定写入白名单（design D2、Risks）：`allow default` 之后紧接 `(deny file-write*)`，只放行下表位置；受保护项的拒绝写在全部放行之后，
+白名单不能重新放开它们。读取、网络、进程不受影响。计算在 core 的 `computeIsolationSpec` 与 `write-allowlist.ts`，路径全部 realpath。
+
+| 类别 | 可写位置 | 适用 |
+| --- | --- | --- |
+| 工作目录 | 本任务工作目录 | 写类角色（只读角色以写拒绝表示） |
+| 本任务私有目录 | `run/tasks/<任务>/`（`dispatch-tokens/` 与派工令牌仍拒绝） | 全部 |
+| Codex | Raindown 管理的 CODEX_HOME（`config.toml`、`prompts/`、`rules/`、`hooks.json`、`AGENTS.md`、`AGENTS.override.md`、`skills/`、`plugins/` 除外）；`auth.json` 链接的目标**这一个文件**（凭证刷新经链接写回用户的 `auth.json`） | codex-orca、codex-exec |
+| Claude Code | Raindown 管理的配置目录 `run/executors/claude-sdk/claude-config/`（`settings.json`、`settings.local.json`、`CLAUDE.md`、`commands/`、`agents/`、`skills/`、`hooks/`、`plugins/`、`rules/`、`output-styles/`、`keybindings.json`、`managed-settings.json`、`.mcp.json` 除外） | claude-sdk |
+| 临时目录 | `/private/tmp`、本用户 `TMPDIR`（`/private/var/folders/<x>/<y>/T`）及同级 `C/`；**`/private/tmp/claude-<uid>` 除外**（用户自己的 Claude Code 会话的临时文件） | 全部 |
+| 设备 | `/dev/null`、`/dev/zero`、`/dev/tty`、`/dev/ptmx`、`/dev/ttys<N>`（固定正则）、`/dev/fd/`、`/dev/stdout`、`/dev/stderr`、`/dev/random`、`/dev/urandom`、`/dev/dtracehelper` | 全部 |
+| 缓存 | `~/.cache`、`~/Library/Caches`、`~/.bun/install/cache`、`~/.npm/_cacache`、`~/.npm/_logs`、`~/Library/pnpm/store`、`~/.local/share/pnpm/store`（不含 `~/.npmrc`、`~/.bunfig.toml`、`~/.bun/bin`、`~/.npm/_npx`、`~/Library/pnpm` 本身） | 全部 |
+| 钥匙串 | `~/Library/Keychains`（Claude Code 经 `security add-generic-password` 刷新 OAuth 凭证、git 的 osxkeychain 凭证助手，写入发生在调用进程内） | 全部 |
+| 登记仓库 `.git` | 见下 | 写类角色 |
+| 追加 | `config/node.yaml` 的 `isolation.extra_write` | 全部 |
+
+**登记仓库 `.git`。** 从工作目录向上找到 `.git`，只读指针文件（`gitdir:`、`commondir`），不运行 git。仓库的 git 目录（本 worktree 的 gitdir 与共享的
+主仓库 `.git`）整体先从白名单中挖掉（即使位于临时目录等可写位置内），linked worktree 的 `.git` 指针文件同样挖掉；写类角色再放行：
+
+- 共享 `.git`：`objects/`、`refs/`、`logs/`、`lfs/`、`rr-cache/`；单个文件 `packed-refs`、`packed-refs.lock`、`packed-refs.new`、`gc.pid`、`gc.pid.lock`、
+  `gc.log`、`gc.log.lock`、`shallow`、`shallow.lock`、`HEAD.lock`；
+- linked worktree：本 worktree 的 `worktrees/<自己>/`（其中 `commondir`、`gitdir`、`config.worktree` 最后再拒绝：改写它们可以让沙箱外在本 worktree
+  中运行的 git 改用伪造的仓库及其 hooks、config）；
+- 其他已存在的 worktree：只有 `worktrees/<其他>/HEAD.lock`、`logs/HEAD`、`logs/HEAD.lock`（`git gc` 的 `reflog expire --all` 需要；锁文件不能改名成
+  HEAD，因为 HEAD 本身不可写）；
+- 主 worktree（工作目录就是登记仓库）：每个 worktree 的状态文件直接位于共享 `.git` 下，另放行 `HEAD`、`index`、`ORIG_HEAD`、`FETCH_HEAD`、
+  `COMMIT_EDITMSG`、`MERGE_*`、`AUTO_MERGE`、`CHERRY_PICK_HEAD`、`REVERT_HEAD`、`REBASE_HEAD`、`SQUASH_MSG`、`TAG_EDITMSG`、`BISECT_*` 及各自的 `.lock`，
+  与 `rebase-merge/`、`rebase-apply/`、`sequencer/`。
+
+`hooks/`、`config`、`info/`、`modules/` 在最后显式拒绝，其他 worktree 的其余内容不可写。只读角色不放行任何 git 部分。
+
+指针可能被之前未隔离的进程改写成指向任意目录（例如用户主目录），按它放行 gitdir 子树就等于放开白名单。因此只有与 git 自己的检查一致的指针才放行：
+linked worktree 的 gitdir 必须是 `<共享 .git>/worktrees/<名字>/` 且其 `gitdir` 文件回指本 `.git`；没有 `commondir` 时（`--separate-git-dir`）gitdir 必须有
+`HEAD` 与 `objects/`。指针不可解析、`.git` 是符号链接或不满足上述条件时，只挖掉、拒绝，不放行任何 git 部分（git 写操作会失败）。
+
+这一最小集合由 macOS 上真实 `/usr/bin/sandbox-exec` + git（临时仓库、本地远端）实测确定（`packages/core/test/isolation-write-allowlist.test.ts`）：
+linked worktree 中 commit、branch、checkout、`fetch`、merge、stash、tag、rebase、`pack-refs`、`gc --auto`、`gc`、`branch -D`、`commit --amend`、`reset`
+都成功；主 worktree 同样。实测中逐项补上的位置：`packed-refs.lock` / `packed-refs.new`（删除 tag 与分支、`pack-refs`）、`gc.pid.lock`、`HEAD.lock`
+（`gc` 锁主 worktree 的 HEAD）、其他 worktree 的 `HEAD.lock` 与 reflog。`FETCH_HEAD`、`ORIG_HEAD`、`index` 在 linked worktree 中位于 `worktrees/<自己>/`。
+
+已知限制（实测）：
+
+- **设置上游要写 `.git/config`，会失败**：`git checkout -b x origin/main`（自动跟踪）、`git branch --set-upstream-to`、`git push -u` 的跟踪配置。
+  改用 `git checkout --no-track -b x origin/main`、`git push origin HEAD:<分支>`。`git branch -D` 顺带删除 `branch.<名>` 配置节失败只告警（退出码 0）。
+- `git worktree add` 失败（要新建 `worktrees/<新>`）：worktree 由 Orca 或节点在沙箱外创建。
+- `git gc` 结束时更新 `.git/info/refs` 失败只告警（退出码 0）；`worktree prune` 删除失效的 worktree 管理目录、`git submodule` 写 `modules/` 会失败。
+- 计算清单之后才新建的 worktree 不在“其他 worktree 的 reflog”内，之后的 `git gc` 会在它上面报错。
+
+**Claude Code 的配置目录。** 用户自己的 `~/.claude` 与 `~/.claude.json` 不能放行：`~/.claude/shell-snapshots/` 会被用户自己（沙箱外）的 Claude Code 会话在
+每条 Bash 命令前 source，`~/.claude/projects/<项目>/memory/` 进入用户会话的系统提示词，`~/.claude.json` 可以按项目配置 MCP 服务器（命令），`settings.json`
+可以配置 hooks。因此 claude-sdk 施加外层 seatbelt 时（只对 worker 会话；supervisor 唤醒会话不施加，也不使用这个目录）：
+
+- `CLAUDE_CONFIG_DIR` 指向 `run/executors/claude-sdk/claude-config/`（0700，节点每次启动会话前准备）。用户配置目录（`CLAUDE_CONFIG_DIR`，缺省 `~/.claude`）中的
+  `settings.json`、`CLAUDE.md`、`commands/`、`agents/`、`skills/`、`output-styles/`、`plugins/` 以符号链接只读引入（`setting_sources` 含 `user` 时与不施加时一致）；
+  Claude Code 的全局状态 `.claude.json`、会话记录、shell 快照等写在这个目录里，只被之后同样受隔离的 claude-sdk 会话使用。
+- `CLAUDE_SECURESTORAGE_CONFIG_DIR` 设为用户原来的 `CLAUDE_CONFIG_DIR`（没有时为空串），登录凭证仍取自原来的钥匙串条目：Claude Code 2.1.310 的二进制中，
+  钥匙串服务名在设置 `CLAUDE_CONFIG_DIR` 时会加上按目录计算的后缀，`CLAUDE_SECURESTORAGE_CONFIG_DIR` 为空串时不加后缀（缺省条目
+  `Claude Code-credentials`），为某目录时按该目录计算（与以 `CLAUDE_CONFIG_DIR=<该目录>` 登录时相同）。没有运行真实 Claude Code 验证（4.5 验收确认）。
+- `CLAUDE_CODE_TMPDIR` 设为本用户 `TMPDIR`：缺省的 `/tmp/claude-<uid>` 属于用户自己的会话，worker 不可写。
+- 变化：开关打开前的 claude-sdk 会话记录在用户目录中，打开后恢复这些会话会找不到（新会话不受影响）；用户级插件的自动更新写入失败。
+
+**追加可写目录。** 新工具需要写自己的缓存或数据目录时，在 `config/node.yaml` 中追加并重启节点：
+
+```yaml
+isolation:
+  enforce: true
+  extra_write:
+    - /Users/me/Library/Developer/Xcode/DerivedData
+```
+
+只接受绝对路径；不能是 `/`、用户主目录或其祖先，不能与受保护路径（raindown-home、私钥目录、LaunchAgents、Orca 目录、派工令牌等）或持久化位置
+（shell 启动文件、`~/.gitconfig`、`~/.config/git`、`~/.config/gh`、`~/.ssh`、`~/.local/bin`、`~/.bun/bin`、`~/.npmrc`、`~/.bunfig.toml`、`~/.claude`、
+`~/.claude.json`、`~/.codex` 等）互相包含，否则 harness 不启动，任务以 `isolation_extra_write_invalid` 失败。`raindown doctor` 显示 `isolation.extra_write`，
+并预先检查用户主目录、持久化位置与 raindown-home。只追加工具的缓存或数据子目录，不要追加会被执行的位置（bin 目录、配置文件）。
+
+**4.5 验收时按失败追加。** 白名单拒绝的写入在 worker 中表现为 `Operation not permitted`（`EPERM`）。排查：
+
+1. 在 worker 输出或 harness 日志中找 `Operation not permitted` 的路径；也可以在本机 `log stream --style compact --predicate 'sender == "Sandbox"'`
+   观察 `deny(1) file-write-create <路径>`。
+2. 路径属于工具自己的缓存或数据目录（例如 `~/Library/Application Support/<工具>`）：追加到 `isolation.extra_write`（尽量具体到子目录）。
+3. 路径属于 harness 运行状态（CODEX_HOME、Claude 配置目录之外）：改适配器声明（`codexHarnessPaths`、`CLAUDE_CONFIG_DENY_WRITE`）并补测试，不要用 `extra_write` 绕过。
+4. 路径是 `.git/config`、hooks、shell 启动文件、`~/.gitconfig` 等：这是白名单要拦住的写入，改用不写这些位置的做法（例如上游配置见上）。
+
+**残留风险**（design Risks）：缓存目录本身就是持久化通道（例如 `~/.bun/install/cache`、`~/Library/Caches` 中的包或浏览器二进制会被之后沙箱外的安装、运行直接使用），
+临时目录中沙箱外进程随后执行的脚本同理；CODEX_HOME 与 Claude 隔离配置目录中的会话记录可被改写（提示注入，不是命令执行）。
+
 ### `native`（Codex permissions profile）
 
 本阶段**没有实现**，留给 tasks 5.1：开关打开时 codex-orca、codex-exec 的 `workspace-write`、`read-only` 设置声明为 `none`，
@@ -1085,9 +1175,8 @@ isolation:
 
 - 外层 seatbelt 下同一执行器的 harness 凭证（CODEX_HOME 中链接到 `~/.codex/auth.json` 的登录凭证、`~/.claude`）与其他任务的会话记录仍可读（design D2、Risks）。
 - 同一用户的进程环境变量可读、可以互相发信号，seatbelt 拦不住（见「隔离实测」第 6 点）。
-- **持久化写入（未解决，4.6）**：`allow default` 下 worker 仍能写入之后在沙箱外执行的文件（shell 启动文件、登记仓库共享的 `.git/hooks` 与
-  `.git/config`、`~/.gitconfig`、用户可写的 PATH 目录、`~/.ssh/config` 等），由沙箱外的进程执行后即脱离隔离。真实开启（4.5）之前必须先完成 4.6，
-  见 design 的 Risks。
+- **持久化写入**：4.6 起写入为白名单（见下文「写白名单」），shell 启动文件、登记仓库共享的 `.git/hooks` 与 `.git/config`、`~/.gitconfig`、
+  用户可写的 PATH 目录、`~/.ssh/` 等都不可写。白名单内的缓存与临时目录仍是持久化通道（残留，见「写白名单」的“残留风险”）。
 - worker 内的 `raindown mcp` 进程同样在沙箱内：`raindown` 可执行文件、bun 与 Raindown 仓库必须位于 raindown-home 之外，否则任务绑定的 MCP 无法启动（4.5 验收时确认）。
 
 ### 回滚
@@ -1102,6 +1191,10 @@ isolation:
 claude-sdk 多声明一个沙箱设置 `supervisor-session → none`。探针每轮多三项：`rename.protected_ancestor`、`write.own_profile`（未施加时为
 可改名 / 跳过）与按只读方式解析出的 Orca 端口（每轮运行一次 `lsof`，只读，不连接 Orca）；未施加时探针本来就不通过，结论不变。
 `config/node.yaml` 打开开关但不在 macOS 上时，doctor 给出 warning“开关打开但平台不支持，未施加”（审查第一轮 L3）。
+
+4.6（写白名单）部署后，开关关闭时同样不改变启动方式：`node.yaml` 多一个可选字段 `isolation.extra_write`（缺省空表，非空时 doctor 显示）；
+探针每轮多 `write.shell_startup`、`write.git_hooks`、`write.git_objects` 三项，在 `run/isolation-probe-<hex>/` 下自建模拟 home 与模拟仓库，结束即删除
+（节点启动与每次探针前也清理残留）；未施加时前两项为“可写”，探针本来就不通过，结论不变。claude-sdk 的隔离配置目录只在开关打开时创建与使用。
 
 ## 隔离自检探针（worker-credential-isolation 3.1–3.2）
 
@@ -1141,6 +1234,9 @@ claude-sdk 多声明一个沙箱设置 `supervisor-session → none`。探针每
 | `connect.orca_port.<端口>` | 拒绝 | 对解析出的 Orca 本机端口只建立 TCP 连接后立即关闭；端口未解析时为**失败**（无法证明控制端口被拒绝），本机没有 Orca 运行时目录时为“跳过” |
 | `rename.protected_ancestor` | 拒绝 | 在探针临时任务目录（`run/tasks/isolation-probe-self-*/rename-probe/`）下自建 `a/b/secret`，把 `secret` 加入本次探针清单的受保护项，尝试改名 `a`（受保护路径的祖先）；成功则立即改回。**只操作探针自建的临时目录树，绝不改名真实目录** |
 | `write.own_profile` | 拒绝 | 以读写方式打开本次探针实际使用的 seatbelt 配置（`state/tasks/<探针任务>/isolation.sb`）后立即关闭，不写入；未施加时没有配置文件，记为跳过 |
+| `write.shell_startup` | 拒绝 | 写白名单（4.6）：在探针自建的 `run/isolation-probe-<hex>/home/` 中独占新建 `.zshenv`（白名单之外）；成功则立即删除。**不碰真实的 `~/.zshenv`** |
+| `write.git_hooks` | 拒绝 | 写白名单（4.6）：探针工作目录是自建的模拟仓库 `run/isolation-probe-<hex>/repo/.git` 的 linked worktree（只写指针文件，不运行 git），按登记仓库同规则计算白名单；独占新建 `.git/hooks/post-checkout`，成功则立即删除 |
+| `write.git_objects` | 可写（只读角色为拒绝） | 同一模拟仓库的 `.git/objects/` 中新建探针文件后删除（worktree 必需部分可用） |
 | `debug.process` | 拒绝 | **未验证**，原因见下 |
 | `write.workdir` | 可写（只读角色为拒绝） | 在工作目录独占新建文件后删除 |
 | `read.own_task_token` | 可读 | 读取本任务令牌 |
@@ -1150,8 +1246,8 @@ claude-sdk 多声明一个沙箱设置 `supervisor-session → none`。探针每
   结果只含项名、路径、预期、实际与错误码（`EACCES`、`EPERM` 等），不含错误消息正文。测试用带特征字符串的假文件断言输出中不出现内容。
 - 判定：`EACCES`/`EPERM`/`EROFS` 为拒绝；`ENOENT` 为跳过（目标不存在，无法验证）；连接得到 `ECONNREFUSED` 记为拒绝并注明歧义
   （seatbelt 拒绝 unix 连接时 bun 报的也是 `ECONNREFUSED`，与失效套接字、无人监听的端口无法区分）；其他错误为失败。
-- **通过**：没有不符合预期的项、没有运行错误，并且核心受保护项 `read.hub_token`、`read.ledger_db`、`read.other_task_token`、`write.config`、`rename.protected_ancestor`、`write.own_profile`（后两项为审查第一轮新增；旧节点的结果缺这两项，按缺少核心项不通过）
-  全部出现且确实被拒绝。跳过与未验证不计入通过或失败，但会显示（核心项被跳过同样不能通过）。
+- **通过**：没有不符合预期的项、没有运行错误，并且核心受保护项 `read.hub_token`、`read.ledger_db`、`read.other_task_token`、`write.config`、`rename.protected_ancestor`、`write.own_profile`（这两项为审查第一轮新增）、
+  `write.shell_startup`、`write.git_hooks`（这两项为 4.6 新增；旧节点的结果缺新增项，按缺少核心项不通过）全部出现且确实被拒绝。跳过与未验证不计入通过或失败，但会显示（核心项被跳过同样不能通过）。
 - `ok` 与 `passed` 由中枢按预期与实际重新计算后才写入（deny/allow 为 `actual === expected`，skipped/unverified 为 null，error 为 false），节点上报的值不用。
 - 探针运行本身抛错时，节点改为上报每个目标都带 `probe_failed` 错误的不通过结果，不继续上报之前的结果。
 - 跨进程调试为什么未验证：不需要 sudo、不触碰真实进程的检查都区分不了“隔离生效”与“系统本来就不允许”——`task_for_pid` 需要调试授权，

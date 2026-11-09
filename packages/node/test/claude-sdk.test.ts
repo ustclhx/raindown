@@ -2059,6 +2059,9 @@ describe('外层 seatbelt（worker-credential-isolation 4.4）', () => {
     expect(outcome.ok && outcome.data.outcome).toBe('done')
     expect(state.calls[0]).not.toHaveProperty('spawnClaudeCodeProcess')
     expect(state.calls[0]).not.toHaveProperty('sandbox')
+    // 写白名单的配置目录只在施加时使用（4.6）。
+    expect(state.calls[0]?.env).not.toHaveProperty('CLAUDE_SECURESTORAGE_CONFIG_DIR')
+    expect(state.calls[0]?.env).not.toHaveProperty('CLAUDE_CODE_TMPDIR')
     expect(ex.adapterCapabilities.credential_isolation).toEqual({
       layers: {
         'bash-sandbox-off': 'seatbelt',
@@ -2080,7 +2083,20 @@ describe('外层 seatbelt（worker-credential-isolation 4.4）', () => {
     expect(options?.sandbox).toEqual({ enabled: false })
     expect(typeof options?.spawnClaudeCodeProcess).toBe('function')
     const profile = join(s.home, 'state/tasks/t-1/isolation.sb')
-    expect(readFileSync(profile, 'utf8')).toContain(`(subpath ${JSON.stringify(s.cwd)})`)
+    const text = readFileSync(profile, 'utf8')
+    expect(text).toContain(`(subpath ${JSON.stringify(s.cwd)})`)
+    // 写白名单（4.6）：Claude Code 改用 Raindown 管理的配置目录；其中的设置与扩展、用户自己的 ~/.claude 不可写。
+    const configDir = join(s.home, 'run/executors/claude-sdk/claude-config')
+    expect(options?.env?.CLAUDE_CONFIG_DIR).toBe(configDir)
+    expect(options?.env?.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe('')
+    expect(options?.env?.CLAUDE_CODE_TMPDIR).toBeTruthy()
+    expect(text).toContain('(deny file-write*)\n')
+    expect(text).toContain(`(subpath ${JSON.stringify(configDir)})`)
+    for (const name of ['settings.json', 'hooks', 'commands', 'skills', 'plugins'])
+      expect(text).toContain(`(subpath ${JSON.stringify(join(configDir, name))})`)
+    expect(text).not.toContain(`(subpath ${JSON.stringify(join(s.root, 'user/.claude'))})`)
+    // 用户主目录本身不在写白名单内。
+    expect(text).not.toContain(`(subpath ${JSON.stringify(join(s.root, 'user'))})`)
     expect(ex.adapterCapabilities.credential_isolation).toEqual({
       layers: {
         'bash-sandbox-off': 'seatbelt',

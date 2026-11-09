@@ -33,6 +33,21 @@ worker 进程及其所有子进程 MUST NOT 能读取或修改受保护资源。
 - **WHEN** 隔离下的 worker 通过 Raindown MCP 调用 `raindown_report progress`
 - **THEN** 上报成功，任务保持 running
 
+### Requirement: 写入白名单
+施加外层隔离时，worker 的写入 SHALL 默认拒绝，只放行：本任务工作目录（写类角色）、本任务私有目录、适配器声明的 harness 可写目录（其中会被 harness 加载或执行的配置与扩展除外）、临时目录、常见缓存子目录、所需的设备文件，以及登记仓库 `.git` 中 worktree 正常工作所需的部分（对象、引用、reflog、本 worktree 的管理目录与必需的锁文件），另加节点配置 `isolation.extra_write` 中显式追加的目录。之后会在沙箱外被执行或加载的位置 MUST NOT 可写，包括 shell 启动文件、`~/.gitconfig` 与 `~/.config/git/`、`~/.ssh/`、用户可写的 PATH 目录、登记仓库共享的 `.git/hooks/` 与 `.git/config`、其他 worktree 的管理目录。白名单 MUST NOT 重新放开任何受保护资源；`isolation.extra_write` 只接受绝对路径，不能是受保护路径、上述持久化位置、用户主目录或它们的祖先。
+
+#### Scenario: worker 写 shell 启动文件
+- **WHEN** 隔离下的 worker 执行 `echo 'curl … | sh' >> ~/.zshenv`
+- **THEN** 写入失败，文件不变
+
+#### Scenario: worker 写登记仓库的 hooks
+- **WHEN** 隔离下的 worker 在任务 worktree 中写入登记仓库的 `.git/hooks/post-checkout` 或修改 `.git/config`
+- **THEN** 写入失败；同一 worker 在 worktree 中 commit、建分支、fetch、merge、rebase 照常成功
+
+#### Scenario: 隔离自检覆盖持久化写入
+- **WHEN** 节点运行隔离探针
+- **THEN** 探针在自建的临时 home 中写模拟的 shell 启动文件、在自建的临时仓库中写 `.git/hooks/`，两者都被拒绝才算通过
+
 ### Requirement: 适配器施加隔离
 声明 `credential_isolation` 能力的执行器适配器 SHALL 在启动 harness 进程（含会话恢复与重新挂接后的新进程）时施加隔离，隔离覆盖该进程派生的全部子进程；harness 自带的沙箱设置不得削弱这一隔离。隔离配置由节点生成，内容只来自节点与角色配置，不来自 worker 或任务输入。
 

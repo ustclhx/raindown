@@ -59,6 +59,10 @@ function setup() {
     userHome,
     resolveOrcaPorts: () => [60211, 10129],
     env: {},
+    // 写白名单（4.6）中与本机有关的部分置空，清单内容可预期（写白名单本身见 isolation-write-allowlist.test.ts）。
+    tmpDirs: [],
+    cacheDirs: [],
+    uid: null,
   }
   return { root, real, home, userHome, work, base }
 }
@@ -96,7 +100,10 @@ describe('computeIsolationSpec', () => {
     ])
     const realCodex = R('raindown-home/run/executors/codex-orca/codex-home')
     expect(r.data.allow_read).toEqual([realCodex, realToken, R('work')].sort())
-    expect(r.data.allow_write).toEqual([realCodex, R('work')].sort())
+    // 写白名单（4.6）：另含本任务私有目录与 /dev/fd。
+    expect(r.data.allow_write).toEqual(
+      [realCodex, R('work'), R('raindown-home/run/tasks/t-1'), '/dev/fd'].sort(),
+    )
     expect(r.data.allow_write).not.toContain(realToken)
     expect(r.data.deny_unix_sockets).toEqual([R('user/Library/Application Support/orca')])
     expect(r.data.allow_unix_sockets).toEqual([])
@@ -128,7 +135,9 @@ describe('computeIsolationSpec', () => {
     })
     if (!r.ok) throw new Error(r.error.message)
     expect(r.data.allow_read).toEqual([join(s.real, 'work')])
-    expect(r.data.allow_write).toEqual([])
+    expect(r.data.allow_write).toEqual(
+      ['/dev/fd', join(s.real, 'raindown-home/run/tasks/t-1')].sort(),
+    )
     expect(r.data.deny_write).toContain(join(s.real, 'work'))
     expect(r.data.deny_read).toContain(join(s.real, 'keys', 'age'))
     expect(r.data.deny_read).not.toContain(join(s.real, 'user', '.config', 'sops', 'age'))
@@ -175,7 +184,13 @@ describe('computeIsolationSpec', () => {
     const r = await computeIsolationSpec({ ...s.base, cwd: join(alias, 'work', 'not-yet') })
     if (!r.ok) throw new Error(r.error.message)
     expect(readDenied(r.data, join(s.real, 'raindown-home', 'brain'))).toBe(true)
-    expect(r.data.allow_write).toEqual([join(s.real, 'work', 'not-yet')])
+    expect(r.data.allow_write).toEqual(
+      [
+        '/dev/fd',
+        join(s.real, 'raindown-home/run/tasks/t-1'),
+        join(s.real, 'work', 'not-yet'),
+      ].sort(),
+    )
   })
 
   test('允许项落在被拒目录内时报错，不静默生成祖先规则', async () => {

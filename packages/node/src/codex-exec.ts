@@ -24,6 +24,7 @@ import { z } from 'zod'
 import { type NodeClock, systemClock } from './clock.ts'
 import {
   CODEX_CREDENTIAL_ISOLATION,
+  codexHarnessPaths,
   codexShellEnvPolicyConfig,
   codexTaskMcpConfig,
   execCodexHome,
@@ -348,7 +349,7 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
             access: readRole ? 'read' : 'write',
             ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
             ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
-            harnessPaths: [{ path: isolated.data, access: 'write' }],
+            harnessPaths: codexHarnessPaths(isolated.data),
           })
           if (finished) return
           if (!prepared.ok) {

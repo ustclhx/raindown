@@ -17,6 +17,7 @@ import {
   type CredentialIsolation,
   executorRunDir,
   fail,
+  type HarnessPath,
   ok,
   type Result,
   raindownPaths,
@@ -351,3 +352,20 @@ export async function prepareCodexHome(dir: string, authSource: string): Promise
     return bad(`无法准备 Codex 的 CODEX_HOME：${(err as Error).message}`)
   }
 }
+
+/**
+ * Raindown 管理的 CODEX_HOME 中拒绝写的条目（外层 seatbelt 写白名单，tasks 4.6）：会被 Codex 加载或执行的配置与扩展。
+ * 同一 CODEX_HOME 也被未施加外层 seatbelt 的设置（workspace-write / read-only）使用，worker 改写 `config.toml`
+ * （notify、MCP 服务器）或 `rules/` 就能让之后的 Codex 进程在外层 seatbelt 之外执行命令；节点每次启动前覆盖 config.toml
+ * 也挡不住并发改写。其余运行状态（会话、日志、数据库）可写。
+ */
+export const CODEX_HOME_DENY_WRITE = ['config.toml', 'prompts', ...HOME_EXTENSIONS] as const
+
+/**
+ * 外层 seatbelt 下 Codex 的 harness 目录：CODEX_HOME 可写（拒绝上面的条目），以及 `auth.json` 链接的目标单个文件可写
+ * （Codex 刷新登录凭证时经链接写回用户的 `auth.json`；只放行这一个文件，不放行用户的 Codex 目录）。
+ */
+export const codexHarnessPaths = (codexHome: string): HarnessPath[] => [
+  { path: codexHome, access: 'write', denyWrite: CODEX_HOME_DENY_WRITE },
+  { path: join(codexHome, 'auth.json'), access: 'write', literal: true },
+]

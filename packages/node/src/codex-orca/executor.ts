@@ -25,6 +25,7 @@ import { z } from 'zod'
 import { type NodeClock, sleep, systemClock } from '../clock.ts'
 import {
   CODEX_CREDENTIAL_ISOLATION,
+  codexHarnessPaths,
   codexShellEnvPolicyConfig,
   codexTaskMcpConfig,
   orcaCodexHome,
@@ -1661,7 +1662,7 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
               access: effectiveRoleKind(role) === 'read' ? 'read' : 'write',
               ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
               ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
-              harnessPaths: [{ path: isolated.data, access: 'write' }],
+              harnessPaths: codexHarnessPaths(isolated.data),
             })
             if (finished || stopping) return
             if (!prepared.ok)

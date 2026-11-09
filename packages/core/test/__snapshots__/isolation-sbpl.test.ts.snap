@@ -1,21 +1,40 @@
 // Bun Snapshot v1, https://bun.sh/docs/test/snapshots
 
-exports[`SBPL 生成 快照：allow default + 最窄允许项在前 + 显式拒绝在后 1`] = `
+exports[`SBPL 生成 快照：allow default + 默认写拒绝 + 写白名单 + 显式拒绝在后 1`] = `
 ";; 由 Raindown 节点生成（add-worker-credential-isolation 4.1），不要手动修改；每次启动 harness 前重新生成。
 ;; 规则按出现顺序求值，同一操作后写的规则优先：允许项在前、拒绝项在后，拒绝优先。
 (version 1)
 (allow default)
 
-;; 1. 最窄允许项（allow default 下只作记录；均不位于下面的读拒绝目录内）
+;; 0. 写白名单（tasks 4.6）：默认拒绝一切写，下面只放行需要的位置
+(deny file-write*)
+
+;; 1. 最窄允许项：读放行只作记录（均不位于下面的读拒绝目录内）；写放行即写白名单
 (allow file-read*
   (subpath "/Users/u/raindown-home/run/tasks/t-1/dispatch-tokens/l-1.token")
   (subpath "/Users/u/work"))
 (allow file-write*
-  (subpath "/Users/u/work"))
+  (subpath "/Users/u/work")
+  (subpath "/Users/u/.cache")
+  (subpath "/private/tmp")
+  (literal "/dev/null")
+  (literal "/Users/u/.codex/auth.json")
+  (regex #"^/dev/ttys[0-9]+$"))
 (allow network-outbound
   (remote ip "localhost:7477"))
 
-;; 2. 受保护资源：读写拒绝（以目录为单位，新增文件自动覆盖）
+;; 1a. 白名单内再拒绝写：登记仓库的 git 目录与 .git 指针文件、harness 目录中会被加载或执行的配置
+(deny file-write*
+  (subpath "/Users/u/repo/.git")
+  (subpath "/Users/u/raindown-home/run/executors/codex-exec/codex-home/config.toml")
+  (literal "/Users/u/work/.git"))
+;; 1b. 登记仓库 .git 中 worktree 必需的部分（写类角色）；hooks、config 等不在内，并在下面再次拒绝
+(allow file-write*
+  (subpath "/Users/u/repo/.git/objects")
+  (subpath "/Users/u/repo/.git/worktrees/work")
+  (literal "/Users/u/repo/.git/packed-refs"))
+
+;; 2. 受保护资源：读写拒绝（以目录为单位，新增文件自动覆盖）；写在白名单之后，白名单不能重新放开
 (deny file-read*
   (subpath "/Users/u/.config/sops/age")
   (subpath "/Users/u/Library/Application Support/orca")
@@ -43,8 +62,13 @@ exports[`SBPL 生成 快照：allow default + 最窄允许项在前 + 显式拒�
   (literal "/Users/u/Library/Application Support")
   (literal "/Users/u/raindown-home")
   (literal "/Users/u/raindown-home/run")
+  (literal "/Users/u/raindown-home/run/executors")
+  (literal "/Users/u/raindown-home/run/executors/codex-exec")
+  (literal "/Users/u/raindown-home/run/executors/codex-exec/codex-home")
   (literal "/Users/u/raindown-home/run/tasks")
-  (literal "/Users/u/raindown-home/run/tasks/t-1"))
+  (literal "/Users/u/raindown-home/run/tasks/t-1")
+  (literal "/Users/u/repo")
+  (literal "/Users/u/work"))
 
 ;; 5. 控制通道：文件规则拦不住 unix 套接字 connect，单独拒绝；只拒绝已解析的 Orca 端口，其他本机端口不拒绝
 (deny network-outbound

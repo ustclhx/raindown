@@ -98,6 +98,22 @@ export const nodeIsolationSchema = z
       description:
         '是否施加外层 seatbelt（仅 macOS）；缺省 false，只声明不施加。改为 true 后需重启节点；改回 false 即回滚',
     }),
+    extra_write: z
+      .array(
+        z
+          .string()
+          .min(1)
+          .max(1024)
+          .refine((p) => p.startsWith('/'), { message: '必须是绝对路径' })
+          // biome-ignore lint/suspicious/noControlCharactersInRegex: 正是要拒绝控制字符
+          .refine((p) => !/[\u0000-\u001f\u007f-\u009f]/.test(p), { message: '不能含控制字符' }),
+      )
+      .max(64)
+      .default([])
+      .meta({
+        description:
+          '外层 seatbelt 写白名单之外追加的可写目录（tasks 4.6），例如新工具的缓存目录；只接受绝对路径，不能是受保护路径、持久化位置（shell 启动文件、~/.ssh、~/.gitconfig 等）、用户主目录或它们的祖先',
+      }),
   })
   .meta({ title: 'Node worker isolation' })
 
@@ -122,7 +138,7 @@ export const nodeConfigSchema = z
       description:
         '在 concurrency 之外为 supervisor 预留的执行槽（add-m1-supervisor D12）：普通槽满时仍为它们领取任务',
     }),
-    isolation: nodeIsolationSchema.default({ enforce: false }).meta({
+    isolation: nodeIsolationSchema.default({ enforce: false, extra_write: [] }).meta({
       description:
         'worker 凭证隔离（add-worker-credential-isolation）；缺省不施加（enforce: false）',
     }),

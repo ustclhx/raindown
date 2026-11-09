@@ -52,6 +52,8 @@ export const nodeStartCommand = defineCommand({
     const isolation: SeatbeltOptions = {
       enforce: nodeConfig.data.isolation.enforce,
       resolveOrcaPorts: orcaPorts,
+      // 写白名单之外追加的可写目录（tasks 4.6）；worker 与探针用同一份。
+      extraWrite: nodeConfig.data.isolation.extra_write,
     }
     if (isolation.enforce && !seatbeltActive(isolation))
       console.error(
@@ -72,6 +74,7 @@ export const nodeStartCommand = defineCommand({
       // 探针只判断受保护文件能否打开，不读取内容。
       isolationProbe: {
         resolveOrcaPorts: orcaPorts,
+        extraWrite: nodeConfig.data.isolation.extra_write,
         ...(seatbeltActive(isolation)
           ? { launchWrapper: seatbeltProbeLaunchWrapper(isolation) }
           : {}),

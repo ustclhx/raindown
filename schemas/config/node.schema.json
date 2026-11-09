@@ -54,7 +54,8 @@
     },
     "isolation": {
       "default": {
-        "enforce": false
+        "enforce": false,
+        "extra_write": []
       },
       "description": "worker 凭证隔离（add-worker-credential-isolation）；缺省不施加（enforce: false）",
       "type": "object",
@@ -63,6 +64,17 @@
           "default": false,
           "description": "是否施加外层 seatbelt（仅 macOS）；缺省 false，只声明不施加。改为 true 后需重启节点；改回 false 即回滚",
           "type": "boolean"
+        },
+        "extra_write": {
+          "default": [],
+          "description": "外层 seatbelt 写白名单之外追加的可写目录（tasks 4.6），例如新工具的缓存目录；只接受绝对路径，不能是受保护路径、持久化位置（shell 启动文件、~/.ssh、~/.gitconfig 等）、用户主目录或它们的祖先",
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
         }
       },
       "additionalProperties": false,

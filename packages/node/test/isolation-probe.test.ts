@@ -81,6 +81,10 @@ const probeOptions = (s: Awaited<ReturnType<typeof setup>>, executors = [codexEx
   userHome: s.userHome,
   env: {},
   tmpDir: s.tmp,
+  // 写白名单（4.6）：测试根目录本身在系统临时目录内，临时与缓存目录改为测试内的子目录，
+  // 使探针自建的模拟 home 与临时仓库位于白名单之外。
+  tmpDirs: [s.tmp],
+  cacheDirs: [join(s.userHome, '.cache')],
   macosVersion: async () => '15.1',
   now: () => new Date('2026-11-09T00:00:00.000Z'),
 })
@@ -267,6 +271,18 @@ describe('模拟已隔离（注入的文件系统接口拒绝受保护项）', (
         expected: 'deny',
         target: '/o/x.sock',
       },
+      {
+        item: 'write.shell_startup',
+        kind: 'create_file',
+        expected: 'deny',
+        target: '/h/run/isolation-probe-p/home/.zshenv',
+      },
+      {
+        item: 'write.git_hooks',
+        kind: 'create_file',
+        expected: 'deny',
+        target: '/h/run/isolation-probe-p/repo/.git/hooks/post-checkout',
+      },
       { item: 'connect.orca_port', kind: 'tcp_connect', expected: 'deny', skip: '未解析' },
       { item: 'debug.process', kind: 'process_debug', expected: 'deny', unverified: '未验证' },
       { item: 'write.workdir', kind: 'write_new', expected: 'allow', target: '/w' },
@@ -382,7 +398,14 @@ describe('模拟已隔离（注入的文件系统接口拒绝受保护项）', (
       actual: 'allow',
       ok: false,
     })
-    expect(created.every((p) => p.includes('.raindown-isolation-probe-'))).toBe(true)
+    // 目录写探针用带前缀的随机文件名；指定路径的写探针（4.6）只针对探针自建临时目录中的固定路径。
+    const fixed = new Set(
+      plan.items.filter((i) => i.kind === 'create_file').map((i) => i.target as string),
+    )
+    expect(created.every((p) => p.includes('.raindown-isolation-probe-') || fixed.has(p))).toBe(
+      true,
+    )
+    expect(created.filter((p) => fixed.has(p)).sort()).toEqual([...fixed].sort())
     expect(removed.sort()).toEqual(created.sort())
     expect(links).toEqual([])
   })
@@ -608,9 +631,17 @@ describe('探针联动（worker-credential-isolation 4.1–4.4）', () => {
         'rename.protected_ancestor',
         // 审查第一轮 H2：本任务实际使用的 seatbelt 配置不可改写。
         'write.own_profile',
+        // 4.6 写白名单：白名单之外的模拟 shell 启动文件、临时仓库（按登记仓库同规则）的 .git/hooks。
+        'write.shell_startup',
+        'write.git_hooks',
         `connect.orca_port.${orcaPort}`,
       ])
         expect({ id, actual: by[id]?.actual }).toEqual({ id, actual: 'deny' })
+      expect(by['write.shell_startup']?.target).toMatch(
+        /\/run\/isolation-probe-[0-9a-f]+\/home\/\.zshenv$/,
+      )
+      // 写类角色：临时仓库 .git/objects 可写（worktree 必需部分）。
+      expect(by['write.git_objects']).toMatchObject({ expected: 'allow', actual: 'allow' })
       expect(by['write.own_profile']?.target).toContain('/state/tasks/isolation-probe-self-')
       // 改名只针对探针自建的临时目录树。
       expect(by['rename.protected_ancestor']?.target).toContain('/run/tasks/isolation-probe-self-')

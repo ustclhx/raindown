@@ -928,6 +928,11 @@ describe('外层 seatbelt（worker-credential-isolation 4.3）', () => {
     const text = readFileSync(profile, 'utf8')
     expect(text).toContain('(version 1)\n(allow default)\n')
     expect(text).toContain(`(subpath "${realpathSync(execCodexHome(s.home))}")`)
+    // 写白名单（4.6）：默认拒绝写；CODEX_HOME 中会被加载执行的配置与扩展挖掉；auth.json 链接目标只放行这一个文件。
+    expect(text).toContain('(deny file-write*)\n')
+    for (const name of ['config.toml', 'rules', 'hooks.json', 'skills', 'AGENTS.md'])
+      expect(text).toContain(`(subpath "${join(realpathSync(execCodexHome(s.home)), name)}")`)
+    expect(text).toContain(`(literal "${join(realpathSync(execCodexHome(s.home)), 'auth.json')}")`)
   })
 
   test('开关打开但非 macOS：不施加，能力声明不变', async () => {

@@ -30,8 +30,8 @@
 ## Decisions
 
 ### D1. 统一的隔离描述，适配器选择施加层
-节点为每次派工生成 `IsolationSpec{deny_read[], deny_write[], allow_read[], allow_write[], allow_unix_sockets[], allow_local_ports[]}`。路径一律规范化为 realpath，这是正确性前提而不只是整洁：seatbelt 按真实路径匹配，未规范化的规则（例如 `/var/…` 而真实路径是 `/private/var/…`）会静默不生效。规范化在生成配置时做，不存在的路径按其最近的已存在祖先规范化后拼回。适配器把它落到三种施加层之一：
-- **外层 seatbelt**：用于 harness 自带 OS 沙箱关闭的情况（danger-full-access、bypass）。节点生成 SBPL 配置，用 `sandbox-exec -f` 启动 harness。配置以 `allow default` 为基础，显式 deny 受保护资源，避免误伤 harness 的正常运行。
+节点为每次派工生成 `IsolationSpec{deny_read[], deny_write[], allow_read[], allow_write[], allow_unix_sockets[], allow_local_ports[]}`。写入是白名单（4.6，见 D2）：`allow_write`（子树）与 `allow_write_literals`（单个文件）就是全部可写位置，`write_carve_outs*` 在其中再挖掉登记仓库的 git 目录与 harness 配置，`allow_write_git*` 再放行 worktree 必需的 git 部分；`deny_*` 受保护项最后写入，白名单不能重新放开它们。路径一律规范化为 realpath，这是正确性前提而不只是整洁：seatbelt 按真实路径匹配，未规范化的规则（例如 `/var/…` 而真实路径是 `/private/var/…`）会静默不生效。规范化在生成配置时做，不存在的路径按其最近的已存在祖先规范化后拼回。适配器把它落到三种施加层之一：
+- **外层 seatbelt**：用于 harness 自带 OS 沙箱关闭的情况（danger-full-access、bypass）。节点生成 SBPL 配置，用 `sandbox-exec -f` 启动 harness。配置以 `allow default` 为基础（读、网络、进程等不改变），紧接着 `(deny file-write*)` 把写入改为白名单（4.6），显式 deny 受保护资源。
 - **harness 原生的读限制**：用于 harness 自带沙箱开启、无法嵌套的情况。1.1 实测结论：
   - Codex 支持：Raindown 在其管理的 CODEX_HOME 中生成 permissions profile，受保护路径写 `"deny"`，启动时不传 `-s`，改传 `-c default_permissions=<name>`。声明为 `native`。
   - Claude Code 不支持可靠的原生读限制（`denyRead` 只覆盖 Bash）。claude-sdk 开启 bash 沙箱时声明为 `none`；需要隔离的角色应关闭 bash 沙箱，改由外层 seatbelt 施加。
@@ -63,6 +63,18 @@
 - 本任务私有目录中的派工令牌文件；
 - 适配器声明的 harness 目录，例如 Raindown 管理的 CODEX_HOME，以及 Codex/Claude 登录所需的路径；
 - 中枢监听的本机端口；其余本机端口不默认拒绝（worker 自己起的 dev server、测试服务器需要可用），只拒绝上面解析出的 Orca 端口等已知控制端口。
+
+**写入白名单（4.6，用户 2026-11-09 决定）。** 读取保持 `allow default` 加显式拒绝；写入默认拒绝，只放行（全部 realpath，按适配器与角色计算）：
+- 本任务工作目录（写类角色；只读角色仍以写拒绝表示）与本任务私有目录 `run/tasks/<任务>/`（派工令牌与 `dispatch-tokens/` 仍写拒绝）；
+- 适配器声明的 harness 可写目录：codex 为 Raindown 管理的 CODEX_HOME（`config.toml`、`rules/`、`hooks.json`、`AGENTS*.md`、`skills/`、`plugins/`、`prompts/` 除外）及其 `auth.json` 链接目标这一个文件；
+  claude-sdk 为 Raindown 管理的 Claude Code 配置目录 `run/executors/claude-sdk/claude-config/`（`CLAUDE_CONFIG_DIR`；`settings*.json`、`commands|agents|skills|hooks|plugins|rules|output-styles`、`CLAUDE.md` 等除外）。
+  用户自己的 `~/.claude`、`~/.claude.json` 不可写：其中的 shell 快照、项目记忆、MCP 与 hooks 配置会被用户自己（沙箱外）的 Claude Code 加载或执行；
+- 临时目录 `/private/tmp`、本用户 `TMPDIR` 及同级 `C/`（`/private/tmp/claude-<uid>` 除外，属于用户自己的 Claude Code 会话）；设备文件（`/dev/null`、`/dev/tty`、`/dev/ttys<N>`、`/dev/fd/` 等）；
+- 常见缓存子目录（`~/.cache`、`~/Library/Caches`、`~/.bun/install/cache`、`~/.npm/_cacache` 与 `_logs`、pnpm store）与钥匙串文件目录 `~/Library/Keychains`（凭证刷新）；
+- 登记仓库 `.git` 中 worktree 必需的部分：`objects/`、`refs/`、`logs/`、本 worktree 的 `worktrees/<自己>/`（`commondir`、`gitdir`、`config.worktree` 除外）、`packed-refs` 与 `gc.pid` 等锁文件、其他 worktree 的 `HEAD.lock` 与 reflog（`git gc` 的 reflog expire）；主 worktree 时还有 `HEAD`、`index` 等每个 worktree 的状态文件。`hooks/`、`config`、`info/`、`modules/` 与其他 worktree 的其余内容不可写；
+- 节点配置 `isolation.extra_write` 显式追加的目录（绝对路径，不能是受保护路径、持久化位置、用户主目录或其祖先）。
+
+SBPL 中的顺序：`(allow default)` → `(deny file-write*)` → 白名单放行 → 白名单内再挖掉（git 目录、`.git` 指针文件、harness 配置）→ git 必需部分放行 → 受保护项拒绝 → 受保护路径与挖掉位置的祖先目录 literal 写拒绝。后写的规则优先，所以白名单不能重新放开受保护项。
 
 seatbelt 的规则后者优先，允许项写得最窄（具体文件，而不是整个私有目录）。
 
@@ -111,8 +123,16 @@ seatbelt 的规则后者优先，允许项写得最窄（具体文件，而不�
   - `~/.ssh/config`；
   - `~/Library/LaunchAgents`（已拒绝）。
 
-  → 真实开启（4.5）之前由 4.6 解决，二选一：写入白名单（默认 `deny file-write*`，只放行工作目录、harness 目录、临时目录、缓存目录与主仓库 `.git`
-  中 worktree 必需的部分），或至少对上述持久化位置写拒绝；探针增加“写 shell 启动文件”一项（只在临时 home 上测试）。
+  → 4.6 已采用写入白名单（用户 2026-11-09 决定，见 D2）：上述位置都不在白名单内；探针新增必过项 `write.shell_startup`
+  （探针自建临时 home 中的模拟 `.zshenv`）与 `write.git_hooks`（探针自建临时仓库的 `.git/hooks/`）。
+- [白名单内仍有会被沙箱外进程执行的内容（4.6 残留）] 缓存目录本身就是持久化通道：`~/.bun/install/cache`、`~/Library/Caches`
+  （例如 Playwright 浏览器）、`~/.cache` 中的包或二进制会被之后沙箱外的安装、运行直接使用；临时目录 `/private/tmp`、`TMPDIR` 中
+  沙箱外进程随后执行的脚本同理。CODEX_HOME 与 Claude 隔离配置目录中的会话记录可被改写（提示注入，不是命令执行）；
+  claude-sdk 隔离配置目录中的 `.claude.json`（含按项目的 MCP 配置）可写，但只被之后同样受隔离的 claude-sdk 会话加载。
+  → 按需从白名单移除或改为任务私有的缓存目录（`isolation.extra_write` 只能追加，不能移除缺省项）；写入文档。
+- [写白名单误伤 harness 或工具链] 例如 Codex 写 `config.toml` 记录项目信任、工具写 `~/Library/Application Support/<工具>`、
+  `git checkout -b x origin/main` 与 `git push -u` 写上游配置（`.git/config`）。→ 4.5 验收时按失败追加 `isolation.extra_write`
+  或调整适配器声明；`.git/config` 与 harness 配置不放行。
 
 ## Migration Plan
 

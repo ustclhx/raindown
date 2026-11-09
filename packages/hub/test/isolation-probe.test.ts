@@ -73,6 +73,8 @@ const report = (passed: boolean, ranAt = '2026-11-09T00:00:00.000Z'): IsolationP
             'write.config',
             'rename.protected_ancestor',
             'write.own_profile',
+            'write.shell_startup',
+            'write.git_hooks',
           ] as const
         ).map((item) => ({
           item,

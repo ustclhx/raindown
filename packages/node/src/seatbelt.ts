@@ -44,6 +44,11 @@ export interface SeatbeltOptions {
   ageKeyFile?: string
   /** Orca 本机端口解析；缺省未解析（不生成端口拒绝规则，探针与 doctor 显示“跳过”）。 */
   resolveOrcaPorts?: () => Promise<number[]> | number[]
+  /** `config/node.yaml` 的 `isolation.extra_write`：追加到写白名单的目录（tasks 4.6）。 */
+  extraWrite?: readonly string[]
+  /** 写白名单中的临时目录与缓存目录；缺省按本机计算，测试注入临时目录。 */
+  tmpDirs?: readonly string[]
+  cacheDirs?: readonly string[]
 }
 
 /** 开关是否在本机生效：打开且运行在 macOS 上。 */
@@ -153,6 +158,9 @@ export async function prepareSeatbelt(
     ...(o.userHome !== undefined ? { userHome: o.userHome } : {}),
     ...(o.ageKeyFile !== undefined ? { ageKeyFile: o.ageKeyFile } : {}),
     ...(o.env ? { env: o.env } : {}),
+    ...(o.extraWrite ? { extraWrite: o.extraWrite } : {}),
+    ...(o.tmpDirs ? { tmpDirs: o.tmpDirs } : {}),
+    ...(o.cacheDirs ? { cacheDirs: o.cacheDirs } : {}),
   })
   if (!spec.ok) return spec
   return writeSeatbeltLaunch(o, input.home, input.taskId, spec.data)

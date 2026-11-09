@@ -6,13 +6,15 @@ import type { IsolationSpec } from './spec.ts'
  * 由 `IsolationSpec` 生成外层 seatbelt 配置（SBPL，add-worker-credential-isolation 4.1）。
  *
  * 结构：`(version 1)(allow default)`，之后依次是
- * 1. 最窄允许项（本任务工作目录、派工令牌、harness 目录、中枢端口、显式放行的套接字）；
+ * 0. `(deny file-write*)`：写入是白名单（tasks 4.6），只有下面放行的位置可写；
+ * 1. 最窄允许项（本任务工作目录、派工令牌、harness 目录、中枢端口、显式放行的套接字）与写白名单
+ *    （临时、缓存、设备文件等），之后在白名单内挖掉登记仓库的 git 目录与 harness 配置，再放行 worktree 必需的 git 部分；
  * 2. 显式拒绝：`deny_read`、`deny_write`、`deny_children_except`、受保护路径全部祖先目录的写（防改名绕过）、
  *    Orca unix 套接字、已解析的 Orca 端口、跨进程调试。
  *
  * 允许项写在拒绝项之前，同一操作后写的规则优先，所以**拒绝优先**（与 `IsolationSpec` 的约定一致）：
- * `computeIsolationSpec` 已保证允许项不落在任何读拒绝目录内，`allow default` 下允许项本身不放开任何东西，只作记录；
- * 而只读语义（派工令牌、令牌目录、只读工作目录）以写拒绝表示，写在最后才能保证它们即使位于可写目录内也不可写。
+ * `computeIsolationSpec` 已保证允许项不落在任何读拒绝目录内，`allow default` 下读放行本身不放开任何东西，只作记录；
+ * 写放行只抵消第 0 步的默认写拒绝，受保护项的拒绝在其后，白名单不能重新放开它们；而只读语义（派工令牌、令牌目录、只读工作目录）以写拒绝表示，写在最后才能保证它们即使位于可写目录内也不可写。
  * 其他本机端口不拒绝（worker 自己的 dev server、测试服务器需要可用）；Orca 端口未解析时不生成端口规则，探针与 doctor 照实显示“跳过”。
  *
  * 路径一律内联为 SBPL 字符串字面量，严格转义 `\` 与 `"`；含控制字符（NUL、换行、回车、制表符等 C0/C1 与 DEL）
@@ -67,6 +69,10 @@ const rule = (action: 'allow' | 'deny', ops: string, filters: readonly string[])
     : [`(${action} ${ops}`, ...filters.map((f) => `  ${f}`).slice(0, -1), `  ${filters.at(-1)})`]
 
 const subpaths = (paths: readonly string[]) => paths.map((p) => `(subpath ${sbplString(p)})`)
+const literals = (paths: readonly string[]) => paths.map((p) => `(literal ${sbplString(p)})`)
+
+/** 终端从设备（`/dev/ttys<N>`）：数目不定，用固定正则放行；不接受任何外部输入。 */
+export const TTY_DEVICE_REGEX = '(regex #"^/dev/ttys[0-9]+$")'
 
 /** `path` 的全部祖先目录（不含自身），直到 `/`。 */
 function ancestors(path: string): string[] {
@@ -86,7 +92,14 @@ function ancestors(path: string): string[] {
  */
 export function protectedAncestors(spec: IsolationSpec): string[] {
   const set = new Set<string>()
-  for (const p of [...spec.deny_read, ...spec.deny_write, ...spec.deny_unix_sockets])
+  for (const p of [
+    ...spec.deny_read,
+    ...spec.deny_write,
+    ...spec.deny_unix_sockets,
+    // 白名单内挖掉的位置（git 目录、.git 指针文件、harness 配置）：改名其祖先（例如工作目录）后同样能绕过（tasks 4.6）。
+    ...spec.write_carve_outs,
+    ...spec.write_carve_out_literals,
+  ])
     for (const a of ancestors(p)) set.add(a)
   for (const d of spec.deny_children_except) {
     set.add(d.dir)
@@ -107,9 +120,16 @@ export function renderSeatbeltProfile(spec: IsolationSpec): Result<string> {
       '(version 1)',
       '(allow default)',
       '',
-      ';; 1. 最窄允许项（allow default 下只作记录；均不位于下面的读拒绝目录内）',
+      ';; 0. 写白名单（tasks 4.6）：默认拒绝一切写，下面只放行需要的位置',
+      '(deny file-write*)',
+      '',
+      ';; 1. 最窄允许项：读放行只作记录（均不位于下面的读拒绝目录内）；写放行即写白名单',
       ...rule('allow', 'file-read*', subpaths(spec.allow_read)),
-      ...rule('allow', 'file-write*', subpaths(spec.allow_write)),
+      ...rule('allow', 'file-write*', [
+        ...subpaths(spec.allow_write),
+        ...literals(spec.allow_write_literals),
+        ...(spec.allow_write_literals.length > 0 ? [TTY_DEVICE_REGEX] : []),
+      ]),
       ...rule(
         'allow',
         'network-outbound',
@@ -121,7 +141,18 @@ export function renderSeatbeltProfile(spec: IsolationSpec): Result<string> {
         spec.allow_unix_sockets.map((p) => `(remote unix-socket (path-literal ${sbplString(p)}))`),
       ),
       '',
-      ';; 2. 受保护资源：读写拒绝（以目录为单位，新增文件自动覆盖）',
+      ';; 1a. 白名单内再拒绝写：登记仓库的 git 目录与 .git 指针文件、harness 目录中会被加载或执行的配置',
+      ...rule('deny', 'file-write*', [
+        ...subpaths(spec.write_carve_outs),
+        ...literals(spec.write_carve_out_literals),
+      ]),
+      ';; 1b. 登记仓库 .git 中 worktree 必需的部分（写类角色）；hooks、config 等不在内，并在下面再次拒绝',
+      ...rule('allow', 'file-write*', [
+        ...subpaths(spec.allow_write_git),
+        ...literals(spec.allow_write_git_literals),
+      ]),
+      '',
+      ';; 2. 受保护资源：读写拒绝（以目录为单位，新增文件自动覆盖）；写在白名单之后，白名单不能重新放开',
       ...rule('deny', 'file-read*', subpaths(spec.deny_read)),
       ...rule('deny', 'file-write*', subpaths(spec.deny_write)),
       '',

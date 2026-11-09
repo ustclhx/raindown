@@ -91,6 +91,9 @@ export const PROBE_REQUIRED_DENY_ITEMS = [
   // 审查第一轮 H1、H2：受保护路径的祖先目录不可改名；本任务实际使用的 seatbelt 配置不可改写。
   'rename.protected_ancestor',
   'write.own_profile',
+  // tasks 4.6 写白名单：白名单之外（模拟的 shell 启动文件）与登记仓库的 .git/hooks 不可写。
+  'write.shell_startup',
+  'write.git_hooks',
 ] as const
 
 /**

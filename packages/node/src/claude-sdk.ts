@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import { readFile, realpath } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type {
   CanUseTool,
@@ -50,6 +51,13 @@ import {
   writablePaths,
 } from '@raindown/core'
 import { z } from 'zod'
+import {
+  CLAUDE_CONFIG_DENY_WRITE,
+  CLAUDE_CONFIG_HOME,
+  claudeIsolatedEnv,
+  prepareClaudeConfigDir,
+  userClaudeConfigDir,
+} from './claude-config.ts'
 import {
   checkReadScope,
   isRaindownMcp,
@@ -1131,20 +1139,35 @@ export function createClaudeSdkExecutor(options: ClaudeSdkExecutorOptions): Exec
         // 外层 seatbelt（4.4）：开关打开时包裹 worker 会话。supervisor 唤醒会话的 MCP 按设计仍在本地读取 raindown-home
         // （唤醒令牌在 state/wake/），不能整体拒绝，因此不包裹。
         let seatbelt: string[] | undefined
+        let isolatedEnv: Record<string, string> | undefined
         if (
           !supervisor.data &&
           seatbeltApplies(credentialIsolation, role.data, options.isolation)
         ) {
-          const prepared = await prepareSeatbelt(options.isolation, {
-            home: options.home,
-            taskId: ctx.taskId,
-            executor: CLAUDE_SDK_EXECUTOR,
-            cwd: sessionCtx.cwd,
-            access: kind === 'read' ? 'read' : 'write',
-            ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
-            ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
-          })
+          // 写白名单（4.6）：Claude Code 改用 Raindown 管理的配置目录，用户自己的 ~/.claude 与 ~/.claude.json 不可写。
+          const configDir = await prepareClaudeConfigDir(
+            options.home,
+            userClaudeConfigDir(env.data, options.isolation.userHome),
+          )
           if (finished) return
+          const prepared = configDir.ok
+            ? await prepareSeatbelt(options.isolation, {
+                home: options.home,
+                taskId: ctx.taskId,
+                executor: CLAUDE_SDK_EXECUTOR,
+                executorHome: CLAUDE_CONFIG_HOME,
+                cwd: sessionCtx.cwd,
+                access: kind === 'read' ? 'read' : 'write',
+                ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
+                ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
+                harnessPaths: [
+                  { path: configDir.data, access: 'write', denyWrite: CLAUDE_CONFIG_DENY_WRITE },
+                ],
+              })
+            : configDir
+          if (finished) return
+          if (prepared.ok && configDir.ok)
+            isolatedEnv = claudeIsolatedEnv(env.data, configDir.data, await realpath(tmpdir()))
           if (!prepared.ok) {
             await cleanupReview()
             finish(
@@ -1177,6 +1200,7 @@ export function createClaudeSdkExecutor(options: ClaudeSdkExecutorOptions): Exec
             : {}),
           canUseTool: makeCanUseTool(perms.data, kind, supervisor.data !== undefined),
           ...(seatbelt ? { seatbelt } : {}),
+          ...(isolatedEnv ? { isolatedEnv } : {}),
           abortController,
           writtenFiles,
           stderr: (data) => {
@@ -1455,6 +1479,8 @@ interface BuildOptionsInput {
    * 选项（flag settings 层，优先于 project / user 设置）强制关闭 bash 沙箱。缺省时选项与之前一致。
    */
   seatbelt?: readonly string[]
+  /** 外层 seatbelt 下的 Claude Code 配置目录、钥匙串条目与临时目录环境变量（`claudeIsolatedEnv`，tasks 4.6）。 */
+  isolatedEnv?: Record<string, string>
 }
 
 /** 由角色与任务上下文拼出 SDK 的 `query()` 选项。 */
@@ -1545,6 +1571,8 @@ export function buildOptions(i: BuildOptionsInput): Options & { model: string } 
       const env: NodeJS.ProcessEnv = {
         ...i.env,
         ...(i.perms.read_scope ? READ_SCOPE_ENV : {}),
+        // 外层 seatbelt 下 Claude Code 改用 Raindown 管理的配置目录与临时目录（写白名单，tasks 4.6）。
+        ...(i.isolatedEnv ?? {}),
         // 只读角色与审查会话不加载 claude.ai connector（CLI 2.1.310 的 ENABLE_CLAUDEAI_MCP_SERVERS）。
         ...(lockedDown || review ? { ENABLE_CLAUDEAI_MCP_SERVERS: 'false' } : {}),
         // 审查会话中 Claude Code 自己运行的 git 同样不运行 hook、fsmonitor 与 filter driver。

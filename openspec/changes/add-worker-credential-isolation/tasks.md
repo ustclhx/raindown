@@ -31,7 +31,15 @@
   - 审查第一轮（PR #98）：受保护路径全部祖先目录写拒绝（防改名绕过）；配置移到 worker 读写都被拒绝的 `state/tasks/<任务>/isolation.sb`；
     Orca 端口只读解析（套接字名取 pid + lsof），未解析时探针记为失败；探针新增 `rename.protected_ancestor`、`write.own_profile` 两个必过项，
     施加时按执行器分别运行；未隔离旧终端拒绝重挂接时关闭；`spawnClaudeCodeProcess` 启动失败不崩溃；非 macOS 打开开关时 doctor 提示未施加。
-- [ ] 4.6 （4.5 的前置）持久化写入（design Risks，PR #98 第二轮审查 N1）：在“写入白名单（默认 `deny file-write*`，放行工作目录、harness 目录、临时目录、缓存目录与主仓库 `.git` 中 worktree 必需的部分）”与“至少对 shell 启动文件、共享 `.git/hooks` 与 `.git/config`、`~/.gitconfig`、`~/.config/git`、用户可写 PATH 目录、`~/.ssh/config` 写拒绝”之间选定方案并实现；探针新增“写 shell 启动文件”一项（只在临时 home 上测试）。验证：darwin 上真实 `sandbox-exec` 的回归测试；Codex 与 Claude Code 在白名单下的工具链冒烟
+- [x] 4.6 （4.5 的前置）持久化写入（design Risks，PR #98 第二轮审查 N1）：在“写入白名单（默认 `deny file-write*`，放行工作目录、harness 目录、临时目录、缓存目录与主仓库 `.git` 中 worktree 必需的部分）”与“至少对 shell 启动文件、共享 `.git/hooks` 与 `.git/config`、`~/.gitconfig`、`~/.config/git`、用户可写 PATH 目录、`~/.ssh/config` 写拒绝”之间选定方案并实现；探针新增“写 shell 启动文件”一项（只在临时 home 上测试）。验证：darwin 上真实 `sandbox-exec` 的回归测试；Codex 与 Claude Code 在白名单下的工具链冒烟
+  - 用户 2026-11-09 选定写入白名单（design D2）。`IsolationSpec` 增加 `allow_write_literals`、`write_carve_outs*`、`allow_write_git*`，
+    `allow_write` 改为白名单语义；SBPL 在 `(allow default)` 之后 `(deny file-write*)`，受保护项拒绝仍写在最后。
+  - claude-sdk 施加时改用 Raindown 管理的 `CLAUDE_CONFIG_DIR`（`run/executors/claude-sdk/claude-config/`，用户设置与扩展只读链接），
+    `CLAUDE_SECURESTORAGE_CONFIG_DIR` 保持原钥匙串条目，`CLAUDE_CODE_TMPDIR` 改到本用户 `TMPDIR`。
+  - 登记仓库 `.git` 的最小写集合由 darwin 上真实 `sandbox-exec` + git 实测确定（`packages/core/test/isolation-write-allowlist.test.ts`）。
+  - 探针新增必过项 `write.shell_startup`、`write.git_hooks`（只在探针自建的 `run/isolation-probe-<hex>/` 中操作），以及 `write.git_objects`（按角色读写类别）。
+  - 新配置 `isolation.extra_write`（绝对路径；不能是受保护路径、持久化位置、用户主目录或其祖先），doctor 显示。
+  - Codex 与 Claude Code 在白名单下的真实工具链冒烟未做（不运行真实 harness），留给 4.5 验收；已知风险见 docs/executors.md「写白名单」。
 - [ ] 4.5 真实验收（征得用户同意后在本机执行）：dev 角色跑一个 product-res 任务，worker 内 `cat ~/raindown-home/state/hub.token`、写 `config/policies.yaml`、读其他任务令牌全部失败，`raindown_report` 与 `kb_search` 正常，任务正常完成
 
 ## 5. harness 沙箱开启时的隔离
