@@ -67,6 +67,11 @@ export interface RaindownPaths {
   backups: string
   /** `state/logs/`：中枢与节点日志。 */
   logs: string
+  /**
+   * `run/`：worker 需要访问的节点运行目录（Raindown 管理的 CODEX_HOME、任务私有目录中的派工令牌），
+   * 放在 `state/` 之外，使隔离可以整体拒绝 `state/`（add-worker-credential-isolation D2）。
+   */
+  run: string
 }
 
 /** 需要初始化为独立 git 仓库的子目录；`state/` 不进 git。 */
@@ -105,6 +110,7 @@ export function raindownPaths(home: string): RaindownPaths {
     nodeId: join(state, 'node-id'),
     backups: join(state, 'backups'),
     logs: join(state, 'logs'),
+    run: join(home, 'run'),
   }
 }
 

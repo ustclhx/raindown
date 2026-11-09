@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { taskRunDir } from '@raindown/core'
 import {
   cleanLeaseTokenFiles,
   leaseTokenDir,
@@ -40,21 +41,39 @@ test('启动只删除受管 token 文件，保留任务产物且不跟随目录�
   const home = await tempHome()
   await cleanLeaseTokenFiles(home)
   const token = await writeLeaseTokenFile(home, 't-1', 'l-1', 'token')
-  const artifact = join(home, 'state', 'tasks', 't-1', 'result.json')
+  const artifact = join(taskRunDir(home, 't-1'), 'result.json')
   await writeFile(artifact, '{}')
   const unrelated = join(leaseTokenDir(home, 't-1'), 'keep.json')
   await writeFile(unrelated, '{}')
   const outside = join(home, 'outside')
   await mkdir(outside)
   await writeFile(join(outside, 'l-2.token'), 'keep')
-  await symlink(outside, join(home, 'state', 'tasks', 't-link'))
-  await mkdir(join(home, 'state', 'tasks', 't-2'))
+  await symlink(outside, join(home, 'run', 'tasks', 't-link'))
+  await mkdir(taskRunDir(home, 't-2'))
   await symlink(outside, leaseTokenDir(home, 't-2'))
   await expect(writeLeaseTokenFile(home, 't-2', 'l-2', 'bad')).rejects.toThrow()
   await cleanLeaseTokenFiles(home)
   expect(existsSync(token)).toBe(false)
   for (const path of [artifact, unrelated, join(outside, 'l-2.token')])
     expect(existsSync(path)).toBe(true)
+})
+
+test('派工凭证写在 state/ 之外的 run/tasks/<任务>/；启动时也清理旧位置 state/tasks/ 残留的凭证', async () => {
+  const home = await tempHome()
+  const token = await writeLeaseTokenFile(home, 't-1', 'l-1', 'token')
+  expect(token).toBe(join(home, 'run', 'tasks', 't-1', 'dispatch-tokens', 'l-1.token'))
+  for (const dir of [join(home, 'run'), join(home, 'run', 'tasks'), taskRunDir(home, 't-1')])
+    expect((await stat(dir)).mode & 0o777).toBe(0o700)
+  const legacyDir = join(home, 'state', 'tasks', 't-old', 'dispatch-tokens')
+  await mkdir(legacyDir, { recursive: true })
+  const legacyToken = join(legacyDir, 'l-0.token')
+  await writeFile(legacyToken, 'old')
+  const legacySpec = join(home, 'state', 'tasks', 't-old', 'spec.md')
+  await writeFile(legacySpec, '# 任务说明')
+  await cleanLeaseTokenFiles(home)
+  expect(existsSync(token)).toBe(false)
+  expect(existsSync(legacyToken)).toBe(false)
+  expect(existsSync(legacySpec)).toBe(true)
 })
 
 test.each(['done', 'abandon'] as const)('节点只传派工凭证文件路径，%s 后删除', async (ending) => {
@@ -162,7 +181,7 @@ test.each([false, true])('节点凭证写失败仅对 MCP 执行器致命（rain
       }
       if (body.data?.lease) {
         const lease = body.data.lease
-        await mkdir(join(home, 'state', 'tasks', lease.task_id), { recursive: true })
+        await mkdir(taskRunDir(home, lease.task_id), { recursive: true })
         await symlink(home, leaseTokenDir(home, lease.task_id))
         lease.dispatch_token = 'dispatch-secret-never-log'
       }
@@ -236,7 +255,7 @@ test('凭证准备期间释放租约会取消计时器并清理已写入的唤�
         const lease = body.data.lease
         taskId = lease.task_id
         leaseId = lease.lease_id
-        await mkdir(join(home, 'state', 'tasks', taskId), { recursive: true })
+        await mkdir(taskRunDir(home, taskId), { recursive: true })
         await symlink(home, leaseTokenDir(home, taskId))
         lease.dispatch_token = 'dispatch-secret-initial'
         lease.wake_token = 'wake-secret-initial'

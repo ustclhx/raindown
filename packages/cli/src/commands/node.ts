@@ -1,5 +1,6 @@
 import { join } from 'node:path'
 import {
+  describeCredentialIsolation,
   fail,
   type NodeView,
   ok,
@@ -63,6 +64,19 @@ export const nodeStartCommand = defineCommand({
 
 const lastSeen = (n: NodeView) => n.last_seen_at ?? '—'
 
+/**
+ * 每个执行器的凭证隔离声明（worker-credential-isolation 1.3）。目前只是声明将要支持的施加层，
+ * 尚未施加，明确标为“未施加”，不能读成已隔离。
+ */
+export function isolationLines(nodes: readonly NodeView[]): string {
+  const lines = nodes.flatMap((n) =>
+    n.executors.map(
+      (e) => `  ${n.node_id} ${e.type}：${describeCredentialIsolation(e.adapter_capabilities)}`,
+    ),
+  )
+  return lines.length ? `凭证隔离（按角色沙箱设置声明的施加层）：\n${lines.join('\n')}` : ''
+}
+
 /** `raindown node list`：列出已注册的节点（node-protocol "查看节点"）。 */
 export const nodeListCommand = defineCommand({
   name: 'node list',
@@ -72,8 +86,8 @@ export const nodeListCommand = defineCommand({
     if (!client.ok) return client
     return client.data.listNodes()
   },
-  human: (d) =>
-    renderTable(
+  human: (d) => {
+    const table = renderTable(
       d.nodes,
       [
         { header: 'ID', value: (n) => n.node_id },
@@ -83,5 +97,8 @@ export const nodeListCommand = defineCommand({
         { header: '最近活动', value: lastSeen },
       ],
       '（没有已注册的节点）',
-    ),
+    )
+    const isolation = isolationLines(d.nodes)
+    return isolation ? `${table}\n\n${isolation}` : table
+  },
 })

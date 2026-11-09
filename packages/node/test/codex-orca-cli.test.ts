@@ -73,7 +73,7 @@ describe('orca 封装', () => {
     expect(
       buildCodexCommand({
         codexBin: 'codex',
-        codexHome: '/raindown/state/codex-orca-home',
+        codexHome: '/raindown/run/executors/codex-orca/codex-home',
         worktreePath: '/repo',
         specPath: '/spec.md',
         role: { name: 'dev', permissions: { writable_paths: ['docs/**'] } },
@@ -411,7 +411,7 @@ describe('启动 Codex 的命令', () => {
   test('bypass 角色：与 run-codex.sh 等价，任务说明经文件传入', () => {
     const r = buildCodexCommand({
       codexBin: 'codex',
-      codexHome: '/raindown/state/codex-orca-home',
+      codexHome: '/raindown/run/executors/codex-orca/codex-home',
       worktreePath: '/wt/t 1',
       specPath: '/home/state/tasks/t-1/spec.md',
       role: {
@@ -428,7 +428,7 @@ describe('启动 Codex 的命令', () => {
     expect(r).toEqual({
       ok: true,
       data:
-        "cd '/wt/t 1' && exec env -u RAINDOWN_HUB_TOKEN -u RAINDOWN_HUB_TOKEN_FILE -u RAINDOWN_LEASE_TOKEN_FILE -u FLOW_LEASE_TOKEN_FILE -u FLOW_HUB_TOKEN -u FLOW_HUB_TOKEN_FILE RAINDOWN_ACTOR=dev FLOW_ACTOR=dev CODEX_HOME=/raindown/state/codex-orca-home codex -m gpt-6.1-sol -c model_reasoning_effort=high " +
+        "cd '/wt/t 1' && exec env -u RAINDOWN_HUB_TOKEN -u RAINDOWN_HUB_TOKEN_FILE -u RAINDOWN_LEASE_TOKEN_FILE -u FLOW_LEASE_TOKEN_FILE -u FLOW_HUB_TOKEN -u FLOW_HUB_TOKEN_FILE RAINDOWN_ACTOR=dev FLOW_ACTOR=dev CODEX_HOME=/raindown/run/executors/codex-orca/codex-home codex -m gpt-6.1-sol -c model_reasoning_effort=high " +
         '-c service_tier=priority --dangerously-bypass-approvals-and-sandbox ' +
         '"$(cat /home/state/tasks/t-1/spec.md)"',
     })
@@ -437,13 +437,13 @@ describe('启动 Codex 的命令', () => {
   test('on-request 角色：-a 与 -s，并默认将授权弹窗交给 Raindown', () => {
     const r = buildCodexCommand({
       codexBin: 'codex',
-      codexHome: '/raindown/state/codex-orca-home',
+      codexHome: '/raindown/run/executors/codex-orca/codex-home',
       worktreePath: '/wt',
       specPath: '/s.md',
       role: { name: 'dev', permissions: { approval: 'on-request', sandbox: 'workspace-write' } },
     })
     expect(r.ok && r.data).toBe(
-      'cd /wt && exec env -u RAINDOWN_HUB_TOKEN -u RAINDOWN_HUB_TOKEN_FILE -u RAINDOWN_LEASE_TOKEN_FILE -u FLOW_LEASE_TOKEN_FILE -u FLOW_HUB_TOKEN -u FLOW_HUB_TOKEN_FILE RAINDOWN_ACTOR=dev FLOW_ACTOR=dev CODEX_HOME=/raindown/state/codex-orca-home codex -c approvals_reviewer=user -a on-request -s workspace-write "$(cat /s.md)"',
+      'cd /wt && exec env -u RAINDOWN_HUB_TOKEN -u RAINDOWN_HUB_TOKEN_FILE -u RAINDOWN_LEASE_TOKEN_FILE -u FLOW_LEASE_TOKEN_FILE -u FLOW_HUB_TOKEN -u FLOW_HUB_TOKEN_FILE RAINDOWN_ACTOR=dev FLOW_ACTOR=dev CODEX_HOME=/raindown/run/executors/codex-orca/codex-home codex -c approvals_reviewer=user -a on-request -s workspace-write "$(cat /s.md)"',
     )
   })
 
@@ -452,7 +452,7 @@ describe('启动 Codex 的命令', () => {
     (permissions) => {
       const r = buildCodexCommand({
         codexBin: 'codex',
-        codexHome: '/raindown/state/codex-orca-home',
+        codexHome: '/raindown/run/executors/codex-orca/codex-home',
         worktreePath: '/wt',
         specPath: '/s.md',
         role: { name: 'dev', permissions },
@@ -465,7 +465,7 @@ describe('启动 Codex 的命令', () => {
   test('approval=never 时不默认追加 reviewer', () => {
     const r = buildCodexCommand({
       codexBin: 'codex',
-      codexHome: '/raindown/state/codex-orca-home',
+      codexHome: '/raindown/run/executors/codex-orca/codex-home',
       worktreePath: '/wt',
       specPath: '/s.md',
       role: { name: 'dev', permissions: { approval: 'never', sandbox: 'workspace-write' } },
@@ -479,7 +479,7 @@ describe('启动 Codex 的命令', () => {
     (reviewer) => {
       const r = buildCodexCommand({
         codexBin: 'codex',
-        codexHome: '/raindown/state/codex-orca-home',
+        codexHome: '/raindown/run/executors/codex-orca/codex-home',
         worktreePath: '/wt',
         specPath: '/s.md',
         role: {
@@ -537,7 +537,7 @@ test('Orca 启动命令把角色身份传给实际子进程，并覆盖终端继
 test('Orca 启动命令移除完整 denylist，并拒绝包含 = 的 codexBin', () => {
   const base = {
     codexBin: 'codex',
-    codexHome: '/raindown/state/codex-orca-home',
+    codexHome: '/raindown/run/executors/codex-orca/codex-home',
     worktreePath: '/wt',
     specPath: '/s.md',
     role: { name: 'dev' },

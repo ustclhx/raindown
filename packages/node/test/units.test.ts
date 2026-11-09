@@ -136,6 +136,7 @@ describe('执行器注册表', () => {
           resume_session: true,
           raindown_mcp: false,
           out_of_band_detection: false,
+          credential_isolation: { layers: {}, enforced: false },
         },
       },
     ])

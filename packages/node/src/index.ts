@@ -52,7 +52,14 @@ export {
   prepareReadCodexHome,
   readCodexHome,
 } from './codex-exec.ts'
-export { execCodexHome, orcaCodexHome, prepareCodexHome, sameCodexHome } from './codex-home.ts'
+export {
+  CODEX_CREDENTIAL_ISOLATION,
+  execCodexHome,
+  migrateCodexHomes,
+  orcaCodexHome,
+  prepareCodexHome,
+  sameCodexHome,
+} from './codex-home.ts'
 export {
   analyzeTail,
   BUSY_RE,

@@ -161,7 +161,7 @@ workspace、lease 与 attempt；`--actor`、`--task` 和环境变量都不能声
 任务凭证访问其他任务或调用建任务、回复任务、收件箱操作、密钥与节点协议等接口，一律返回 403 `forbidden`。
 只读知识操作由任务绑定 MCP 在本地执行，不经中枢 HTTP。
 
-节点把 `dispatch_token` 写入 `state/tasks/<task>/dispatch-tokens/<lease>.token`（目录 0700、文件 0600），
+节点把 `dispatch_token` 写入 `run/tasks/<task>/dispatch-tokens/<lease>.token`（目录 0700、文件 0600；位于 `state/` 之外，见 `docs/executors.md` 的「`run/` 目录」），
 仅通过 `ExecutorContext.leaseTokenFile` 向适配器交付路径，供后续受管 MCP 配置使用；明文不放进 argv、env 或活动日志。
 MCP 通过 `RAINDOWN_LEASE_TOKEN_FILE` 读取凭证；节点通用子进程环境移除此变量，适配器仅为受管 MCP 显式设置它。
 任务结束、取消或放弃租约后删除文件；持有节点单实例锁的启动清理只删除受管目录内的 token 文件，保留任务产物且不跟随目录符号链接。

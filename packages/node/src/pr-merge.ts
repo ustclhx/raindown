@@ -188,7 +188,11 @@ export function createPrMergeExecutor(options: PrMergeOptions): ExecutorPlugin {
   return {
     type: PR_MERGE_EXECUTOR,
     mode: 'headless',
-    adapterCapabilities: NO_ADAPTER_CAPABILITIES,
+    // 节点内执行、不启动 harness，节点属于可信计算基（D1）。
+    adapterCapabilities: {
+      ...NO_ADAPTER_CAPABILITIES,
+      credential_isolation: { layers: { 'in-node': 'none' }, enforced: false },
+    },
     taskInputs: false,
     classify: () => null,
     run(contract: TaskContract, ctx: ExecutorContext) {

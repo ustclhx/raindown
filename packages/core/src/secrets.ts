@@ -28,8 +28,12 @@ const treeSchema: z.ZodType<SecretTree> = z.record(
   secretPathSchema.refine((k) => !k.includes('/')),
   z.lazy(() => z.union([z.string(), treeSchema])),
 )
-const keyFile = (opts: SecretsOptions) =>
-  opts.ageKeyFile ?? join(homedir(), '.config/sops/age/keys.txt')
+/** age 私钥文件的位置：显式传入优先，否则为 `<home>/.config/sops/age/keys.txt`；隔离清单据此确定私钥目录。 */
+export const resolveAgeKeyFile = (
+  opts: Pick<SecretsOptions, 'ageKeyFile'> = {},
+  home: string = homedir(),
+): string => opts.ageKeyFile ?? join(home, '.config/sops/age/keys.txt')
+const keyFile = (opts: SecretsOptions) => resolveAgeKeyFile(opts)
 
 async function sops(home: string, args: string[], opts: SecretsOptions, input?: string) {
   const r = await (opts.exec ?? execCommand)(opts.sopsBin ?? 'sops', args, {

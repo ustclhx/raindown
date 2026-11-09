@@ -1,15 +1,150 @@
 import { randomBytes } from 'node:crypto'
-import { existsSync } from 'node:fs'
-import { lstat, mkdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
-import { fail, ok, type Result, raindownPaths } from '@raindown/core'
+import { existsSync, lstatSync } from 'node:fs'
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readlink,
+  realpath,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
+import {
+  type CredentialIsolation,
+  executorRunDir,
+  fail,
+  ok,
+  type Result,
+  raindownPaths,
+} from '@raindown/core'
 
-/** 读任务继续使用原目录，保留已有会话以便恢复。 */
-export const readCodexHome = (home: string) => join(raindownPaths(home).state, 'codex-read-home')
+/**
+ * Raindown 管理的 CODEX_HOME 位于 `run/executors/<执行器>/` 下（D2：移出 `state/`，隔离可整体拒绝 `state/`）。
+ * 旧版本放在 `state/` 下；节点启动时由 `migrateCodexHomes` 迁移。旧位置仍是普通目录（迁移失败或尚未迁移）时继续使用旧位置，
+ * 不丢失登录状态与会话。
+ */
+interface CodexHomeLocation {
+  legacy: string
+  current: string
+}
 
-/** 写任务按执行器隔离运行状态，避免交互式与无头 Codex 互相影响。 */
-export const orcaCodexHome = (home: string) => join(raindownPaths(home).state, 'codex-orca-home')
-export const execCodexHome = (home: string) => join(raindownPaths(home).state, 'codex-exec-home')
+const codexHomeLocations = (home: string) => {
+  const state = raindownPaths(home).state
+  return {
+    // 读任务单独一个目录，保留已有会话以便恢复。
+    read: {
+      legacy: join(state, 'codex-read-home'),
+      current: join(executorRunDir(home, 'codex-exec'), 'codex-read-home'),
+    },
+    // 写任务按执行器隔离运行状态，避免交互式与无头 Codex 互相影响。
+    orca: {
+      legacy: join(state, 'codex-orca-home'),
+      current: join(executorRunDir(home, 'codex-orca'), 'codex-home'),
+    },
+    exec: {
+      legacy: join(state, 'codex-exec-home'),
+      current: join(executorRunDir(home, 'codex-exec'), 'codex-home'),
+    },
+  } satisfies Record<string, CodexHomeLocation>
+}
+
+/** 旧位置是普通目录（不是迁移后留下的链接）时继续使用旧位置。 */
+function activeLocation(loc: CodexHomeLocation): string {
+  try {
+    const info = lstatSync(loc.legacy)
+    if (info.isDirectory() && !info.isSymbolicLink()) return loc.legacy
+  } catch {
+    // 旧位置不存在或不可访问：使用新位置。
+  }
+  return loc.current
+}
+
+export const readCodexHome = (home: string) => activeLocation(codexHomeLocations(home).read)
+export const orcaCodexHome = (home: string) => activeLocation(codexHomeLocations(home).orca)
+export const execCodexHome = (home: string) => activeLocation(codexHomeLocations(home).exec)
+
+/**
+ * 节点启动时（持有节点锁之后）把旧位置的 CODEX_HOME 迁到 `run/`：同一文件系统内 rename，再在旧位置留一个指向新位置的
+ * 符号链接，使升级前启动、环境里仍是旧路径的存活 Codex 终端继续可用，并能通过 `sameCodexHome` 的真实路径比较重新挂接。
+ * 幂等：旧位置已是链接或不存在时跳过。新旧位置同时存在、rename 失败（例如跨文件系统）时保留旧位置继续使用并记日志。
+ * 返回实际迁移的条目，供测试与日志使用。
+ */
+export async function migrateCodexHomes(
+  home: string,
+  log: (message: string) => void,
+): Promise<{ migrated: string[] }> {
+  const migrated: string[] = []
+  for (const loc of Object.values(codexHomeLocations(home))) {
+    let info: Awaited<ReturnType<typeof lstat>>
+    try {
+      info = await lstat(loc.legacy)
+    } catch (err) {
+      if (!missing(err)) log(`无法检查旧 CODEX_HOME ${loc.legacy}：${(err as Error).message}`)
+      continue
+    }
+    if (info.isSymbolicLink()) continue
+    if (!info.isDirectory()) {
+      log(`旧 CODEX_HOME ${loc.legacy} 不是目录，跳过迁移`)
+      continue
+    }
+    try {
+      await lstat(loc.current)
+      log(
+        `CODEX_HOME 新旧位置同时存在（${loc.legacy}、${loc.current}），继续使用旧位置；请确认后手动合并`,
+      )
+      continue
+    } catch (err) {
+      if (!missing(err)) {
+        log(`无法检查 ${loc.current}，继续使用旧位置：${(err as Error).message}`)
+        continue
+      }
+    }
+    try {
+      await ensureRunDirs(dirname(loc.current), raindownPaths(home).run)
+      await rename(loc.legacy, loc.current)
+    } catch (err) {
+      log(
+        `迁移 CODEX_HOME ${loc.legacy} → ${loc.current} 失败，继续使用旧位置：${(err as Error).message}`,
+      )
+      continue
+    }
+    migrated.push(loc.current)
+    try {
+      await symlink(loc.current, loc.legacy)
+    } catch (err) {
+      // 新位置已生效；只有升级前启动的存活终端会因此无法重挂接。
+      log(`已迁移到 ${loc.current}，但无法在旧位置留下链接：${(err as Error).message}`)
+    }
+  }
+  return { migrated }
+}
+
+/** 逐级创建 `run/` 到 `dir` 的目录并收紧为 0700（已存在的目录也收紧，拒绝符号链接）。 */
+async function ensureRunDirs(dir: string, runRoot: string): Promise<void> {
+  const chain: string[] = []
+  for (let d = dir; d.startsWith(runRoot); d = dirname(d)) {
+    chain.unshift(d)
+    if (d === runRoot) break
+  }
+  for (const d of chain) {
+    await mkdir(d, { recursive: true, mode: 0o700 })
+    const info = await lstat(d)
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(`${d} 不是普通目录`)
+    await chmod(d, 0o700)
+  }
+}
+
+/**
+ * codex-orca 与 codex-exec 的凭证隔离声明（D1）：harness 沙箱关闭（danger-full-access / bypass）时由外层 seatbelt 施加，
+ * 开启（workspace-write / read-only）时由 Codex permissions profile 施加。本阶段只声明，尚未施加。
+ */
+export const CODEX_CREDENTIAL_ISOLATION: CredentialIsolation = {
+  layers: { 'danger-full-access': 'seatbelt', 'workspace-write': 'native', 'read-only': 'native' },
+  enforced: false,
+}
 
 const HOME_CONFIG = `# 由 Raindown 生成，每次启动 Codex 前覆盖。
 # 不含任务绑定、notify、hooks 与项目信任记录；Raindown MCP 由本模块生成的 -c 层注入。

@@ -43,6 +43,7 @@ import {
 } from '@raindown/core'
 import { createNodeHubClient, type FetchLike, type NodeHubClient } from './client.ts'
 import { type NodeClock, sleep, systemClock } from './clock.ts'
+import { migrateCodexHomes } from './codex-home.ts'
 import type { CommandRunner } from './codex-orca/orca.ts'
 import { dualRaindownEnv, executorEnv } from './env.ts'
 import {
@@ -1713,6 +1714,9 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
   // 调用方（startNode）已持有节点单实例锁，不会误删并行节点的文件。
   await cleanWakeTokenDir(home)
   await cleanLeaseTokenFiles(home)
+  // CODEX_HOME 从 state/ 迁到 run/（worker-credential-isolation D2）；失败时保留旧位置继续使用。
+  const codexHomes = await migrateCodexHomes(home, (message) => logger.warn(message))
+  for (const dir of codexHomes.migrated) logger.info(`CODEX_HOME 已迁移到 ${dir}`)
 
   const id =
     options.nodeId !== undefined ? ok(options.nodeId) : await loadOrCreateNodeId(home, host)

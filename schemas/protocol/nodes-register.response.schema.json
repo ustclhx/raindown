@@ -85,6 +85,37 @@
                       "out_of_band_detection": {
                         "default": false,
                         "type": "boolean"
+                      },
+                      "credential_isolation": {
+                        "type": "object",
+                        "properties": {
+                          "layers": {
+                            "default": {},
+                            "type": "object",
+                            "propertyNames": {
+                              "type": "string"
+                            },
+                            "additionalProperties": {
+                              "default": "none",
+                              "type": "string",
+                              "enum": [
+                                "seatbelt",
+                                "native",
+                                "separate_user",
+                                "none"
+                              ]
+                            }
+                          },
+                          "enforced": {
+                            "default": false,
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "layers",
+                          "enforced"
+                        ],
+                        "additionalProperties": false
                       }
                     },
                     "required": [

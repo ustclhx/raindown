@@ -23,6 +23,7 @@ import {
 import { z } from 'zod'
 import { type NodeClock, systemClock } from './clock.ts'
 import {
+  CODEX_CREDENTIAL_ISOLATION,
   codexShellEnvPolicyConfig,
   codexTaskMcpConfig,
   execCodexHome,
@@ -162,6 +163,7 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
       resume_session: true,
       raindown_mcp: true,
       out_of_band_detection: false,
+      credential_isolation: CODEX_CREDENTIAL_ISOLATION,
     },
     // 进程仍在运行时不从中间消息推断提问；无进展由节点判定。
     classify: () => null,
