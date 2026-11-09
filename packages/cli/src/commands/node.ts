@@ -1,3 +1,4 @@
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import {
   describeCredentialIsolation,
@@ -19,6 +20,7 @@ import {
   createFakeExecutor,
   createPrMergeExecutor,
   nodeHubClientFromHome,
+  resolveOrcaPorts,
   type SeatbeltOptions,
   seatbeltActive,
   seatbeltProbeLaunchWrapper,
@@ -45,7 +47,12 @@ export const nodeStartCommand = defineCommand({
     // 关闭时各执行器的启动方式与之前一致、探针以恒等包裹运行；打开时（仅 macOS）探针与 worker 用同一 SBPL 生成函数。
     const nodeConfig = await loadNodeConfig(home)
     if (!nodeConfig.ok) return nodeConfig
-    const isolation: SeatbeltOptions = { enforce: nodeConfig.data.isolation.enforce }
+    // Orca 本机端口只读解析（目录项名 + lsof，不连接 Orca）；未解析时不生成端口规则，探针记为失败（审查第一轮 M2）。
+    const orcaPorts = () => resolveOrcaPorts(homedir())
+    const isolation: SeatbeltOptions = {
+      enforce: nodeConfig.data.isolation.enforce,
+      resolveOrcaPorts: orcaPorts,
+    }
     if (isolation.enforce && !seatbeltActive(isolation))
       console.error(
         'config/node.yaml 的 isolation.enforce 已打开，但外层 seatbelt 只支持 macOS，本机不施加',
@@ -63,9 +70,12 @@ export const nodeStartCommand = defineCommand({
       ],
       // 隔离自检探针：启动时、每 6 小时、macOS 版本变化时运行，结果随注册上报（worker-credential-isolation 3.1）。
       // 探针只判断受保护文件能否打开，不读取内容。
-      isolationProbe: seatbeltActive(isolation)
-        ? { launchWrapper: seatbeltProbeLaunchWrapper(isolation) }
-        : {},
+      isolationProbe: {
+        resolveOrcaPorts: orcaPorts,
+        ...(seatbeltActive(isolation)
+          ? { launchWrapper: seatbeltProbeLaunchWrapper(isolation) }
+          : {}),
+      },
     })
     if (!started.ok) return started
     const node = started.data

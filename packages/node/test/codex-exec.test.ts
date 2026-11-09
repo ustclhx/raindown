@@ -908,7 +908,7 @@ describe('外层 seatbelt（worker-credential-isolation 4.3）', () => {
     )
     expect(s.report().args[0]).toBe('exec')
     expect(existsSync(fake.report)).toBe(false)
-    expect(existsSync(join(s.home, 'run/tasks/t-test/isolation.sb'))).toBe(false)
+    expect(existsSync(join(s.home, 'state/tasks/t-test/isolation.sb'))).toBe(false)
   })
 
   test('开关打开、danger-full-access：子进程经 sandbox-exec -f <配置> codex … 启动，配置 0600', async () => {
@@ -918,7 +918,7 @@ describe('外层 seatbelt（worker-credential-isolation 4.3）', () => {
       s.run({ ...s.ctx, hubUrl }, { ...s.options, isolation: isolation(s, fake.script) }),
     )
     expect(outcome.outcome).toBe('done')
-    const profile = join(s.home, 'run/tasks/t-test/isolation.sb')
+    const profile = join(s.home, 'state/tasks/t-test/isolation.sb')
     const args = fake.args()
     expect(args.slice(0, 4)).toEqual(['-f', profile, process.execPath, join(s.dir, 'codex.cjs')])
     // codex 自己的参数原样跟在后面（与开关关闭时相同）。
@@ -977,7 +977,7 @@ describe('外层 seatbelt（worker-credential-isolation 4.3）', () => {
     'macOS 实测：真实 sandbox-exec 下 worker 读不到 state/hub.token，任务照常完成',
     async () => {
       const s = setup(
-        `let r = 'readable'; try { fs.readFileSync(process.env.RAINDOWN_HOME + '/state/hub.token') } catch (e) { r = e.code } fs.writeFileSync('hub-read.txt', r); send(resumed)`,
+        `let r = 'readable'; try { fs.readFileSync(process.env.RAINDOWN_HOME + '/state/hub.token') } catch (e) { r = e.code } fs.writeFileSync('hub-read.txt', r); let w = 'writable'; try { fs.writeFileSync(process.env.RAINDOWN_HOME + '/state/tasks/t-test/isolation.sb', '(version 1)(allow default)') } catch (e) { w = e.code } fs.writeFileSync('profile-write.txt', w); send(resumed)`,
         dfa,
       )
       mkdirSync(join(s.home, 'state'), { recursive: true })
@@ -987,6 +987,11 @@ describe('外层 seatbelt（worker-credential-isolation 4.3）', () => {
       )
       expect(outcome.outcome).toBe('done')
       expect(readFileSync(join(s.dir, 'hub-read.txt'), 'utf8')).toBe('EPERM')
+      // 审查第一轮 H2：worker 不能改写本任务实际使用的配置（位于 state/tasks/<任务>/）。
+      expect(readFileSync(join(s.dir, 'profile-write.txt'), 'utf8')).toBe('EPERM')
+      expect(readFileSync(join(s.home, 'state/tasks/t-test/isolation.sb'), 'utf8')).toContain(
+        '(deny file-write*',
+      )
       // 对照：不施加时可读。
       const plain = setup(
         `let r = 'readable'; try { fs.readFileSync(process.env.RAINDOWN_HOME + '/state/hub.token') } catch (e) { r = e.code } fs.writeFileSync('hub-read.txt', r); send(resumed)`,

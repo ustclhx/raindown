@@ -11,7 +11,7 @@ export type IsolationLayer = z.infer<typeof isolationLayer>
 /**
  * 角色的沙箱设置（决定可用的施加层，D1 的表）。由 `roleSandboxSetting` 从角色配置推出：
  * - codex：`danger-full-access`（含 bypass）、`workspace-write`、`read-only`；
- * - claude-sdk：`bash-sandbox-off`、`bash-sandbox-on`；
+ * - claude-sdk：`bash-sandbox-off`、`bash-sandbox-on`，以及 supervisor 唤醒会话 `supervisor-session`（不施加外层隔离）；
  * - `in-node`：在节点进程内执行、不启动 harness（pr-merge）。
  * 键在注册时只校验格式，未来的新设置不会让旧中枢拒绝注册。
  */
@@ -21,6 +21,7 @@ export const SANDBOX_SETTINGS = [
   'read-only',
   'bash-sandbox-off',
   'bash-sandbox-on',
+  'supervisor-session',
   'in-node',
 ] as const
 export type SandboxSetting = (typeof SANDBOX_SETTINGS)[number]

@@ -47,6 +47,7 @@ import {
   summarizeToolInput,
   systemClock,
 } from '../src/index.ts'
+import { seatbeltApplies } from '../src/seatbelt.ts'
 import { type Bench, bench, ManualClock } from './harness.ts'
 import { waitFor } from './wait.ts'
 
@@ -2059,7 +2060,11 @@ describe('外层 seatbelt（worker-credential-isolation 4.4）', () => {
     expect(state.calls[0]).not.toHaveProperty('spawnClaudeCodeProcess')
     expect(state.calls[0]).not.toHaveProperty('sandbox')
     expect(ex.adapterCapabilities.credential_isolation).toEqual({
-      layers: { 'bash-sandbox-off': 'seatbelt', 'bash-sandbox-on': 'none' },
+      layers: {
+        'bash-sandbox-off': 'seatbelt',
+        'bash-sandbox-on': 'none',
+        'supervisor-session': 'none',
+      },
       enforced: false,
     })
   })
@@ -2074,10 +2079,14 @@ describe('外层 seatbelt（worker-credential-isolation 4.4）', () => {
     const options = state.calls[0]
     expect(options?.sandbox).toEqual({ enabled: false })
     expect(typeof options?.spawnClaudeCodeProcess).toBe('function')
-    const profile = join(s.home, 'run/tasks/t-1/isolation.sb')
+    const profile = join(s.home, 'state/tasks/t-1/isolation.sb')
     expect(readFileSync(profile, 'utf8')).toContain(`(subpath ${JSON.stringify(s.cwd)})`)
     expect(ex.adapterCapabilities.credential_isolation).toEqual({
-      layers: { 'bash-sandbox-off': 'seatbelt', 'bash-sandbox-on': 'none' },
+      layers: {
+        'bash-sandbox-off': 'seatbelt',
+        'bash-sandbox-on': 'none',
+        'supervisor-session': 'none',
+      },
       enforced: true,
     })
   })
@@ -2125,6 +2134,39 @@ describe('外层 seatbelt（worker-credential-isolation 4.4）', () => {
       '--version',
     ])
     expect(out.join('')).toBe('--version\n')
+  })
+
+  test('seatbeltSpawner：sandbox-exec 不存在时只发出 error，原因写入 stderr 回调（审查第一轮 L2）', async () => {
+    const errs: string[] = []
+    const spawnFn = seatbeltSpawner(['/nonexistent/sandbox-exec', '-f', '/x.sb'], (d) =>
+      errs.push(d),
+    )
+    const child = spawnFn({
+      command: '/bin/echo',
+      args: [],
+      env: {},
+      signal: new AbortController().signal,
+    })
+    // SDK 也会注册 error 监听；这里只确认没有未处理的 error 让进程崩溃，且原因可见。
+    await waitFor(() => errs.join('').includes('ENOENT'), 'stderr 回调收到启动失败')
+    expect(errs.join('')).toContain('sandbox-exec 启动失败')
+    expect(child.exitCode === null || child.exitCode !== 0).toBe(true)
+  })
+
+  test('supervisor 会话：沙箱设置为 supervisor-session，开关打开时也不包裹（审查第一轮 M1）', () => {
+    const declared = createClaudeSdkExecutor({
+      home: '/tmp/raindown-home-not-used',
+      isolation: { enforce: true, platform: 'darwin' },
+    }).adapterCapabilities.credential_isolation
+    expect(declared?.layers['supervisor-session']).toBe('none')
+    expect(declared?.layers['bash-sandbox-off']).toBe('seatbelt')
+    expect(
+      seatbeltApplies(
+        declared as NonNullable<typeof declared>,
+        { executor: 'claude-sdk', kind: 'supervisor' },
+        { enforce: true, platform: 'darwin' },
+      ),
+    ).toBe(false)
   })
 
   test('buildOptions：给出前缀时才加 sandbox 与 spawnClaudeCodeProcess', () => {

@@ -136,7 +136,7 @@
                             }
                           ]
                         },
-                        "description": "按角色沙箱设置声明的施加层（已知取值：seatbelt、native、separate_user、none；不认识的取值按 none）；已知设置：danger-full-access、workspace-write、read-only、bash-sandbox-off、bash-sandbox-on、in-node。未列出的设置视为 none"
+                        "description": "按角色沙箱设置声明的施加层（已知取值：seatbelt、native、separate_user、none；不认识的取值按 none）；已知设置：danger-full-access、workspace-write、read-only、bash-sandbox-off、bash-sandbox-on、supervisor-session、in-node。未列出的设置视为 none"
                       },
                       "enforced": {
                         "type": "boolean",

@@ -294,6 +294,8 @@ describe('credential_isolation 能力与角色沙箱设置', () => {
       [{ executor: 'codex-orca' }, undefined],
       [{ executor: 'codex-orca', permissions: { sandbox: 'future-mode' } }, undefined],
       [{ executor: 'claude-sdk' }, 'bash-sandbox-off'],
+      // 审查第一轮 M1：supervisor 唤醒会话不施加外层隔离，单独一个沙箱设置。
+      [{ executor: 'claude-sdk', kind: 'supervisor' }, 'supervisor-session'],
       [{ executor: 'pr-merge' }, 'in-node'],
       [{ executor: 'fake' }, undefined],
     ]

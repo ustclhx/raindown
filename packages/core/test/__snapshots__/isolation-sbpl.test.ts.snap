@@ -32,13 +32,27 @@ exports[`SBPL 生成 快照：allow default + 最窄允许项在前 + 显式拒�
 (deny file-read* file-write*
   (require-all (subpath "/Users/u/raindown-home/run/tasks") (require-not (literal "/Users/u/raindown-home/run/tasks")) (require-not (subpath "/Users/u/raindown-home/run/tasks/t-1"))))
 
-;; 4. 控制通道：文件规则拦不住 unix 套接字 connect，单独拒绝；只拒绝已解析的 Orca 端口，其他本机端口不拒绝
+;; 4. 受保护路径的祖先目录：拒绝对目录节点本身的写（改名、删除），防止改名祖先目录后在新路径下绕过上面的规则
+(deny file-write*
+  (literal "/")
+  (literal "/Users")
+  (literal "/Users/u")
+  (literal "/Users/u/.config")
+  (literal "/Users/u/.config/sops")
+  (literal "/Users/u/Library")
+  (literal "/Users/u/Library/Application Support")
+  (literal "/Users/u/raindown-home")
+  (literal "/Users/u/raindown-home/run")
+  (literal "/Users/u/raindown-home/run/tasks")
+  (literal "/Users/u/raindown-home/run/tasks/t-1"))
+
+;; 5. 控制通道：文件规则拦不住 unix 套接字 connect，单独拒绝；只拒绝已解析的 Orca 端口，其他本机端口不拒绝
 (deny network-outbound
   (remote unix-socket (subpath "/Users/u/Library/Application Support/orca")))
 (deny network-outbound
   (remote ip "*:60211"))
 
-;; 5. 跨进程调试（allow default 下默认允许 attach 同用户的非 hardened 进程）
+;; 6. 跨进程调试（allow default 下默认允许 attach 同用户的非 hardened 进程）
 (deny mach-priv-task-port (target others))
 (deny mach-task-name (target others))
 "

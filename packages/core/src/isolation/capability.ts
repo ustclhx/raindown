@@ -45,10 +45,13 @@ const CODEX_INDIRECT_KEYS = ['profile', 'default_permissions'] as const
  * - codex-orca：`approval: never` + `danger-full-access` 是 bypass，同属 danger-full-access；
  *   其次 `permissions.sandbox`（`-s`），再次 `permissions.config.sandbox_mode`（不传 `-s` 时生效，值可带 TOML 引号）；
  *   经 `profile` / `default_permissions` 间接指定或都没有时无法确定；
- * - claude-sdk：Raindown 目前不向 SDK 传 `sandbox` 选项，bash 沙箱关闭（项目设置能否开启见 tasks 4.4）；
+ * - claude-sdk：`kind: supervisor` 角色的唤醒会话为 `supervisor-session`（其 MCP 按设计仍在本地读取 raindown-home，不施加外层隔离）；
+ *   其他角色为 `bash-sandbox-off`（Raindown 不开启 bash 沙箱；施加 seatbelt 时以 SDK 的 sandbox 选项强制关闭，tasks 4.4）；
  * - pr-merge：节点内执行。
  */
-export function roleSandboxInfo(role: Pick<Role, 'executor' | 'permissions'>): RoleSandboxInfo {
+export function roleSandboxInfo(
+  role: Pick<Role, 'executor' | 'permissions'> & Partial<Pick<Role, 'kind'>>,
+): RoleSandboxInfo {
   const p = role.permissions ?? {}
   const unknown = (reason: string): RoleSandboxInfo => ({ reason })
   switch (role.executor) {
@@ -75,7 +78,7 @@ export function roleSandboxInfo(role: Pick<Role, 'executor' | 'permissions'>): R
       return unknown('没有设置 sandbox 或 config.sandbox_mode，由 Codex 自行决定')
     }
     case 'claude-sdk':
-      return { setting: 'bash-sandbox-off' }
+      return { setting: role.kind === 'supervisor' ? 'supervisor-session' : 'bash-sandbox-off' }
     case 'pr-merge':
       return { setting: 'in-node' }
     default:
@@ -84,7 +87,7 @@ export function roleSandboxInfo(role: Pick<Role, 'executor' | 'permissions'>): R
 }
 
 export function roleSandboxSetting(
-  role: Pick<Role, 'executor' | 'permissions'>,
+  role: Pick<Role, 'executor' | 'permissions'> & Partial<Pick<Role, 'kind'>>,
 ): SandboxSetting | undefined {
   return roleSandboxInfo(role).setting
 }

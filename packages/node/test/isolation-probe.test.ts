@@ -154,8 +154,12 @@ describe('未施加隔离（受保护项可读）', () => {
       // 套接字、端口未解析为跳过；跨进程调试为未验证。
       expect(by['connect.orca_socket']).toMatchObject({ actual: 'skipped', ok: null })
       expect(by['connect.orca_socket']?.detail).toContain('Orca 运行时目录不存在')
-      expect(by['connect.orca_port']).toMatchObject({ actual: 'skipped', ok: null })
+      // Orca 端口未解析：无法证明控制端口被拒绝，记为失败而不是跳过（审查第一轮 M2）。
+      expect(by['connect.orca_port']).toMatchObject({ actual: 'error', ok: false })
       expect(by['connect.orca_port']?.detail).toContain('Orca 端口未解析')
+      // 改名探针与本任务配置：未施加时改名成功（随后改回），没有配置文件时跳过。
+      expect(by['rename.protected_ancestor']).toMatchObject({ actual: 'allow', ok: false })
+      expect(by['write.own_profile']).toMatchObject({ actual: 'skipped', ok: null })
       expect(by['debug.process']).toMatchObject({ actual: 'unverified', ok: null })
       expect(by['read.hub_token']?.target).toBe(join(s.home, 'state', 'hub.token'))
     }
@@ -246,6 +250,18 @@ describe('模拟已隔离（注入的文件系统接口拒绝受保护项）', (
       },
       { item: 'write.config', kind: 'write_new', expected: 'deny', target: '/h/config' },
       {
+        item: 'rename.protected_ancestor',
+        kind: 'rename',
+        expected: 'deny',
+        target: '/h/run/tasks/p/rename-probe/a',
+      },
+      {
+        item: 'write.own_profile',
+        kind: 'open_write',
+        expected: 'deny',
+        target: '/h/state/tasks/p/isolation.sb',
+      },
+      {
         item: 'connect.orca_socket.1',
         kind: 'unix_connect',
         expected: 'deny',
@@ -281,6 +297,12 @@ describe('模拟已隔离（注入的文件系统接口拒绝受保护项）', (
       },
       unlink: async (p) => {
         links.delete(p)
+      },
+      openWrite: async (p) => {
+        if (!allowed(p)) throw eperm()
+      },
+      rename: async (p) => {
+        if (!allowed(p)) throw eperm()
       },
       connectUnix: async () => {
         throw eperm()
@@ -471,7 +493,8 @@ describe('探针联动（worker-credential-isolation 4.1–4.4）', () => {
           const profile = await readFile(out[2] as string, 'utf8')
           const expected = renderSeatbeltProfile(launch.spec)
           expect(expected.ok && expected.data).toBe(profile)
-          expect(out[2]).toBe(join(s.home, 'run/tasks', launch.taskId, 'isolation.sb'))
+          // 配置在 worker 读写都被拒绝的 state/tasks/ 下（审查第一轮 H2）。
+          expect(out[2]).toBe(join(s.home, 'state/tasks', launch.taskId, 'isolation.sb'))
         }
         return out
       },
@@ -484,6 +507,35 @@ describe('探针联动（worker-credential-isolation 4.1–4.4）', () => {
     // 配置随临时任务目录一起删除。
     const tasks = runTasksDir(s.home)
     expect(existsSync(tasks) ? readdirSync(tasks) : []).toEqual([])
+  })
+
+  test('同一施加层的不同执行器（保留的执行器目录不同）分别运行，不复用结果（审查第一轮 L4）', async () => {
+    const s = await setup()
+    const seatbelt = (type: string): ExecutorInfo => ({
+      type,
+      adapter_capabilities: {
+        ...NO_ADAPTER_CAPABILITIES,
+        credential_isolation: {
+          layers: { 'danger-full-access': 'seatbelt', 'workspace-write': 'none' },
+          enforced: true,
+        },
+      },
+    })
+    const launches: Array<{ executor: string; keeps: string[] }> = []
+    const report = await runIsolationProbe({
+      ...probeOptions(s, [seatbelt('codex-exec'), seatbelt('codex-orca')]),
+      launchWrapper: (target, argv, launch) => {
+        launches.push({
+          executor: target.executor,
+          keeps: launch.spec.deny_children_except.map((d) => d.keep),
+        })
+        return [...argv]
+      },
+    })
+    expect(report.runs.map((r) => r.executor)).toEqual(['codex-exec', 'codex-orca'])
+    expect(launches.map((l) => l.executor).sort()).toEqual(['codex-exec', 'codex-orca'])
+    for (const l of launches)
+      expect(l.keeps.some((k) => k.endsWith(`/run/executors/${l.executor}`))).toBe(true)
   })
 
   test('开关打开时的能力声明：native 未实现，声明为 none，不探测', () => {
@@ -530,8 +582,14 @@ describe('探针联动（worker-credential-isolation 4.1–4.4）', () => {
     'macOS 实测：开关打开时探针以 sandbox-exec 运行，受保护项全部拒绝、允许项可用，通过',
     async () => {
       const s = await setup()
+      // 模拟 Orca 的本机端口：一个真实监听的临时 TCP 端口，沙箱外可连、沙箱内应被拒绝。
+      const orca = createServer((_req, res) => res.end())
+      servers.push(orca)
+      await new Promise<void>((resolve) => orca.listen(0, '127.0.0.1', resolve))
+      const orcaPort = (orca.address() as AddressInfo).port
       const report = await runIsolationProbe({
         ...probeOptions(s, [codexExec(true)]),
+        resolveOrcaPorts: () => [orcaPort],
         launchWrapper: seatbeltProbeLaunchWrapper(),
       })
       const run = report.runs.find((r) => r.setting === 'danger-full-access')
@@ -546,8 +604,17 @@ describe('探针联动（worker-credential-isolation 4.1–4.4）', () => {
         'read.age_key',
         'read.hub_token_via_symlink',
         'write.config',
+        // 审查第一轮 H1：改名受保护路径的上级目录（探针自建的临时目录树）被拒绝。
+        'rename.protected_ancestor',
+        // 审查第一轮 H2：本任务实际使用的 seatbelt 配置不可改写。
+        'write.own_profile',
+        `connect.orca_port.${orcaPort}`,
       ])
         expect({ id, actual: by[id]?.actual }).toEqual({ id, actual: 'deny' })
+      expect(by['write.own_profile']?.target).toContain('/state/tasks/isolation-probe-self-')
+      // 改名只针对探针自建的临时目录树。
+      expect(by['rename.protected_ancestor']?.target).toContain('/run/tasks/isolation-probe-self-')
+      expect(by['rename.protected_ancestor']?.target).toEndWith('/rename-probe/a')
       for (const id of ['write.workdir', 'read.own_task_token', 'connect.hub'])
         expect({ id, actual: by[id]?.actual }).toEqual({ id, actual: 'allow' })
       expect(run.passed).toBe(true)
@@ -555,6 +622,24 @@ describe('探针联动（worker-credential-isolation 4.1–4.4）', () => {
       expect(JSON.stringify(report)).not.toContain(MARKER)
       const tasks = runTasksDir(s.home)
       expect(existsSync(tasks) ? readdirSync(tasks) : []).toEqual([])
+      // 探针的 seatbelt 配置（state/tasks/isolation-probe-*/isolation.sb）连同目录一起删除。
+      expect(readdirSync(join(s.home, 'state/tasks'))).toEqual([])
+    },
+  )
+
+  test.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))(
+    'macOS 实测：Orca 端口未解析时 connect.orca_port 记为失败，不能通过',
+    async () => {
+      const s = await setup()
+      const report = await runIsolationProbe({
+        ...probeOptions(s, [codexExec(true)]),
+        launchWrapper: seatbeltProbeLaunchWrapper(),
+      })
+      const run = report.runs.find((r) => r.setting === 'danger-full-access')
+      const item = run?.items.find((i) => i.item === 'connect.orca_port')
+      expect(item).toMatchObject({ actual: 'error', ok: false })
+      expect(item?.detail).toContain('Orca 端口未解析')
+      expect(run?.passed).toBe(false)
     },
   )
 })

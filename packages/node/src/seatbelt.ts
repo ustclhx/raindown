@@ -70,7 +70,7 @@ export function effectiveCredentialIsolation(
 /** 该角色在该执行器上是否施加外层 seatbelt：开关生效，且角色沙箱设置对应的施加层为 `seatbelt`。 */
 export function seatbeltApplies(
   capability: CredentialIsolation,
-  role: Pick<Role, 'executor' | 'permissions'>,
+  role: Pick<Role, 'executor' | 'permissions'> & Partial<Pick<Role, 'kind'>>,
   o?: SeatbeltOptions,
 ): o is SeatbeltOptions {
   if (!seatbeltActive(o) || !capability.enforced) return false

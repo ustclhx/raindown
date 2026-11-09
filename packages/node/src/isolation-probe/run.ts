@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { lstat, mkdtemp, readdir, realpath, rm } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -24,14 +24,11 @@ import {
   raindownPaths,
   resolveAgeKeyFile,
   runTasksDir,
+  taskIsolationProfile,
+  taskRunDir,
 } from '@raindown/core'
 import { z } from 'zod'
-import {
-  removeEmptyTaskRunDir,
-  removeLeaseTokenFile,
-  removeSeatbeltProfile,
-  writeLeaseTokenFile,
-} from '../lease-token.ts'
+import { removeLeaseTokenFile, removeSeatbeltProfile, writeLeaseTokenFile } from '../lease-token.ts'
 import { hubPortOf, type SeatbeltOptions, writeSeatbeltLaunch } from '../seatbelt.ts'
 
 /**
@@ -113,6 +110,8 @@ export const PROBE_TIMEOUT_MS = 20_000
 /** 探针临时任务 id 的前缀（造在 `run/tasks/` 下，结束即删除；节点启动清理也会删除残留的令牌文件）。 */
 export const PROBE_TASK_PREFIX = 'isolation-probe-'
 const PROBE_LEASE = 'isolation-probe'
+/** 改名探针的临时目录名（位于探针临时任务目录下）。 */
+const RENAME_PROBE_DIR = 'rename-probe'
 
 const knownLayer = (v: string | undefined) =>
   v !== undefined && (ISOLATION_LAYERS as readonly string[]).includes(v) ? v : 'none'
@@ -302,6 +301,13 @@ async function runOne(
     tokens.push(ownToken)
     const otherToken = await writeLeaseTokenFile(o.home, otherTask, PROBE_LEASE, fake)
     tokens.push(otherToken)
+    // 改名探针（审查第一轮 H1）：在本探针临时任务目录下自建 a/b/secret，把 secret 作为受保护项加入清单，
+    // 子进程尝试改名 a（受保护路径的祖先目录）。只操作探针自建的临时目录树，绝不改名真实目录。
+    const renameRoot = join(taskRunDir(o.home, ownTask), RENAME_PROBE_DIR)
+    await mkdir(join(renameRoot, 'a', 'b'), { recursive: true, mode: 0o700 })
+    await writeFile(join(renameRoot, 'a', 'b', 'secret'), `${fake}\n`, { mode: 0o600 })
+    const renameTarget = await realpath(join(renameRoot, 'a'))
+    const renameSecret = join(renameTarget, 'b', 'secret')
     const executorHome = executorHomeFor(target)
     const spec = await computeIsolationSpec({
       home: o.home,
@@ -318,8 +324,15 @@ async function runOne(
       ...(o.env ? { env: o.env } : {}),
     })
     if (!spec.ok) return failed(spec.error.code, spec.error.message)
+    const probeSpec: IsolationSpec = {
+      ...spec.data,
+      deny_read: [...spec.data.deny_read, renameSecret],
+      deny_write: [...spec.data.deny_write, renameSecret],
+    }
     const plan = buildProbePlan({
-      spec: spec.data,
+      spec: probeSpec,
+      renameTarget,
+      profilePath: taskIsolationProfile(o.home, ownTask),
       home: o.home,
       ageKeyFile: resolveAgeKeyFile(
         o.ageKeyFile ? { ageKeyFile: o.ageKeyFile } : {},
@@ -335,7 +348,7 @@ async function runOne(
     const argv = await wrap(target, [o.execPath ?? process.execPath, PROBE_CHILD_SCRIPT], {
       home: o.home,
       taskId: ownTask,
-      spec: spec.data,
+      spec: probeSpec,
     })
     const items = await spawnProbe(argv, plan, o.timeoutMs ?? PROBE_TIMEOUT_MS, cwd)
     return { ...base, items, passed: probeRunPassed({ items }) }
@@ -348,8 +361,9 @@ async function runOne(
   } finally {
     for (const t of tokens) await removeLeaseTokenFile(t).catch(() => {})
     await removeSeatbeltProfile(o.home, ownTask).catch(() => {})
+    // 探针临时任务目录（名字带固定前缀，全部由探针自建）：连同改名探针的目录树一起删除。
     for (const task of [ownTask, otherTask])
-      await removeEmptyTaskRunDir(o.home, task).catch(() => {})
+      await rm(taskRunDir(o.home, task), { recursive: true, force: true }).catch(() => {})
     if (cwd) await rm(cwd, { recursive: true, force: true }).catch(() => {})
   }
 }
@@ -421,8 +435,14 @@ export async function runIsolationProbe(o: IsolationProbeOptions): Promise<Isola
   const sockets: ProbeTargets = targets.length
     ? await findOrcaSockets(userHome)
     : { status: 'none', reason: '' }
+  // 未施加（none）时各目标的结果相同，只运行一次；施加时清单随执行器及其 harness 子目录变化（保留的目录不同），
+  // 按执行器 × harness 子目录分别运行（审查第一轮 L4），只在完全相同的配置之间复用。
+  const groupKey = (t: ProbeTarget) =>
+    t.applied_layer === 'none'
+      ? 'none'
+      : `${t.applied_layer}|${t.executor}|${executorHomeFor(t) ?? ''}`
   const groups = new Map<string, ProbeTarget[]>()
-  for (const t of targets) groups.set(t.applied_layer, [...(groups.get(t.applied_layer) ?? []), t])
+  for (const t of targets) groups.set(groupKey(t), [...(groups.get(groupKey(t)) ?? []), t])
   const results = await Promise.all(
     [...groups.values()].map(async (group) => {
       const [rep, ...rest] = group as [ProbeTarget, ...ProbeTarget[]]

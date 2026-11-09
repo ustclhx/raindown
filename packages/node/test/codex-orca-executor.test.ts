@@ -2299,7 +2299,7 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
     const [command] = created(s)
     expect(norm(command, home)).toMatchSnapshot()
     expect(command).not.toContain('sandbox-exec')
-    expect(existsSync(join(home.home, 'run/tasks/t-orca-1/isolation.sb'))).toBe(false)
+    expect(existsSync(join(home.home, 'state/tasks/t-orca-1/isolation.sb'))).toBe(false)
     const state = JSON.parse(
       readFileSync(join(home.home, 'state/tasks/t-orca-1/orca.json'), 'utf8'),
     )
@@ -2329,7 +2329,7 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
     })
     await ready(s)
     const [command] = created(s)
-    const profile = join(home.home, 'run/tasks/t-orca-1/isolation.sb')
+    const profile = join(home.home, 'state/tasks/t-orca-1/isolation.sb')
     expect(norm(command, home)).toMatchSnapshot()
     // 顺序：exec env … CODEX_HOME=… /usr/bin/sandbox-exec -f <配置> codex … "$(cat spec.md)"
     const sandboxAt = command?.indexOf(`/usr/bin/sandbox-exec -f ${profile} codex `) ?? -1
@@ -2365,7 +2365,7 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
     })
     await ready(s)
     expect(created(s)[0]).not.toContain('sandbox-exec')
-    expect(existsSync(join(home.home, 'run/tasks/t-orca-1/isolation.sb'))).toBe(false)
+    expect(existsSync(join(home.home, 'state/tasks/t-orca-1/isolation.sb'))).toBe(false)
     await s.run.cancel()
   })
 
@@ -2386,7 +2386,39 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
     })
     expect(second.orca.ops('terminalCreate')).toEqual([])
     expect(sends(second)).toEqual([])
+    // 审查第一轮 L1：顺手关闭该终端，下次派工以隔离方式重启。
+    expect(second.orca.ops('terminalClose')).toHaveLength(1)
+    const state = JSON.parse(
+      readFileSync(join(home.home, 'state/tasks/t-orca-1/orca.json'), 'utf8'),
+    )
+    expect(state).not.toHaveProperty('handle')
     await first.run.cancel()
+  })
+
+  test('开关打开：派工绑定已变化的未隔离旧终端关闭后以隔离方式重启（审查第一轮 L1）', async () => {
+    const home = orcaHome()
+    const first = await start({}, (o) => o.show('question'), {
+      home,
+      leaseTokenFile: await token(home, 'l-1'),
+      hubUrl: HUB,
+    })
+    await ready(first)
+    const second = await start({}, (o) => o.show('question'), {
+      home,
+      leaseTokenFile: await token(home, 'l-2'),
+      hubUrl: HUB,
+      isolation: on(home),
+    })
+    await ready(second)
+    expect(second.outcome()).toBeUndefined()
+    expect(second.orca.ops('terminalClose')).toHaveLength(1)
+    expect(created(second)[0]).toContain('/usr/bin/sandbox-exec -f ')
+    const state = JSON.parse(
+      readFileSync(join(home.home, 'state/tasks/t-orca-1/orca.json'), 'utf8'),
+    )
+    expect(state.isolation_layer).toBe('seatbelt')
+    await first.run.cancel()
+    await second.run.cancel()
   })
 
   test('开关打开：已隔离的终端照常重挂接；派工绑定变化后新起的终端同样施加', async () => {

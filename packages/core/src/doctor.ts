@@ -3,6 +3,7 @@ import { accessSync, constants, existsSync, readFileSync, statSync } from 'node:
 import { homedir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import { z } from 'zod'
+import { loadNodeConfig } from './daemon/config.ts'
 import { checkDaemonPlists, LEGACY_DAEMON_LABELS, launchAgentsDirectory } from './daemon/plist.ts'
 import { checkPatrolRules } from './doctor-patrol.ts'
 import { type DoctorSdk, inspectClaudeSdk } from './doctor-sdk.ts'
@@ -522,6 +523,7 @@ export async function runDoctor(
     })
   }
 
+  checks.push(...(await isolationSwitchChecks(home, opts.platform ?? process.platform)))
   if (opts.isolationNodes) checks.push(...(await isolationProbeChecks(opts.isolationNodes)))
 
   const normalized: DoctorCheck[] = checks.map((c) => ({
@@ -536,6 +538,36 @@ export async function runDoctor(
   }
   if (!report.ok) return fail('failure', 'doctor_failed', formatDoctorReport(report), report)
   return ok(report)
+}
+
+/**
+ * 本机节点的外层 seatbelt 开关（`config/node.yaml` 的 `isolation.enforce`，审查第一轮 L3）：
+ * 打开但不在 macOS 上时明确提示“未施加”；node.yaml 读取失败由节点启动时报告，这里不重复。
+ */
+export async function isolationSwitchChecks(
+  home: string,
+  platform: NodeJS.Platform,
+): Promise<DoctorCheck[]> {
+  const config = await loadNodeConfig(home)
+  if (!config.ok || !config.data.isolation.enforce) return []
+  if (platform !== 'darwin')
+    return [
+      {
+        id: 'isolation.enforce',
+        ok: false,
+        severity: 'warning',
+        message: `config/node.yaml 的 isolation.enforce 已打开，但本机平台（${platform}）不支持外层 seatbelt，未施加任何隔离`,
+        hint: '外层 seatbelt 只支持 macOS；Linux 的施加层尚未实现。不需要时把 isolation.enforce 改回 false',
+      },
+    ]
+  return [
+    {
+      id: 'isolation.enforce',
+      ok: true,
+      message:
+        'config/node.yaml 的 isolation.enforce 已打开：施加层为 seatbelt 的角色以 sandbox-exec 启动（是否生效以隔离自检为准）',
+    },
+  ]
 }
 
 /**
@@ -582,7 +614,9 @@ export async function isolationProbeChecks(
           // 失败的探针不会让 enforced 为 true；按探针实际运行的施加层区分“已施加但失效”与“尚未施加”。
           hint:
             row.run && row.run.applied_layer !== 'none'
-              ? '已施加隔离但探针不通过，隔离可能失效：检查失败项、macOS 更新与 seatbelt 配置'
+              ? row.run.items.some((i) => i.item === 'connect.orca_port' && i.actual === 'error')
+                ? '已施加隔离，但 Orca 本机端口未解析（无法证明 Orca 控制端口被拒绝），不能算已施加：确认 Orca 正在运行后等待下次自检'
+                : '已施加隔离但探针不通过，隔离可能失效：检查失败项、macOS 更新与 seatbelt 配置'
               : '适配器尚未施加隔离（config/node.yaml 的 isolation.enforce 为 false、不在 macOS 上或该施加层尚未实现），探针如实报告受保护项可访问',
         })
       else if (row.probe === 'untested')

@@ -143,6 +143,7 @@ async function fakeHome(weird: boolean) {
     join(home, 'run/tasks/t-other/dispatch-tokens'),
     join(userHome, '.config/sops/age'),
     join(userHome, 'Library/LaunchAgents'),
+    join(home, 'run/executors/codex-exec/codex-home'),
     cwd,
   ])
     await mkdir(d, { recursive: true })
@@ -159,9 +160,11 @@ async function fakeHome(weird: boolean) {
     home,
     taskId: 't-1',
     executor: 'codex-exec',
+    executorHome: 'codex-home',
     cwd,
     access: 'write',
     leaseTokenFile: files.ownToken,
+    harnessPaths: [{ path: join(home, 'run/executors/codex-exec/codex-home'), access: 'write' }],
     hubPort: 7477,
     userHome,
     env: {},
@@ -171,7 +174,7 @@ async function fakeHome(weird: boolean) {
   if (!profile.ok) throw new Error(profile.error.message)
   const profilePath = join(root, 'isolation.sb')
   await writeFile(profilePath, profile.data, { mode: 0o600 })
-  return { home, cwd, files, profilePath }
+  return { root, base, home, userHome, cwd, files, profilePath }
 }
 
 const SANDBOX_EXEC = '/usr/bin/sandbox-exec'
@@ -204,4 +207,76 @@ describe.skipIf(!onMac)('macOS 实测：sandbox-exec 包裹 /bin/cat、/usr/bin/
       expect(spawnSync('/bin/cat', [s.files.hubToken], { encoding: 'utf8' }).status).toBe(0)
     },
   )
+})
+
+describe.skipIf(!onMac)('macOS 实测：改名祖先目录不能绕过拒绝（审查第一轮 H1）', () => {
+  const run = (profile: string, argv: string[]) =>
+    spawnSync(SANDBOX_EXEC, ['-f', profile, ...argv], { encoding: 'utf8' })
+
+  test.each([false, true])(
+    '受保护路径的任何一级祖先都不能改名（路径含特殊字符：%s）',
+    async (weird) => {
+      const s = await fakeHome(weird)
+      const moves: Array<[string, string, string]> = [
+        [s.home, `${s.home}2`, join(`${s.home}2`, 'state/hub.token')],
+        [join(s.home, 'state'), join(s.home, 'state2'), join(s.home, 'state2/hub.token')],
+        [
+          join(s.home, 'run/tasks'),
+          join(s.home, 'run/t2'),
+          join(s.home, 'run/t2/t-other/dispatch-tokens/l-2.token'),
+        ],
+        [join(s.home, 'run'), join(s.home, 'run2'), join(s.home, 'run2/tasks/t-other')],
+        [
+          join(s.userHome, '.config/sops'),
+          join(s.userHome, '.config/s2'),
+          join(s.userHome, '.config/s2/age/keys.txt'),
+        ],
+        [
+          join(s.userHome, '.config'),
+          join(s.userHome, 'c2'),
+          join(s.userHome, 'c2/sops/age/keys.txt'),
+        ],
+        [s.userHome, `${s.userHome}2`, join(`${s.userHome}2`, '.config/sops/age/keys.txt')],
+        [s.base, `${s.base}-moved`, join(`${s.base}-moved`, 'raindown-home/state/hub.token')],
+        // 本任务目录（派工令牌目录的上级）也不能整体搬走。
+        [join(s.home, 'run/tasks/t-1'), join(s.cwd, 't-1'), join(s.cwd, 't-1/dispatch-tokens')],
+      ]
+      for (const [from, to, probe] of moves) {
+        const mv = run(s.profilePath, ['/bin/mv', from, to])
+        expect({ from, status: mv.status }).not.toEqual({ from, status: 0 })
+        expect(existsSync(from)).toBe(true)
+        expect(existsSync(probe)).toBe(false)
+      }
+      expect(run(s.profilePath, ['/bin/cat', s.files.hubToken]).status).not.toBe(0)
+    },
+  )
+
+  test('祖先目录、工作目录与 CODEX_HOME 中新建文件、目录、符号链接与改名仍然可用', async () => {
+    const s = await fakeHome(false)
+    const codexHome = join(s.home, 'run/executors/codex-exec/codex-home')
+    const ownTask = join(s.home, 'run/tasks/t-1')
+    for (const dir of [
+      s.cwd,
+      codexHome,
+      ownTask,
+      s.userHome,
+      join(s.userHome, '.config'),
+      s.root,
+    ]) {
+      for (const argv of [
+        ['/usr/bin/touch', join(dir, 'new-file')],
+        ['/bin/mkdir', join(dir, 'new-dir')],
+        ['/bin/ln', '-s', join(dir, 'new-file'), join(dir, 'new-link')],
+        ['/bin/mv', join(dir, 'new-dir'), join(dir, 'renamed-dir')],
+        ['/bin/rm', join(dir, 'new-link')],
+      ]) {
+        const r = run(s.profilePath, argv)
+        expect({ argv, status: r.status, stderr: r.stderr }).toEqual({
+          argv,
+          status: 0,
+          stderr: '',
+        })
+      }
+    }
+  })
 })

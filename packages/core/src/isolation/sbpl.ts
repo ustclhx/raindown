@@ -1,4 +1,4 @@
-import { isAbsolute } from 'node:path'
+import { dirname, isAbsolute } from 'node:path'
 import { fail, ok, type Result } from '../result.ts'
 import type { IsolationSpec } from './spec.ts'
 
@@ -7,7 +7,8 @@ import type { IsolationSpec } from './spec.ts'
  *
  * 结构：`(version 1)(allow default)`，之后依次是
  * 1. 最窄允许项（本任务工作目录、派工令牌、harness 目录、中枢端口、显式放行的套接字）；
- * 2. 显式拒绝：`deny_read`、`deny_write`、`deny_children_except`、Orca unix 套接字、已解析的 Orca 端口、跨进程调试。
+ * 2. 显式拒绝：`deny_read`、`deny_write`、`deny_children_except`、受保护路径全部祖先目录的写（防改名绕过）、
+ *    Orca unix 套接字、已解析的 Orca 端口、跨进程调试。
  *
  * 允许项写在拒绝项之前，同一操作后写的规则优先，所以**拒绝优先**（与 `IsolationSpec` 的约定一致）：
  * `computeIsolationSpec` 已保证允许项不落在任何读拒绝目录内，`allow default` 下允许项本身不放开任何东西，只作记录；
@@ -67,6 +68,33 @@ const rule = (action: 'allow' | 'deny', ops: string, filters: readonly string[])
 
 const subpaths = (paths: readonly string[]) => paths.map((p) => `(subpath ${sbplString(p)})`)
 
+/** `path` 的全部祖先目录（不含自身），直到 `/`。 */
+function ancestors(path: string): string[] {
+  const out: string[] = []
+  for (let d = dirname(path); ; d = dirname(d)) {
+    out.push(d)
+    if (dirname(d) === d) break
+  }
+  return out
+}
+
+/**
+ * 受保护路径的祖先目录（审查第一轮 H1）：读写拒绝都按路径匹配，改名任何一级祖先目录（`mv home home2`）
+ * 就能在新路径下读到受保护文件。因此对每个受保护路径的全部祖先目录、`deny_children_except` 的 `dir` 本身及其祖先，
+ * 都写 `(deny file-write* (literal …))`：只拒绝对目录节点本身的写（改名、删除、改属性），
+ * 不影响在这些目录里新建、修改其他文件或子目录（新建子项按子项自己的路径检查）。
+ */
+export function protectedAncestors(spec: IsolationSpec): string[] {
+  const set = new Set<string>()
+  for (const p of [...spec.deny_read, ...spec.deny_write, ...spec.deny_unix_sockets])
+    for (const a of ancestors(p)) set.add(a)
+  for (const d of spec.deny_children_except) {
+    set.add(d.dir)
+    for (const a of ancestors(d.dir)) set.add(a)
+  }
+  return [...set].sort()
+}
+
 /**
  * 生成 SBPL 配置文本。只依赖传入的隔离清单（其路径来自节点与角色配置，已 realpath），不读取任何文件。
  * 返回的文本以换行结尾；同一清单总是生成同一文本（便于快照测试）。
@@ -104,7 +132,14 @@ export function renderSeatbeltProfile(spec: IsolationSpec): Result<string> {
         ]),
       ),
       '',
-      ';; 4. 控制通道：文件规则拦不住 unix 套接字 connect，单独拒绝；只拒绝已解析的 Orca 端口，其他本机端口不拒绝',
+      ';; 4. 受保护路径的祖先目录：拒绝对目录节点本身的写（改名、删除），防止改名祖先目录后在新路径下绕过上面的规则',
+      ...rule(
+        'deny',
+        'file-write*',
+        protectedAncestors(spec).map((p) => `(literal ${sbplString(p)})`),
+      ),
+      '',
+      ';; 5. 控制通道：文件规则拦不住 unix 套接字 connect，单独拒绝；只拒绝已解析的 Orca 端口，其他本机端口不拒绝',
       ...rule(
         'deny',
         'network-outbound',
@@ -116,7 +151,7 @@ export function renderSeatbeltProfile(spec: IsolationSpec): Result<string> {
         spec.deny_local_ports.map((p) => `(remote ip "*:${port(p)}")`),
       ),
       '',
-      ';; 5. 跨进程调试（allow default 下默认允许 attach 同用户的非 hardened 进程）',
+      ';; 6. 跨进程调试（allow default 下默认允许 attach 同用户的非 hardened 进程）',
       ...spec.deny_process_debug.map((op) => {
         if (!OPERATION_NAME.test(op))
           throw new ProfileError(

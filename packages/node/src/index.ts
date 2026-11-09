@@ -194,6 +194,14 @@ export {
   TIMEOUT_GRACE_MS,
 } from './node.ts'
 export {
+  defaultLsof,
+  LSOF,
+  type LsofRunner,
+  type OrcaPortOptions,
+  parseLsofPorts,
+  resolveOrcaPorts,
+} from './orca-ports.ts'
+export {
   createPrMergeExecutor,
   DEFAULT_PIPELINE_POLL_MS,
   DEFAULT_PIPELINE_TIMEOUT_MS,

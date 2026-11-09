@@ -1605,12 +1605,6 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
                 'codex_home_mismatch',
                 '已有 Codex 终端未使用当前隔离目录；请先关闭旧终端后重试',
               )
-            // 存活进程无法事后施加隔离：启动时没有施加外层 seatbelt 的终端（升级前、开关打开前启动）不重新挂接。
-            if (isolation && st.isolation_layer !== 'seatbelt')
-              return failed(
-                'isolation_not_applied',
-                `已有 Codex 终端 ${st.handle} 启动时没有施加外层 seatbelt（升级前或 isolation.enforce 打开前启动），不能重新挂接；请先关闭旧终端后重试`,
-              )
             if (ctx.leaseTokenFile && st.lease_token_file !== ctx.leaseTokenFile) {
               // 新派工不能复用仍指向旧租约凭证的 MCP；保留 worktree，在同一分支重启 worker。
               const closed = await orca.terminalClose({ handle: st.handle })
@@ -1624,6 +1618,21 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
               delete st.incarnation_id
               await saveState()
               status('派工绑定已变化，保留工作目录并重启 Codex')
+            } else if (isolation && st.isolation_layer !== 'seatbelt') {
+              // 存活进程无法事后施加隔离：启动时没有施加外层 seatbelt 的终端（升级前、开关打开前启动）不重新挂接，
+              // 顺手关闭它（审查第一轮 L1）；派工绑定已变化的旧终端走上面的分支，关闭后以隔离方式重启。
+              const closed = await orca.terminalClose({ handle: st.handle })
+              const old = st.handle
+              if (closed.ok) {
+                delete st.handle
+                delete st.pty_id
+                delete st.incarnation_id
+                await saveState()
+              }
+              return failed(
+                'isolation_not_applied',
+                `已有 Codex 终端 ${old} 启动时没有施加外层 seatbelt（升级前或 isolation.enforce 打开前启动），不能重新挂接；${closed.ok ? '已关闭该终端，重试即以隔离方式重启' : '关闭失败，请先手动关闭旧终端后重试'}`,
+              )
             } else {
               handle = st.handle
               prevTail = tail

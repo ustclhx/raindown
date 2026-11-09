@@ -496,8 +496,9 @@ test('外层 seatbelt 配置：0600、原子替换不跟随已有链接；任务
   const home = await tempHome()
   const outside = join(home, 'outside.sb')
   await writeFile(outside, 'keep')
-  await mkdir(taskRunDir(home, 't-1'), { recursive: true })
-  const profilePath = join(taskRunDir(home, 't-1'), 'isolation.sb')
+  // 配置位于 worker 读写都被拒绝的 state/tasks/<任务>/（审查第一轮 H2）。
+  await mkdir(join(home, 'state/tasks/t-1'), { recursive: true })
+  const profilePath = join(home, 'state/tasks/t-1/isolation.sb')
   await symlink(outside, profilePath)
   expect(await writeSeatbeltProfile(home, 't-1', '(version 1)\n')).toBe(profilePath)
   expect((await stat(profilePath)).mode & 0o777).toBe(0o600)
@@ -509,5 +510,6 @@ test('外层 seatbelt 配置：0600、原子替换不跟随已有链接；任务
   await writeSeatbeltProfile(home, 't-2', '(version 1)\n')
   await cleanLeaseTokenFiles(home)
   expect(existsSync(taskRunDir(home, 't-2'))).toBe(false)
+  expect(existsSync(join(home, 'state/tasks/t-2'))).toBe(false)
   await expect(writeSeatbeltProfile(home, '../x', 'bad')).rejects.toThrow()
 })

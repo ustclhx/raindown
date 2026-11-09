@@ -27,7 +27,10 @@
   - 4.1–4.4 的施加由节点级开关 `config/node.yaml` 的 `isolation.enforce` 控制，缺省 false（关闭时启动方式逐字节不变，快照测试锁定）；仅 macOS。
     SBPL 路径内联并严格转义（未用 `-D`），允许项在前、拒绝项在后（拒绝优先，与 `IsolationSpec` 约定一致）；Orca 端口未解析时不生成端口规则。
     `native`（workspace-write / read-only 的 Codex permissions profile）**未实现**，留给 5.1：开关打开时这些设置声明为 `none`，不显示为已施加。
-    supervisor 唤醒会话（MCP 仍本地读取 raindown-home）不包裹。说明见 `docs/executors.md`「外层 seatbelt 施加」。
+    supervisor 唤醒会话（MCP 仍本地读取 raindown-home）不包裹，沙箱设置为 `supervisor-session → none`。说明见 `docs/executors.md`「外层 seatbelt 施加」。
+  - 审查第一轮（PR #98）：受保护路径全部祖先目录写拒绝（防改名绕过）；配置移到 worker 读写都被拒绝的 `state/tasks/<任务>/isolation.sb`；
+    Orca 端口只读解析（套接字名取 pid + lsof），未解析时探针记为失败；探针新增 `rename.protected_ancestor`、`write.own_profile` 两个必过项，
+    施加时按执行器分别运行；未隔离旧终端拒绝重挂接时关闭；`spawnClaudeCodeProcess` 启动失败不崩溃；非 macOS 打开开关时 doctor 提示未施加。
 - [ ] 4.5 真实验收（征得用户同意后在本机执行）：dev 角色跑一个 product-res 任务，worker 内 `cat ~/raindown-home/state/hub.token`、写 `config/policies.yaml`、读其他任务令牌全部失败，`raindown_report` 与 `kb_search` 正常，任务正常完成
 
 ## 5. harness 沙箱开启时的隔离

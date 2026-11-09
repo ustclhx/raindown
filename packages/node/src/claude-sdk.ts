@@ -116,9 +116,17 @@ import { resolveContractCwd } from './workdir.ts'
 
 export const CLAUDE_SDK_EXECUTOR = 'claude-sdk'
 
-/** claude-sdk 的凭证隔离声明（D1）：bash 沙箱关闭时为外层 seatbelt；开启时原生 denyRead 只覆盖 Bash，不提供。 */
+/**
+ * claude-sdk 的凭证隔离声明（D1）：bash 沙箱关闭时为外层 seatbelt；开启时原生 denyRead 只覆盖 Bash，不提供；
+ * supervisor 唤醒会话不施加（审查第一轮 M1）。
+ */
 export const CLAUDE_SDK_CREDENTIAL_ISOLATION: CredentialIsolation = {
-  layers: { 'bash-sandbox-off': 'seatbelt', 'bash-sandbox-on': 'none' },
+  layers: {
+    'bash-sandbox-off': 'seatbelt',
+    'bash-sandbox-on': 'none',
+    // supervisor 唤醒会话：MCP 按设计仍在本地读取 raindown-home（唤醒令牌在 state/wake/），不包裹外层 seatbelt。
+    'supervisor-session': 'none',
+  },
   enforced: false,
 }
 export const DEFAULT_CLAUDE_MODEL = 'claude-opus-5-5'
@@ -364,7 +372,7 @@ export interface ClaudeSdkExecutorOptions {
 
 /**
  * `spawnClaudeCodeProcess` 的外层 seatbelt 实现（tasks 4.4）：在 SDK 给出的命令前加上 `[sandbox-exec, -f, <配置>]`。
- * 自定义启动时 SDK 不再读取子进程的 stderr，这里转交给选项中的 `stderr` 回调，与缺省启动一致。
+ * 自定义启动时 SDK 不再读取子进程的 stderr，这里转交给选项中的 `stderr` 回调，与缺省启动一致；启动失败同样写入该回调。
  */
 export function seatbeltSpawner(
   prefix: readonly string[],
@@ -380,6 +388,11 @@ export function seatbeltSpawner(
       stdio: ['pipe', 'pipe', 'pipe'],
     })
     child.stderr.setEncoding('utf8').on('data', (data: string) => stderr?.(data))
+    // 启动失败（ENOENT 等）时 ChildProcess 发出 'error'：总有一个监听者，不让节点进程因未处理的 'error' 崩溃；
+    // 原因交给 stderr 回调，随退出错误中的 stderr 尾部（脱敏后）上报（审查第一轮 L2）。SDK 自己也会监听 'error'。
+    child.on('error', (err) => {
+      stderr?.(`sandbox-exec 启动失败：${(err as NodeJS.ErrnoException).code ?? err.message}\n`)
+    })
     return child
   }
 }

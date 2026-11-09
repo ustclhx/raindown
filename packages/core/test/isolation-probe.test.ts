@@ -9,6 +9,7 @@ import {
   type IsolationProbeReport,
   type IsolationProbeRun,
   isolationProbeChecks,
+  isolationSwitchChecks,
   NO_ADAPTER_CAPABILITIES,
   type NodeView,
   normalizeProbeReport,
@@ -20,7 +21,7 @@ import {
   runDoctor,
 } from '../src/index.ts'
 import { doctorOptions } from './doctor-helpers.ts'
-import { tempHome } from './helpers.ts'
+import { tempHome, writeText } from './helpers.ts'
 
 const roots: string[] = []
 afterEach(() => {
@@ -78,7 +79,13 @@ describe('探针清单（buildProbePlan）', () => {
     expect(by['read.ledger_db']?.target).toBe(join(s.home, 'state', 'raindown.db'))
     expect(by['write.config']?.target).toBe(join(s.home, 'config'))
     expect(by['connect.orca_socket']?.skip).toBe('Orca 运行时目录不存在')
-    expect(by['connect.orca_port']?.skip).toContain('Orca 端口未解析')
+    // 端口未解析：记为失败而不是跳过（审查第一轮 M2）。
+    expect(by['connect.orca_port']?.skip).toBeUndefined()
+    expect(by['connect.orca_port']?.fail).toContain('Orca 端口未解析')
+    // 改名探针与本任务配置：没有给出目标时跳过（核心项被跳过同样不能通过）。
+    expect(by['rename.protected_ancestor']).toMatchObject({ expected: 'deny', kind: 'rename' })
+    expect(by['rename.protected_ancestor']?.skip).toBeDefined()
+    expect(by['write.own_profile']).toMatchObject({ expected: 'deny', kind: 'open_write' })
     expect(by['debug.process']?.unverified).toContain('未验证')
     expect(by['write.workdir']).toMatchObject({ expected: 'allow', target: s.cwd })
     expect(by['read.own_task_token']).toMatchObject({ expected: 'allow', target: '/x/own.token' })
@@ -130,7 +137,15 @@ const run = (
         ok: !failing,
         ...(failing ? {} : { detail: 'EPERM' }),
       },
-      ...(['read.ledger_db', 'read.other_task_token', 'write.config'] as const).map((item) => ({
+      ...(
+        [
+          'read.ledger_db',
+          'read.other_task_token',
+          'write.config',
+          'rename.protected_ancestor',
+          'write.own_profile',
+        ] as const
+      ).map((item) => ({
         item,
         expected: 'deny' as const,
         actual: 'deny' as const,
@@ -143,7 +158,7 @@ const run = (
               expected: 'deny' as const,
               actual: 'skipped' as const,
               ok: null,
-              detail: 'Orca 端口未解析：没有提供 Orca 端口解析',
+              detail: '没有 Orca 端口（本机没有 Orca 运行时目录）',
             },
           ]
         : []),
@@ -279,7 +294,9 @@ describe('doctor 显示隔离自检（worker-credential-isolation 3.2）', () =>
   test('跳过项与原因', async () => {
     const checks = await checksFor([nodeView(probe(run({ skipped: true })))])
     const c = checks.find((x) => x.id === 'isolation.n-1.codex-exec.danger-full-access')
-    expect(c?.message).toContain('跳过 connect.orca_port：Orca 端口未解析：没有提供 Orca 端口解析')
+    expect(c?.message).toContain(
+      '跳过 connect.orca_port：没有 Orca 端口（本机没有 Orca 运行时目录）',
+    )
   })
 
   test('探针无法运行时显示原因（例如遗留 home 是工作目录的祖先）', async () => {
@@ -321,5 +338,49 @@ describe('doctor 显示隔离自检（worker-credential-isolation 3.2）', () =>
     expect(report.checks.some((c) => c.id.startsWith('isolation.') && c.severity === 'error')).toBe(
       false,
     )
+  })
+})
+
+describe('审查第一轮：开关与 Orca 端口的 doctor 提示', () => {
+  test('L3：非 macOS 上 isolation.enforce 打开时明确提示未施加；macOS 上为 info；关闭时不显示', async () => {
+    const home = tempHome()
+    try {
+      expect(await isolationSwitchChecks(home, 'linux')).toEqual([])
+      writeText(join(home, 'config/node.yaml'), 'isolation:\n  enforce: true\n')
+      const [linux] = await isolationSwitchChecks(home, 'linux')
+      expect(linux).toMatchObject({ id: 'isolation.enforce', ok: false, severity: 'warning' })
+      expect(linux?.message).toContain('不支持外层 seatbelt，未施加任何隔离')
+      const [mac] = await isolationSwitchChecks(home, 'darwin')
+      expect(mac).toMatchObject({ id: 'isolation.enforce', ok: true })
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  test('M2：已施加但 Orca 端口未解析时，修复提示说明原因', async () => {
+    const r = run({ failing: false })
+    const failed: IsolationProbeRun = {
+      ...r,
+      applied_layer: 'seatbelt',
+      passed: false,
+      items: [
+        ...r.items,
+        {
+          item: 'connect.orca_port',
+          expected: 'deny',
+          actual: 'error',
+          ok: false,
+          detail: 'Orca 端口未解析：Orca 运行时目录中没有 app 控制套接字',
+        },
+      ],
+    }
+    const checks = await isolationProbeChecks(
+      async () => ok({ nodes: [nodeView(probe(failed), true)] }),
+      Date.parse('2026-11-09T02:00:00.000Z'),
+    )
+    const c = checks.find((x) => x.id === 'isolation.n-1.codex-exec.danger-full-access')
+    expect(c).toMatchObject({ ok: false, severity: 'warning' })
+    expect(c?.message).toContain('connect.orca_port')
+    expect(c?.hint).toContain('Orca 本机端口未解析')
   })
 })

@@ -77,6 +77,7 @@ supervisor 是否代答提问看的是卡住的 `basis`（见下文「上报与�
 | `codex-orca`、`codex-exec` | `workspace-write`、`read-only` | `native` |
 | `claude-sdk` | `bash-sandbox-off`（Raindown 目前不开启 bash 沙箱） | `seatbelt` |
 | `claude-sdk` | `bash-sandbox-on` | `none` |
+| `claude-sdk` | `supervisor-session`（`kind: supervisor` 的唤醒会话） | `none`（MCP 仍本地读取 raindown-home，不包裹） |
 | `pr-merge` | `in-node` | `none` |
 | `fake` | — | `none` |
 
@@ -1019,15 +1020,22 @@ isolation:
 ### 配置生成（4.1）
 
 - 节点为每次 harness 启动重新计算隔离清单（`computeIsolationSpec`，路径已 realpath），用 core 的 `renderSeatbeltProfile` 生成 SBPL，
-  原子替换写入任务私有目录 `run/tasks/<任务>/isolation.sb`（0600，不跟随已有的同名链接）。内容只来自节点与角色配置。
-  `sandbox-exec` 只在启动时读取配置：执行结束、节点启动清理时删除。
+  原子替换写入 `state/tasks/<任务>/isolation.sb`（0600，目录 0700，不跟随已有的同名链接）。内容只来自节点与角色配置。
+  **配置放在 worker 读写都被拒绝的 `state/` 下**（审查第一轮 H2）：放在 worker 可写的 `run/tasks/<任务>/` 时，后台常驻进程可以改写它，
+  下次同任务启动（恢复、派工绑定变化后重启）时 harness 就没有隔离。`sandbox-exec` 在施加沙箱之前读取配置，不受拒绝规则影响。
+  没有改用 `sandbox-exec -p <配置文本>`：codex-orca 的终端命令是一行 shell 文本，多行配置（含 `;;` 注释）需要额外改写与引号。
+  执行结束、节点启动清理时删除。
 - 结构：`(version 1)(allow default)`，之后依次是：
   1. 最窄允许项（工作目录、派工令牌、harness 目录、中枢端口）；
   2. `deny_read` → `(deny file-read* (subpath …))`，`deny_write` → `(deny file-write* (subpath …))`；
   3. `deny_children_except` → `(deny file-read* file-write* (require-all (subpath <dir>) (require-not (literal <dir>)) (require-not (subpath <keep>))))`；
-  4. Orca 运行时目录 → `(deny network-outbound (remote unix-socket (subpath …)))`；已解析的 Orca 端口 → `(deny network-outbound (remote ip "*:<端口>"))`；
+  4. **受保护路径的全部祖先目录**（每个 `deny_read` / `deny_write` / unix 套接字目录的上级直到 `/`，以及 `deny_children_except` 的 `dir`
+     本身及其上级）→ `(deny file-write* (literal …))`（审查第一轮 H1）：拒绝规则按路径匹配，改名任何一级祖先目录（`mv home home2`）
+     就能在新路径下读到受保护文件。`literal` 只拒绝对目录节点本身的写（改名、删除、改属性），在这些目录里新建、修改、改名其他文件、
+     子目录与符号链接不受影响（macOS 实测覆盖工作目录、CODEX_HOME、本任务目录、用户主目录）；
+  5. Orca 运行时目录 → `(deny network-outbound (remote unix-socket (subpath …)))`；已解析的 Orca 端口 → `(deny network-outbound (remote ip "*:<端口>"))`；
      **其他本机端口不拒绝**；
-  5. `(deny mach-priv-task-port (target others))`、`(deny mach-task-name (target others))`。
+  6. `(deny mach-priv-task-port (target others))`、`(deny mach-task-name (target others))`。
 - **允许项写在拒绝项之前（拒绝优先）**，与 `IsolationSpec` 的约定一致：`computeIsolationSpec` 已保证允许项不落在任何读拒绝目录内，
   在 `allow default` 下允许项只作记录；而只读语义（派工令牌、令牌目录、只读工作目录）以写拒绝表示，写在最后才能保证它们即使位于可写目录内也不可写。
 - 路径一律内联为 SBPL 字符串字面量，严格转义 `\` 与 `"`；路径含控制字符（C0、DEL、C1，含 NUL、换行、回车、制表符）或不是绝对路径时返回
@@ -1035,7 +1043,12 @@ isolation:
   没有改用 `sandbox-exec -D KEY=VALUE` + `(param …)`：配置文件因此自包含，探针与 worker 共用同一份文件与同一条命令前缀，
   codex-orca 的终端命令也不必为每个参数再做 shell 引号；转义只涉及两个字符，由注入测试（引号、括号、反斜杠、`)(allow default`）
   与 macOS 上的实测（路径含 `we"ird) (allow default\x` 时 `sandbox-exec -f … /bin/cat` 仍然拒绝受保护文件）覆盖。
-- Orca 端口：`raindown node start` 目前没有提供端口解析，所以不生成端口规则，探针与 doctor 如实显示 `connect.orca_port` 跳过（“Orca 端口未解析”）。
+- Orca 端口（审查第一轮 M2）：节点以只读方式解析（`packages/node/src/orca-ports.ts`），不连接 Orca、不运行 orca 命令：
+  从 Orca 运行时目录的 app 控制套接字名 `o-<app pid>-<runtimeId>.sock` 取 pid（只看目录项名字与类型），再用
+  `lsof -nP -a -p <pid> -iTCP -sTCP:LISTEN -Fn` 读取该进程的监听端口。没有 Orca 运行时目录时视为本机没有 Orca（不拒绝端口，探针该项跳过）；
+  目录存在但找不到 app 套接字、lsof 失败或没有监听端口（例如 Orca 未运行）时为“未解析”：不生成端口规则，worker 照常启动，
+  但探针把 `connect.orca_port` 记为**失败**（不是跳过），该执行器不能显示为已施加，doctor 的修复提示写明“Orca 本机端口未解析”。
+  只覆盖 app 进程；Orca 守护进程（`daemon/`）的端口不在范围内。
 - 测试：`packages/core/test/isolation-sbpl.test.ts`（快照、注入、控制字符；macOS 上用 `/usr/bin/sandbox-exec -f <生成的配置> /bin/cat`
   对临时目录中伪造的受保护文件实测拒绝、允许文件可读；Linux CI 跳过实测部分）。
 
@@ -1045,7 +1058,7 @@ isolation:
 | --- | --- | --- |
 | codex-orca（4.2） | 角色沙箱设置为 `danger-full-access`（含 bypass） | 终端命令 `cd <worktree> && exec env -u … <赋值…> /usr/bin/sandbox-exec -f <配置> codex … "$(cat state/tasks/<id>/spec.md)"`：`sandbox-exec` 只包住 `codex`，任务说明由沙箱外的外层 shell 读取 |
 | codex-exec（4.3） | 角色 `permissions.sandbox` 为 `danger-full-access` | `spawn('/usr/bin/sandbox-exec', ['-f', <配置>, 'codex', 'exec', …])`，进程组与取消不变 |
-| claude-sdk（4.4） | 角色沙箱设置为 `bash-sandbox-off`（当前全部 claude-sdk 角色），且不是 supervisor 唤醒会话 | SDK 的 `spawnClaudeCodeProcess` 以 `sandbox-exec -f <配置> <SDK 给出的命令> …` 启动 Claude Code 原生进程，stderr 转交 `stderr` 回调；同时传 `sandbox: { enabled: false }`（flag settings 层，优先于 project / user 设置）强制关闭 bash 沙箱，否则嵌套失败（退出码 71） |
+| claude-sdk（4.4） | 角色沙箱设置为 `bash-sandbox-off`（除 supervisor 外的 claude-sdk 角色） | SDK 的 `spawnClaudeCodeProcess` 以 `sandbox-exec -f <配置> <SDK 给出的命令> …` 启动 Claude Code 原生进程，stderr 转交 `stderr` 回调；同时传 `sandbox: { enabled: false }`（flag settings 层，优先于 project / user 设置）强制关闭 bash 沙箱，否则嵌套失败（退出码 71） |
 
 - 隔离清单的输入：工作目录（codex-orca 为任务 worktree，codex-exec 为合同工作目录，claude-sdk 为会话工作目录，审查会话为审查 worktree）、
   读写类别（有效类别 read 时工作目录只读）、本次派工令牌、中枢端口（取自 `RAINDOWN_HUB_URL`），codex 还放行本执行器的 CODEX_HOME。
@@ -1054,10 +1067,13 @@ isolation:
   派工令牌不在任务私有目录 `isolation_token_outside_task_dir`，配置不合法 `isolation_profile_*`，写入失败 `isolation_profile_write_failed`。
   这不会静默降级为未隔离运行。
 - codex-orca 的恢复与重新挂接：`state/tasks/<id>/orca.json` 记录终端启动时的施加层（`isolation_layer: seatbelt`，开关关闭时不写这个键）。
-  开关打开时，会话恢复、派工绑定变化后重启等**新起的终端同样施加**；记录中没有施加层的存活终端（升级前或开关打开前启动，包括仍在旧
-  CODEX_HOME 链接路径上的）不重新挂接，任务以 `failed`、原因 `isolation_not_applied` 结束，提示先关闭旧终端。已施加的终端照常重挂接。
+  开关打开时，会话恢复、派工绑定变化后重启等**新起的终端同样施加**：派工绑定已变化的未隔离旧终端照常关闭后以隔离方式重启。
+  派工绑定相同、但记录中没有施加层的存活终端（升级前或开关打开前启动，包括仍在旧 CODEX_HOME 链接路径上的）不重新挂接：
+  节点关闭该终端，任务以 `failed`、原因 `isolation_not_applied` 结束，重试即以隔离方式重启（审查第一轮 L1）。已施加的终端照常重挂接。
 - supervisor 唤醒会话不包裹：唤醒绑定的 MCP 按设计（tasks 2.2）仍在本地读取 raindown-home，唤醒令牌在 `state/wake/`，整体拒绝会使其无法工作。
+  它有单独的沙箱设置 `supervisor-session`，声明为 `none`（审查第一轮 M1），doctor 与 `node list` 显示为 none、不探测。
   supervisor 角色是只读配置，属于协调者；这一边界在 6.1 的角色要求中需要单独处理。
+- claude-sdk 的 `spawnClaudeCodeProcess` 启动失败（例如 `sandbox-exec` 不存在）时不会让节点崩溃，原因写入 stderr 尾部（脱敏后）随失败结果上报。
 
 ### `native`（Codex permissions profile）
 
@@ -1078,7 +1094,10 @@ isolation:
 ### 部署到真实节点后（开关关闭）
 
 不需要改任何配置。harness 的启动方式、能力声明与探针结果都与之前相同；`node.yaml` 只多了一个可选字段（不写即为 `false`）；
-任务结束与节点启动时多一次删除 `run/tasks/<任务>/isolation.sb` 的尝试（文件不存在时什么也不做）。doctor 的修复提示措辞改为说明开关。
+任务结束与节点启动时多一次删除 `state/tasks/<任务>/isolation.sb` 的尝试（文件不存在时什么也不做）。doctor 的修复提示措辞改为说明开关。
+claude-sdk 多声明一个沙箱设置 `supervisor-session → none`。探针每轮多三项：`rename.protected_ancestor`、`write.own_profile`（未施加时为
+可改名 / 跳过）与按只读方式解析出的 Orca 端口（每轮运行一次 `lsof`，只读，不连接 Orca）；未施加时探针本来就不通过，结论不变。
+`config/node.yaml` 打开开关但不在 macOS 上时，doctor 给出 warning“开关打开但平台不支持，未施加”（审查第一轮 L3）。
 
 ## 隔离自检探针（worker-credential-isolation 3.1–3.2）
 
@@ -1091,11 +1110,12 @@ isolation:
 - 入口：`runIsolationProbe`（节点进程内）为每个执行器 × 沙箱设置（声明的施加层不是 `none`）计算隔离清单（`computeIsolationSpec`），
   推导探针清单（core 的 `buildProbePlan`），再启动子进程 `child.ts` 逐项尝试。子进程在节点进程之外、以探针的临时工作目录为 cwd 运行，
   清单经 stdin 传入，结果经 stdout 返回，环境变量只传 `PATH` 与 `HOME`。
-- 同一实际施加层（`applied_layer`）的组合每轮只真正运行一次（受保护文件每轮每个施加层只打开一次），结果复用到同层的其他执行器 × 沙箱设置；
+- 未施加（`none`）的组合每轮只真正运行一次，结果复用到其他执行器 × 沙箱设置；施加时清单随执行器及其 harness 子目录变化（保留的目录不同），
+  按执行器 × harness 子目录分别运行，只在配置完全相同的组合之间复用（审查第一轮 L4）；
   复用时只按各自的读写类别重新设定 `write.workdir` 的预期。开关关闭时全部是 `none`，所以每轮只运行一次。
 - 子进程按与 worker 相同的包裹方式启动：接口接受一个“启动包装”（`launchWrapper(target, argv, { home, taskId, spec })`），
   开关关闭时为恒等；打开时 `raindown node start` 传入 `seatbeltProbeLaunchWrapper`：实际施加层为 `seatbelt` 的目标用与 worker
-  相同的生成函数（`renderSeatbeltProfile` + `writeSeatbeltLaunch`）把配置写到探针临时任务目录的 `isolation.sb`，
+  相同的生成函数（`renderSeatbeltProfile` + `writeSeatbeltLaunch`）把配置写到探针临时任务的 `state/tasks/<探针任务>/isolation.sb`，
   以 `/usr/bin/sandbox-exec -f <配置>` 启动探针子进程，配置随临时任务目录删除。
 - 运行前在 `run/tasks/isolation-probe-other-<hex>/dispatch-tokens/` 造一个内容明显为假的“他人任务”令牌，
   在 `run/tasks/isolation-probe-self-<hex>/` 造“本任务”令牌，在系统临时目录建工作目录；结束后全部删除
@@ -1114,7 +1134,9 @@ isolation:
 | `read.hub_token_via_symlink` | 拒绝 | 在工作目录建指向 hub.token 的符号链接再读取（验证 realpath 规范化），用后删除 |
 | `write.config` | 拒绝 | 在 `config/` 下独占新建探针文件；新建成功即记为“可写”，随后立即删除，删除失败时在说明中写出残留路径 |
 | `connect.orca_socket.<n>` | 拒绝 | 对 Orca 运行时目录（及 `daemon/`）中的 unix 套接字只 `connect`，不发送任何数据；没有套接字时为“跳过” |
-| `connect.orca_port.<端口>` | 拒绝 | 对解析出的 Orca 本机端口只建立 TCP 连接后立即关闭；端口未解析时为“跳过” |
+| `connect.orca_port.<端口>` | 拒绝 | 对解析出的 Orca 本机端口只建立 TCP 连接后立即关闭；端口未解析时为**失败**（无法证明控制端口被拒绝），本机没有 Orca 运行时目录时为“跳过” |
+| `rename.protected_ancestor` | 拒绝 | 在探针临时任务目录（`run/tasks/isolation-probe-self-*/rename-probe/`）下自建 `a/b/secret`，把 `secret` 加入本次探针清单的受保护项，尝试改名 `a`（受保护路径的祖先）；成功则立即改回。**只操作探针自建的临时目录树，绝不改名真实目录** |
+| `write.own_profile` | 拒绝 | 以读写方式打开本次探针实际使用的 seatbelt 配置（`state/tasks/<探针任务>/isolation.sb`）后立即关闭，不写入；未施加时没有配置文件，记为跳过 |
 | `debug.process` | 拒绝 | **未验证**，原因见下 |
 | `write.workdir` | 可写（只读角色为拒绝） | 在工作目录独占新建文件后删除 |
 | `read.own_task_token` | 可读 | 读取本任务令牌 |
@@ -1124,7 +1146,7 @@ isolation:
   结果只含项名、路径、预期、实际与错误码（`EACCES`、`EPERM` 等），不含错误消息正文。测试用带特征字符串的假文件断言输出中不出现内容。
 - 判定：`EACCES`/`EPERM`/`EROFS` 为拒绝；`ENOENT` 为跳过（目标不存在，无法验证）；连接得到 `ECONNREFUSED` 记为拒绝并注明歧义
   （seatbelt 拒绝 unix 连接时 bun 报的也是 `ECONNREFUSED`，与失效套接字、无人监听的端口无法区分）；其他错误为失败。
-- **通过**：没有不符合预期的项、没有运行错误，并且核心受保护项 `read.hub_token`、`read.ledger_db`、`read.other_task_token`、`write.config`
+- **通过**：没有不符合预期的项、没有运行错误，并且核心受保护项 `read.hub_token`、`read.ledger_db`、`read.other_task_token`、`write.config`、`rename.protected_ancestor`、`write.own_profile`（后两项为审查第一轮新增；旧节点的结果缺这两项，按缺少核心项不通过）
   全部出现且确实被拒绝。跳过与未验证不计入通过或失败，但会显示（核心项被跳过同样不能通过）。
 - `ok` 与 `passed` 由中枢按预期与实际重新计算后才写入（deny/allow 为 `actual === expected`，skipped/unverified 为 null，error 为 false），节点上报的值不用。
 - 探针运行本身抛错时，节点改为上报每个目标都带 `probe_failed` 错误的不通过结果，不继续上报之前的结果。
@@ -1148,7 +1170,7 @@ isolation:
 ```text
 [warn] 隔离 n-mac-abc123 codex-orca × danger-full-access：声明 seatbelt，未施加；最近探针 2026-11-09T08:00:00.000Z，macOS 15.1（实际以 none 运行）：不通过
          失败 read.hub_token（~/raindown-home/state/hub.token）：预期拒绝，实际 allow
-         跳过 connect.orca_port：Orca 端口未解析：没有提供 Orca 端口解析
+         失败 connect.orca_port：预期拒绝，实际 error（Orca 端口未解析：…）
          未验证 debug.process：…
        修复：适配器尚未施加隔离（config/node.yaml 的 isolation.enforce 为 false、不在 macOS 上或该施加层尚未实现），探针如实报告受保护项可访问
 ```
