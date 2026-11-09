@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { lstat, mkdtemp, readdir, realpath, rm } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -13,6 +13,7 @@ import {
   type IsolationProbeItem,
   type IsolationProbeReport,
   type IsolationProbeRun,
+  type IsolationSpec,
   isolationProbeItem,
   ORCA_RUNTIME_DIR,
   PROBE_FAKE_TOKEN_CONTENT,
@@ -23,18 +24,23 @@ import {
   raindownPaths,
   resolveAgeKeyFile,
   runTasksDir,
+  taskIsolationProfile,
+  taskRunDir,
 } from '@raindown/core'
 import { z } from 'zod'
-import { removeEmptyTaskRunDir, removeLeaseTokenFile, writeLeaseTokenFile } from '../lease-token.ts'
+import { removeLeaseTokenFile, removeSeatbeltProfile, writeLeaseTokenFile } from '../lease-token.ts'
+import { hubPortOf, type SeatbeltOptions, writeSeatbeltLaunch } from '../seatbelt.ts'
 
 /**
  * 节点侧的隔离自检探针（add-worker-credential-isolation D6，tasks 3.1）：
  * 1. 对每个执行器 × 沙箱设置（声明的施加层不是 none）计算隔离清单（`computeIsolationSpec`）；
  * 2. 造临时的"他人任务"假令牌与"本任务"令牌、临时工作目录；
- * 3. 以与 worker 相同的包裹方式启动探针子进程（`launchWrapper`，本阶段恒等，适配器尚未施加隔离），在节点进程之外逐项尝试；
+ * 3. 以与 worker 相同的包裹方式启动探针子进程（`launchWrapper`），在节点进程之外逐项尝试；
  * 4. 删除全部临时文件，返回结构化结果。
  *
- * 本阶段适配器都是 `enforced: false`，探针实际以 none 方式运行，受保护项可读 → 不通过；这正是要如实上报的状态。
+ * 开关 `isolation.enforce` 关闭时适配器都是 `enforced: false`，探针实际以 none 方式（恒等包裹）运行，受保护项可读 → 不通过；
+ * 这正是要如实上报的状态。开关打开时节点传入 `seatbeltProbeLaunchWrapper`：施加层为 seatbelt 的目标用与 worker 相同的
+ * SBPL 生成函数写配置并以 `sandbox-exec -f` 启动（tasks 4.1–4.4 的探针联动）。
  */
 
 /** 子进程入口（与本文件同目录）。 */
@@ -49,9 +55,35 @@ export interface ProbeTarget {
   applied_layer: string
 }
 
-/** 启动包装：接收探针子进程的 argv，返回实际执行的 argv（4.x 在这里加上 sandbox-exec 等）。本阶段为恒等。 */
-export type ProbeLaunchWrapper = (target: ProbeTarget, argv: readonly string[]) => string[]
+/** 启动包装的上下文：探针临时任务与它的隔离清单（与 worker 同一个 `computeIsolationSpec` 结果）。 */
+export interface ProbeLaunch {
+  home: string
+  taskId: string
+  spec: IsolationSpec
+}
+
+/** 启动包装：接收探针子进程的 argv，返回实际执行的 argv（施加 seatbelt 时加上 sandbox-exec）。缺省为恒等。 */
+export type ProbeLaunchWrapper = (
+  target: ProbeTarget,
+  argv: readonly string[],
+  launch: ProbeLaunch,
+) => string[] | Promise<string[]>
 export const identityLaunchWrapper: ProbeLaunchWrapper = (_target, argv) => [...argv]
+
+/**
+ * 开关打开时的启动包装：实际施加层为 seatbelt 的目标，用与 worker 相同的 SBPL 生成与写入（`writeSeatbeltLaunch`）
+ * 写入探针临时任务目录的 `isolation.sb`，以 `sandbox-exec -f <配置>` 启动探针子进程；其他施加层恒等。
+ */
+export function seatbeltProbeLaunchWrapper(
+  o: Pick<SeatbeltOptions, 'sandboxExec'> = {},
+): ProbeLaunchWrapper {
+  return async (target, argv, launch) => {
+    if (target.applied_layer !== 'seatbelt') return [...argv]
+    const prepared = await writeSeatbeltLaunch(o, launch.home, launch.taskId, launch.spec)
+    if (!prepared.ok) throw new ProbeError(prepared.error.code, prepared.error.message)
+    return [...prepared.data.prefix, ...argv]
+  }
+}
 
 export interface IsolationProbeOptions {
   home: string
@@ -78,6 +110,8 @@ export const PROBE_TIMEOUT_MS = 20_000
 /** 探针临时任务 id 的前缀（造在 `run/tasks/` 下，结束即删除；节点启动清理也会删除残留的令牌文件）。 */
 export const PROBE_TASK_PREFIX = 'isolation-probe-'
 const PROBE_LEASE = 'isolation-probe'
+/** 改名探针的临时目录名（位于探针临时任务目录下）。 */
+const RENAME_PROBE_DIR = 'rename-probe'
 
 const knownLayer = (v: string | undefined) =>
   v !== undefined && (ISOLATION_LAYERS as readonly string[]).includes(v) ? v : 'none'
@@ -110,12 +144,6 @@ function executorHomeFor(target: ProbeTarget): string | undefined {
     return target.setting === 'read-only' ? 'codex-read-home' : 'codex-home'
   if (target.executor === 'codex-orca') return 'codex-home'
   return undefined
-}
-
-const hubPortOf = (hubUrl: string): number => {
-  const u = new URL(hubUrl)
-  if (u.port) return Number(u.port)
-  return u.protocol === 'https:' ? 443 : 80
 }
 
 /** 列出 Orca 运行时目录（及 `daemon/`）中的 unix 套接字；只看目录项类型，不读文件、不连接。 */
@@ -273,6 +301,13 @@ async function runOne(
     tokens.push(ownToken)
     const otherToken = await writeLeaseTokenFile(o.home, otherTask, PROBE_LEASE, fake)
     tokens.push(otherToken)
+    // 改名探针（审查第一轮 H1）：在本探针临时任务目录下自建 a/b/secret，把 secret 作为受保护项加入清单，
+    // 子进程尝试改名 a（受保护路径的祖先目录）。只操作探针自建的临时目录树，绝不改名真实目录。
+    const renameRoot = join(taskRunDir(o.home, ownTask), RENAME_PROBE_DIR)
+    await mkdir(join(renameRoot, 'a', 'b'), { recursive: true, mode: 0o700 })
+    await writeFile(join(renameRoot, 'a', 'b', 'secret'), `${fake}\n`, { mode: 0o600 })
+    const renameTarget = await realpath(join(renameRoot, 'a'))
+    const renameSecret = join(renameTarget, 'b', 'secret')
     const executorHome = executorHomeFor(target)
     const spec = await computeIsolationSpec({
       home: o.home,
@@ -289,8 +324,15 @@ async function runOne(
       ...(o.env ? { env: o.env } : {}),
     })
     if (!spec.ok) return failed(spec.error.code, spec.error.message)
+    const probeSpec: IsolationSpec = {
+      ...spec.data,
+      deny_read: [...spec.data.deny_read, renameSecret],
+      deny_write: [...spec.data.deny_write, renameSecret],
+    }
     const plan = buildProbePlan({
-      spec: spec.data,
+      spec: probeSpec,
+      renameTarget,
+      profilePath: taskIsolationProfile(o.home, ownTask),
       home: o.home,
       ageKeyFile: resolveAgeKeyFile(
         o.ageKeyFile ? { ageKeyFile: o.ageKeyFile } : {},
@@ -303,7 +345,11 @@ async function runOne(
       orcaSockets: shared.sockets,
     })
     const wrap = o.launchWrapper ?? identityLaunchWrapper
-    const argv = wrap(target, [o.execPath ?? process.execPath, PROBE_CHILD_SCRIPT])
+    const argv = await wrap(target, [o.execPath ?? process.execPath, PROBE_CHILD_SCRIPT], {
+      home: o.home,
+      taskId: ownTask,
+      spec: probeSpec,
+    })
     const items = await spawnProbe(argv, plan, o.timeoutMs ?? PROBE_TIMEOUT_MS, cwd)
     return { ...base, items, passed: probeRunPassed({ items }) }
   } catch (err) {
@@ -314,8 +360,10 @@ async function runOne(
     )
   } finally {
     for (const t of tokens) await removeLeaseTokenFile(t).catch(() => {})
+    await removeSeatbeltProfile(o.home, ownTask).catch(() => {})
+    // 探针临时任务目录（名字带固定前缀，全部由探针自建）：连同改名探针的目录树一起删除。
     for (const task of [ownTask, otherTask])
-      await removeEmptyTaskRunDir(o.home, task).catch(() => {})
+      await rm(taskRunDir(o.home, task), { recursive: true, force: true }).catch(() => {})
     if (cwd) await rm(cwd, { recursive: true, force: true }).catch(() => {})
   }
 }
@@ -387,8 +435,14 @@ export async function runIsolationProbe(o: IsolationProbeOptions): Promise<Isola
   const sockets: ProbeTargets = targets.length
     ? await findOrcaSockets(userHome)
     : { status: 'none', reason: '' }
+  // 未施加（none）时各目标的结果相同，只运行一次；施加时清单随执行器及其 harness 子目录变化（保留的目录不同），
+  // 按执行器 × harness 子目录分别运行（审查第一轮 L4），只在完全相同的配置之间复用。
+  const groupKey = (t: ProbeTarget) =>
+    t.applied_layer === 'none'
+      ? 'none'
+      : `${t.applied_layer}|${t.executor}|${executorHomeFor(t) ?? ''}`
   const groups = new Map<string, ProbeTarget[]>()
-  for (const t of targets) groups.set(t.applied_layer, [...(groups.get(t.applied_layer) ?? []), t])
+  for (const t of targets) groups.set(groupKey(t), [...(groups.get(groupKey(t)) ?? []), t])
   const results = await Promise.all(
     [...groups.values()].map(async (group) => {
       const [rep, ...rest] = group as [ProbeTarget, ...ProbeTarget[]]

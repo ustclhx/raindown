@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { open, symlink, unlink } from 'node:fs/promises'
+import { open, rename, symlink, unlink } from 'node:fs/promises'
 import { createConnection } from 'node:net'
 import {
   type IsolationProbeItem,
@@ -24,6 +24,9 @@ export interface ProbeSystem {
   createExclusive(path: string): Promise<void>
   symlink(target: string, path: string): Promise<void>
   unlink(path: string): Promise<void>
+  /** 以读写方式打开已有文件后立即关闭（不写入、不截断）。 */
+  openWrite(path: string): Promise<void>
+  rename(from: string, to: string): Promise<void>
   connectUnix(path: string, timeoutMs: number): Promise<void>
   connectTcp(host: string, port: number, timeoutMs: number): Promise<void>
   /** GET 并返回状态码；不读取响应正文。 */
@@ -55,6 +58,11 @@ export const realProbeSystem: ProbeSystem = {
   },
   symlink: (target, path) => symlink(target, path),
   unlink: (path) => unlink(path),
+  async openWrite(path) {
+    const fh = await open(path, 'r+')
+    await fh.close()
+  },
+  rename: (from, to) => rename(from, to),
   connectUnix: (path, timeoutMs) => connectOnce(() => createConnection({ path }), timeoutMs),
   connectTcp: (host, port, timeoutMs) =>
     connectOnce(() => createConnection({ host, port }), timeoutMs),
@@ -163,6 +171,28 @@ async function attempt(item: ProbePlanItem, plan: ProbePlan, sys: ProbeSystem): 
         return { actual: 'allow', detail: `探针文件未能删除，残留 ${path}（${errCode(err)}）` }
       }
     }
+    case 'open_write':
+      try {
+        await sys.openWrite(target)
+        return { actual: 'allow' }
+      } catch (err) {
+        return fileOutcome(err)
+      }
+    case 'rename': {
+      // 只用于探针自建的临时目录（见 buildProbePlan 的 renameTarget）；成功即为“可改名”，随后立即改回。
+      const moved = `${target}.moved-${sys.random()}`
+      try {
+        await sys.rename(target, moved)
+      } catch (err) {
+        return fileOutcome(err)
+      }
+      try {
+        await sys.rename(moved, target)
+        return { actual: 'allow' }
+      } catch (err) {
+        return { actual: 'allow', detail: `改名后未能改回，残留 ${moved}（${errCode(err)}）` }
+      }
+    }
     case 'unix_connect':
       try {
         await sys.connectUnix(target, timeout)
@@ -203,7 +233,8 @@ export async function runProbeItems(
   const out: IsolationProbeItem[] = []
   for (const item of plan.items) {
     let outcome: Outcome
-    if (item.skip !== undefined) outcome = { actual: 'skipped', detail: item.skip }
+    if (item.fail !== undefined) outcome = { actual: 'error', detail: item.fail }
+    else if (item.skip !== undefined) outcome = { actual: 'skipped', detail: item.skip }
     else if (item.unverified !== undefined)
       outcome = { actual: 'unverified', detail: item.unverified }
     else outcome = await attempt(item, plan, sys)

@@ -66,7 +66,15 @@ const report = (passed: boolean, ranAt = '2026-11-09T00:00:00.000Z'): IsolationP
           ok: passed,
           ...(passed ? { detail: 'EPERM' } : {}),
         },
-        ...(['read.ledger_db', 'read.other_task_token', 'write.config'] as const).map((item) => ({
+        ...(
+          [
+            'read.ledger_db',
+            'read.other_task_token',
+            'write.config',
+            'rename.protected_ancestor',
+            'write.own_profile',
+          ] as const
+        ).map((item) => ({
           item,
           expected: 'deny' as const,
           actual: 'deny' as const,

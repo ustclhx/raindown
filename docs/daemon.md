@@ -26,6 +26,16 @@ reserved:
 
 **升级注意**：`node.yaml` 是严格校验的，未知字段会让读取失败。写入 `reserved` 之后，**旧版本的节点二进制会因为不认识该字段而读取失败、无法启动**。先升级节点（与中枢）再写 `reserved`；回滚到旧版本前先删掉这一节。不写时取默认值，新旧版本都能读。
 
+worker 凭证隔离开关（add-worker-credential-isolation 4.1–4.4，缺省关闭）：
+
+```yaml
+isolation:
+  enforce: false  # true 时（仅 macOS）以 sandbox-exec 包裹 danger-full-access / bypass 的 Codex 与 claude-sdk worker
+```
+
+改动后重启节点生效；改回 `false`（或删掉这一节）即回滚。和 `reserved` 一样，旧版本节点不认识 `isolation`，回滚到旧版本前先删掉这一节。
+施加方式、失败时的行为与真实开启前的检查见 [executors.md](executors.md#外层-seatbelt-施加worker-credential-isolation-4144)。
+
 同理，旧节点会 strict 解析策略检查响应中的 `matched_rules[].rule`：升级节点之后，才能在 `policies.yaml` 中写带新条件（`when.push_to`、`when.gh_scope`）的规则，见 `packages/core/src/policy/README.md`。
 
 ## 任务重试的升级与回滚限制

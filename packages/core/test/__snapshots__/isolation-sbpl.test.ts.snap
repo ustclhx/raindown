@@ -1,0 +1,59 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`SBPL 生成 快照：allow default + 最窄允许项在前 + 显式拒绝在后 1`] = `
+";; 由 Raindown 节点生成（add-worker-credential-isolation 4.1），不要手动修改；每次启动 harness 前重新生成。
+;; 规则按出现顺序求值，同一操作后写的规则优先：允许项在前、拒绝项在后，拒绝优先。
+(version 1)
+(allow default)
+
+;; 1. 最窄允许项（allow default 下只作记录；均不位于下面的读拒绝目录内）
+(allow file-read*
+  (subpath "/Users/u/raindown-home/run/tasks/t-1/dispatch-tokens/l-1.token")
+  (subpath "/Users/u/work"))
+(allow file-write*
+  (subpath "/Users/u/work"))
+(allow network-outbound
+  (remote ip "localhost:7477"))
+
+;; 2. 受保护资源：读写拒绝（以目录为单位，新增文件自动覆盖）
+(deny file-read*
+  (subpath "/Users/u/.config/sops/age")
+  (subpath "/Users/u/Library/Application Support/orca")
+  (subpath "/Users/u/Library/LaunchAgents"))
+(deny file-write*
+  (subpath "/Users/u/.config/sops/age")
+  (subpath "/Users/u/Library/Application Support/orca")
+  (subpath "/Users/u/Library/LaunchAgents")
+  (subpath "/Users/u/raindown-home/run/tasks/t-1/dispatch-tokens"))
+
+;; 3. 目录下除保留子目录以外的全部内容（目录本身可见）
+(deny file-read* file-write*
+  (require-all (subpath "/Users/u/raindown-home") (require-not (literal "/Users/u/raindown-home")) (require-not (subpath "/Users/u/raindown-home/run"))))
+(deny file-read* file-write*
+  (require-all (subpath "/Users/u/raindown-home/run/tasks") (require-not (literal "/Users/u/raindown-home/run/tasks")) (require-not (subpath "/Users/u/raindown-home/run/tasks/t-1"))))
+
+;; 4. 受保护路径的祖先目录：拒绝对目录节点本身的写（改名、删除），防止改名祖先目录后在新路径下绕过上面的规则
+(deny file-write*
+  (literal "/")
+  (literal "/Users")
+  (literal "/Users/u")
+  (literal "/Users/u/.config")
+  (literal "/Users/u/.config/sops")
+  (literal "/Users/u/Library")
+  (literal "/Users/u/Library/Application Support")
+  (literal "/Users/u/raindown-home")
+  (literal "/Users/u/raindown-home/run")
+  (literal "/Users/u/raindown-home/run/tasks")
+  (literal "/Users/u/raindown-home/run/tasks/t-1"))
+
+;; 5. 控制通道：文件规则拦不住 unix 套接字 connect，单独拒绝；只拒绝已解析的 Orca 端口，其他本机端口不拒绝
+(deny network-outbound
+  (remote unix-socket (subpath "/Users/u/Library/Application Support/orca")))
+(deny network-outbound
+  (remote ip "*:60211"))
+
+;; 6. 跨进程调试（allow default 下默认允许 attach 同用户的非 hardened 进程）
+(deny mach-priv-task-port (target others))
+(deny mach-task-name (target others))
+"
+`;

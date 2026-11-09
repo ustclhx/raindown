@@ -874,3 +874,133 @@ describe('只读角色由执行器强制只读（add-m1-supervisor 5.7）', () =
     }
   })
 })
+
+/** 假的 sandbox-exec：记录收到的参数后去掉 `-f <配置>`，exec 其余命令（不施加任何沙箱，只验证 spawn 参数）。 */
+function fakeSandboxExec(dir: string) {
+  const script = join(dir, 'fake-sandbox-exec.sh')
+  const report = join(dir, 'sandbox-argv.txt')
+  writeFileSync(script, `#!/bin/sh\nprintf '%s\\n' "$@" > '${report}'\nshift 2\nexec "$@"\n`, {
+    mode: 0o755,
+  })
+  return { script, report, args: () => readFileSync(report, 'utf8').trimEnd().split('\n') }
+}
+
+describe('外层 seatbelt（worker-credential-isolation 4.3）', () => {
+  const dfa = { permissions: { sandbox: 'danger-full-access' as const } }
+  const hubUrl = 'http://127.0.0.1:7477'
+  const isolation = (s: ReturnType<typeof setup>, sandboxExec?: string, enforce = true) => ({
+    enforce,
+    platform: 'darwin' as const,
+    ...(sandboxExec ? { sandboxExec } : {}),
+    userHome: join(s.dir, 'user'),
+    env: {},
+  })
+
+  test.each([
+    ['开关关闭', false, 'danger-full-access'],
+    ['开关打开但沙箱为 read-only（native，未实现）', true, 'read-only'],
+    ['开关打开但沙箱为 workspace-write（native，未实现）', true, 'workspace-write'],
+  ] as const)('%s：spawn 参数不变，不生成配置', async (_name, enforce, sandbox) => {
+    const s = setup('send(resumed)', { permissions: { sandbox } })
+    const fake = fakeSandboxExec(s.dir)
+    await collect(
+      s.run({ ...s.ctx, hubUrl }, { ...s.options, isolation: isolation(s, fake.script, enforce) }),
+    )
+    expect(s.report().args[0]).toBe('exec')
+    expect(existsSync(fake.report)).toBe(false)
+    expect(existsSync(join(s.home, 'state/tasks/t-test/isolation.sb'))).toBe(false)
+  })
+
+  test('开关打开、danger-full-access：子进程经 sandbox-exec -f <配置> codex … 启动，配置 0600', async () => {
+    const s = setup('send(resumed)', dfa)
+    const fake = fakeSandboxExec(s.dir)
+    const { outcome } = await collect(
+      s.run({ ...s.ctx, hubUrl }, { ...s.options, isolation: isolation(s, fake.script) }),
+    )
+    expect(outcome.outcome).toBe('done')
+    const profile = join(s.home, 'state/tasks/t-test/isolation.sb')
+    const args = fake.args()
+    expect(args.slice(0, 4)).toEqual(['-f', profile, process.execPath, join(s.dir, 'codex.cjs')])
+    // codex 自己的参数原样跟在后面（与开关关闭时相同）。
+    // （假 sandbox-exec 按行记录参数，提示词中的换行也会分行，所以按行拼接后比较。）
+    expect(args.slice(4).join('\n')).toBe(s.report().args.join('\n'))
+    expect(lstatSync(profile).mode & 0o777).toBe(0o600)
+    const text = readFileSync(profile, 'utf8')
+    expect(text).toContain('(version 1)\n(allow default)\n')
+    expect(text).toContain(`(subpath "${realpathSync(execCodexHome(s.home))}")`)
+  })
+
+  test('开关打开但非 macOS：不施加，能力声明不变', async () => {
+    const s = setup('send(resumed)', dfa)
+    const fake = fakeSandboxExec(s.dir)
+    const options = {
+      ...s.options,
+      isolation: { ...isolation(s, fake.script), platform: 'linux' as const },
+    }
+    await collect(s.run({ ...s.ctx, hubUrl }, options))
+    expect(existsSync(fake.report)).toBe(false)
+    expect(createCodexExecExecutor(options).adapterCapabilities.credential_isolation).toEqual({
+      layers: {
+        'danger-full-access': 'seatbelt',
+        'workspace-write': 'native',
+        'read-only': 'native',
+      },
+      enforced: false,
+    })
+  })
+
+  test('开关打开时能力声明只保留已实现的施加层（native 未实现，声明为 none）', () => {
+    const s = setup('send(resumed)', dfa)
+    expect(
+      createCodexExecExecutor({ ...s.options, isolation: isolation(s) }).adapterCapabilities
+        .credential_isolation,
+    ).toEqual({
+      layers: { 'danger-full-access': 'seatbelt', 'workspace-write': 'none', 'read-only': 'none' },
+      enforced: true,
+    })
+  })
+
+  test('无法施加（没有中枢地址）时不启动 Codex，结果带原因', async () => {
+    const s = setup('send(resumed)', dfa)
+    const fake = fakeSandboxExec(s.dir)
+    const { outcome } = await collect(
+      s.run(s.ctx, { ...s.options, isolation: isolation(s, fake.script) }),
+    )
+    expect(outcome).toMatchObject({
+      outcome: 'failed',
+      result: { reason: 'isolation_hub_url_missing' },
+    })
+    expect(s.launched()).toBe(false)
+  })
+
+  test.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))(
+    'macOS 实测：真实 sandbox-exec 下 worker 读不到 state/hub.token，任务照常完成',
+    async () => {
+      const s = setup(
+        `let r = 'readable'; try { fs.readFileSync(process.env.RAINDOWN_HOME + '/state/hub.token') } catch (e) { r = e.code } fs.writeFileSync('hub-read.txt', r); let w = 'writable'; try { fs.writeFileSync(process.env.RAINDOWN_HOME + '/state/tasks/t-test/isolation.sb', '(version 1)(allow default)') } catch (e) { w = e.code } fs.writeFileSync('profile-write.txt', w); send(resumed)`,
+        dfa,
+      )
+      mkdirSync(join(s.home, 'state'), { recursive: true })
+      writeFileSync(join(s.home, 'state/hub.token'), 'FAKE-HUB-TOKEN-not-a-secret\n')
+      const { outcome } = await collect(
+        s.run({ ...s.ctx, hubUrl }, { ...s.options, isolation: isolation(s) }),
+      )
+      expect(outcome.outcome).toBe('done')
+      expect(readFileSync(join(s.dir, 'hub-read.txt'), 'utf8')).toBe('EPERM')
+      // 审查第一轮 H2：worker 不能改写本任务实际使用的配置（位于 state/tasks/<任务>/）。
+      expect(readFileSync(join(s.dir, 'profile-write.txt'), 'utf8')).toBe('EPERM')
+      expect(readFileSync(join(s.home, 'state/tasks/t-test/isolation.sb'), 'utf8')).toContain(
+        '(deny file-write*',
+      )
+      // 对照：不施加时可读。
+      const plain = setup(
+        `let r = 'readable'; try { fs.readFileSync(process.env.RAINDOWN_HOME + '/state/hub.token') } catch (e) { r = e.code } fs.writeFileSync('hub-read.txt', r); send(resumed)`,
+        dfa,
+      )
+      mkdirSync(join(plain.home, 'state'), { recursive: true })
+      writeFileSync(join(plain.home, 'state/hub.token'), 'FAKE-HUB-TOKEN-not-a-secret\n')
+      await collect(plain.run({ ...plain.ctx, hubUrl }))
+      expect(readFileSync(join(plain.dir, 'hub-read.txt'), 'utf8')).toBe('readable')
+    },
+  )
+})

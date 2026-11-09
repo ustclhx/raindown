@@ -32,6 +32,8 @@ import {
   type ExecutorOutcome,
   type ExecutorPlugin,
   type ExecutorRun,
+  type SeatbeltOptions,
+  writeLeaseTokenFile,
 } from '../src/index.ts'
 import {
   FakeGh,
@@ -82,6 +84,8 @@ async function start(
     leaseTokenFile?: string
     reportResumeReplyDropped?: (options?: { attempted?: boolean }) => void
     directoryStat?: (path: string) => { isDirectory(): boolean }
+    isolation?: SeatbeltOptions
+    hubUrl?: string
   } = {},
 ) {
   h = extra.home ?? orcaHome()
@@ -98,6 +102,7 @@ async function start(
     baseBranch: async () => 'origin/main',
     waitForSetup: async () => ok(undefined),
     ...(extra.directoryStat ? { directoryStat: extra.directoryStat } : {}),
+    ...(extra.isolation ? { isolation: extra.isolation } : {}),
   })
   const contract = taskContract.parse({
     goal: '修正 README',
@@ -119,6 +124,7 @@ async function start(
     ...(extra.recovery ? { recovery: extra.recovery } : {}),
     ...(extra.inputs ? { inputs: extra.inputs } : {}),
     ...(extra.leaseTokenFile ? { leaseTokenFile: extra.leaseTokenFile } : {}),
+    ...(extra.hubUrl ? { hubUrl: extra.hubUrl } : {}),
     ...(extra.reportResumeReplyDropped
       ? { reportResumeReplyDropped: extra.reportResumeReplyDropped }
       : {}),
@@ -2266,5 +2272,200 @@ describe('PR 直通的输入（harness-neutral 8.4）', () => {
     expect(spec).toStartWith(`${renderRecoveryPrompt(recovery)}\n\n${renderTaskInputs([input(4)])}`)
     expect(sends(s)).toEqual([])
     await s.run.cancel()
+  })
+})
+
+describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
+  const HUB = 'http://127.0.0.1:7477'
+  const on = (home: OrcaHome): SeatbeltOptions => ({
+    enforce: true,
+    platform: 'darwin',
+    userHome: join(home.root, 'user'),
+    env: {},
+  })
+  const created = (s: Started) =>
+    s.orca.ops('terminalCreate').map((c) => (c.input as { command: string }).command)
+  /** 把临时目录换成占位符，便于快照。 */
+  const norm = (text: string | undefined, home: OrcaHome) =>
+    (text ?? '').split(realpathSync(home.root)).join('<root>').split(home.root).join('<root>')
+  const token = (home: OrcaHome, lease: string) =>
+    writeLeaseTokenFile(home.home, 't-orca-1', lease, 'fake-lease-token-not-a-secret')
+
+  test('开关关闭：终端命令与之前逐字节一致（快照），不生成配置', async () => {
+    const home = orcaHome()
+    const leaseTokenFile = await token(home, 'l-1')
+    const s = await start({}, (o) => o.show('working'), { home, leaseTokenFile, hubUrl: HUB })
+    await ready(s)
+    const [command] = created(s)
+    expect(norm(command, home)).toMatchSnapshot()
+    expect(command).not.toContain('sandbox-exec')
+    expect(existsSync(join(home.home, 'state/tasks/t-orca-1/isolation.sb'))).toBe(false)
+    const state = JSON.parse(
+      readFileSync(join(home.home, 'state/tasks/t-orca-1/orca.json'), 'utf8'),
+    )
+    expect(state).not.toHaveProperty('isolation_layer')
+    await s.run.cancel()
+  })
+
+  test('开关打开、bypass：sandbox-exec 只包住 codex，任务说明仍由外层 shell 读取', async () => {
+    const home = orcaHome()
+    const leaseTokenFile = await token(home, 'l-1')
+    // 对照：另一个临时 home 中开关关闭时的命令（令牌路径按各自的 home 归一）。
+    const offHome = orcaHome()
+    const off = await start({}, (o) => o.show('working'), {
+      home: offHome,
+      leaseTokenFile: await token(offHome, 'l-1'),
+      hubUrl: HUB,
+    })
+    await ready(off)
+    await off.run.cancel()
+    const offCommand = norm(created(off)[0], offHome)
+    rmSync(offHome.root, { recursive: true, force: true })
+    const s = await start({}, (o) => o.show('working'), {
+      home,
+      leaseTokenFile,
+      hubUrl: HUB,
+      isolation: on(home),
+    })
+    await ready(s)
+    const [command] = created(s)
+    const profile = join(home.home, 'state/tasks/t-orca-1/isolation.sb')
+    expect(norm(command, home)).toMatchSnapshot()
+    // 顺序：exec env … CODEX_HOME=… /usr/bin/sandbox-exec -f <配置> codex … "$(cat spec.md)"
+    const sandboxAt = command?.indexOf(`/usr/bin/sandbox-exec -f ${profile} codex `) ?? -1
+    expect(sandboxAt).toBeGreaterThan(command?.indexOf('CODEX_HOME=') ?? Infinity)
+    expect(command?.indexOf('exec env ')).toBeLessThan(sandboxAt)
+    expect(command?.indexOf('"$(cat ')).toBeGreaterThan(sandboxAt)
+    expect(command).toEndWith(`"$(cat ${join(home.home, 'state/tasks/t-orca-1/spec.md')})"`)
+    // 去掉前缀后与开关关闭时的命令相同（只多了 sandbox-exec -f <配置>）。
+    expect(norm(command?.replace(`/usr/bin/sandbox-exec -f ${profile} `, ''), home)).toBe(
+      offCommand,
+    )
+    expect(lstatSync(profile).mode & 0o777).toBe(0o600)
+    const text = readFileSync(profile, 'utf8')
+    expect(text).toContain(`(subpath ${JSON.stringify(realpathSync(home.worktree))})`)
+    expect(text).toContain(`(subpath ${JSON.stringify(realpathSync(leaseTokenFile))})`)
+    const state = JSON.parse(
+      readFileSync(join(home.home, 'state/tasks/t-orca-1/orca.json'), 'utf8'),
+    )
+    expect(state.isolation_layer).toBe('seatbelt')
+    await s.run.cancel()
+  })
+
+  test('开关打开但角色为 workspace-write（native 未实现）：命令不变', async () => {
+    const home = orcaHome()
+    writeFileSync(
+      join(home.home, 'config/roles/dev.yaml'),
+      'name: dev\nexecutor: codex-orca\nprompt: dev.md\npermissions:\n  approval: on-request\n  sandbox: workspace-write\n',
+    )
+    const s = await start({}, (o) => o.show('working'), {
+      home,
+      hubUrl: HUB,
+      isolation: on(home),
+    })
+    await ready(s)
+    expect(created(s)[0]).not.toContain('sandbox-exec')
+    expect(existsSync(join(home.home, 'state/tasks/t-orca-1/isolation.sb'))).toBe(false)
+    await s.run.cancel()
+  })
+
+  test('开关打开：升级前（未隔离）启动的终端不重新挂接，按无法恢复处理', async () => {
+    const first = await start({}, (o) => o.show('question'))
+    await ready(first)
+    const home = h
+    if (!home) throw new Error('no home')
+    const second = await start({}, (o) => o.show('question'), {
+      home,
+      hubUrl: HUB,
+      isolation: on(home),
+    })
+    await ready(second)
+    expect(second.outcome()).toMatchObject({
+      ok: true,
+      data: { outcome: 'failed', result: { reason: 'isolation_not_applied' } },
+    })
+    expect(second.orca.ops('terminalCreate')).toEqual([])
+    expect(sends(second)).toEqual([])
+    // 审查第一轮 L1：顺手关闭该终端，下次派工以隔离方式重启。
+    expect(second.orca.ops('terminalClose')).toHaveLength(1)
+    const state = JSON.parse(
+      readFileSync(join(home.home, 'state/tasks/t-orca-1/orca.json'), 'utf8'),
+    )
+    expect(state).not.toHaveProperty('handle')
+    await first.run.cancel()
+  })
+
+  test('开关打开：派工绑定已变化的未隔离旧终端关闭后以隔离方式重启（审查第一轮 L1）', async () => {
+    const home = orcaHome()
+    const first = await start({}, (o) => o.show('question'), {
+      home,
+      leaseTokenFile: await token(home, 'l-1'),
+      hubUrl: HUB,
+    })
+    await ready(first)
+    const second = await start({}, (o) => o.show('question'), {
+      home,
+      leaseTokenFile: await token(home, 'l-2'),
+      hubUrl: HUB,
+      isolation: on(home),
+    })
+    await ready(second)
+    expect(second.outcome()).toBeUndefined()
+    expect(second.orca.ops('terminalClose')).toHaveLength(1)
+    expect(created(second)[0]).toContain('/usr/bin/sandbox-exec -f ')
+    const state = JSON.parse(
+      readFileSync(join(home.home, 'state/tasks/t-orca-1/orca.json'), 'utf8'),
+    )
+    expect(state.isolation_layer).toBe('seatbelt')
+    await first.run.cancel()
+    await second.run.cancel()
+  })
+
+  test('开关打开：已隔离的终端照常重挂接；派工绑定变化后新起的终端同样施加', async () => {
+    const home = orcaHome()
+    const first = await start({}, (o) => o.show('question'), {
+      home,
+      leaseTokenFile: await token(home, 'l-1'),
+      hubUrl: HUB,
+      isolation: on(home),
+    })
+    await ready(first)
+    const same = await start({}, (o) => o.show('question'), {
+      home,
+      leaseTokenFile: join(home.home, 'run/tasks/t-orca-1/dispatch-tokens/l-1.token'),
+      hubUrl: HUB,
+      isolation: on(home),
+    })
+    await ready(same)
+    expect(same.orca.ops('terminalCreate')).toEqual([])
+    expect(same.activity.some((a) => a.text?.includes('接着使用已有的终端'))).toBe(true)
+    await same.run.cancel()
+    const relaunched = await start({}, (o) => o.show('question'), {
+      home,
+      leaseTokenFile: await token(home, 'l-2'),
+      hubUrl: HUB,
+      isolation: on(home),
+    })
+    await ready(relaunched)
+    expect(relaunched.orca.ops('terminalClose')).toHaveLength(1)
+    expect(created(relaunched)[0]).toContain('/usr/bin/sandbox-exec -f ')
+    await first.run.cancel()
+    await relaunched.run.cancel()
+  })
+
+  test('开关打开但无法计算隔离清单（派工令牌不在任务私有目录）：不启动 Codex', async () => {
+    const home = orcaHome()
+    const s = await start({}, (o) => o.show('working'), {
+      home,
+      leaseTokenFile: join(home.root, 'elsewhere.token'),
+      hubUrl: HUB,
+      isolation: on(home),
+    })
+    await ready(s)
+    expect(s.outcome()).toMatchObject({
+      ok: true,
+      data: { outcome: 'failed', result: { reason: 'isolation_token_outside_task_dir' } },
+    })
+    expect(s.orca.ops('terminalCreate')).toEqual([])
   })
 })

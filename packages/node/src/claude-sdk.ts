@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process'
 import { readFile, realpath } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type {
@@ -11,11 +12,14 @@ import type {
   SDKResultMessage,
   SDKUserMessage,
   SettingSource,
+  SpawnedProcess,
+  SpawnOptions,
 } from '@anthropic-ai/claude-agent-sdk'
 import {
   BLOCKED_REASONS,
   type BlockedReason,
   RAINDOWN_MCP_TOOL_PREFIX as CORE_RAINDOWN_MCP_TOOL_PREFIX,
+  type CredentialIsolation,
   clipText,
   type DeliveredReply,
   effectiveRoleKind,
@@ -84,6 +88,13 @@ import {
   prepareReview,
   reviewPromptSection,
 } from './review-prep.ts'
+import {
+  effectiveCredentialIsolation,
+  prepareSeatbelt,
+  type SeatbeltOptions,
+  seatbeltApplies,
+  seatbeltFailureMessage,
+} from './seatbelt.ts'
 import { resolveContractCwd } from './workdir.ts'
 
 /**
@@ -104,6 +115,20 @@ import { resolveContractCwd } from './workdir.ts'
  */
 
 export const CLAUDE_SDK_EXECUTOR = 'claude-sdk'
+
+/**
+ * claude-sdk 的凭证隔离声明（D1）：bash 沙箱关闭时为外层 seatbelt；开启时原生 denyRead 只覆盖 Bash，不提供；
+ * supervisor 唤醒会话不施加（审查第一轮 M1）。
+ */
+export const CLAUDE_SDK_CREDENTIAL_ISOLATION: CredentialIsolation = {
+  layers: {
+    'bash-sandbox-off': 'seatbelt',
+    'bash-sandbox-on': 'none',
+    // supervisor 唤醒会话：MCP 按设计仍在本地读取 raindown-home（唤醒令牌在 state/wake/），不包裹外层 seatbelt。
+    'supervisor-session': 'none',
+  },
+  enforced: false,
+}
 export const DEFAULT_CLAUDE_MODEL = 'claude-opus-5-5'
 /** 审批等待的默认时限：24 小时。 */
 export const DEFAULT_APPROVAL_TIMEOUT_MINUTES = 24 * 60
@@ -337,6 +362,39 @@ export interface ClaudeSdkExecutorOptions {
   resolveSupervisor?: (
     workspace: string,
   ) => Promise<Result<Pick<SupervisorConfig, 'reviewer_roles'> | undefined>>
+  /**
+   * 外层 seatbelt（tasks 4.4）：`config/node.yaml` 的 `isolation.enforce`。缺省关闭，SDK 选项与之前一致；
+   * 打开后 worker 会话经 `spawnClaudeCodeProcess` 以 `sandbox-exec -f <配置>` 包裹 Claude Code 原生进程，
+   * 并强制关闭 bash 沙箱（嵌套会失败）。supervisor 唤醒会话不包裹（见 docs/executors.md）。
+   */
+  isolation?: SeatbeltOptions
+}
+
+/**
+ * `spawnClaudeCodeProcess` 的外层 seatbelt 实现（tasks 4.4）：在 SDK 给出的命令前加上 `[sandbox-exec, -f, <配置>]`。
+ * 自定义启动时 SDK 不再读取子进程的 stderr，这里转交给选项中的 `stderr` 回调，与缺省启动一致；启动失败同样写入该回调。
+ */
+export function seatbeltSpawner(
+  prefix: readonly string[],
+  stderr?: (data: string) => void,
+): (options: SpawnOptions) => SpawnedProcess {
+  const [bin, ...rest] = prefix
+  if (!bin) throw new Error('seatbelt 命令前缀为空')
+  return ({ command, args, cwd, env, signal }) => {
+    const child = spawn(bin, [...rest, command, ...args], {
+      ...(cwd !== undefined ? { cwd } : {}),
+      env,
+      signal,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    child.stderr.setEncoding('utf8').on('data', (data: string) => stderr?.(data))
+    // 启动失败（ENOENT 等）时 ChildProcess 发出 'error'：总有一个监听者，不让节点进程因未处理的 'error' 崩溃；
+    // 原因交给 stderr 回调，随退出错误中的 stderr 尾部（脱敏后）上报（审查第一轮 L2）。SDK 自己也会监听 'error'。
+    child.on('error', (err) => {
+      stderr?.(`sandbox-exec 启动失败：${(err as NodeJS.ErrnoException).code ?? err.message}\n`)
+    })
+    return child
+  }
 }
 
 const REANNOUNCE_MAX_MS = 10 * 60_000
@@ -540,6 +598,10 @@ export function createClaudeSdkExecutor(options: ClaudeSdkExecutorOptions): Exec
       if (!loaded.ok) return loaded
       return ok(loaded.data.workspaces.find((w) => w.ref === workspace)?.supervisor)
     })
+  const credentialIsolation = effectiveCredentialIsolation(
+    CLAUDE_SDK_CREDENTIAL_ISOLATION,
+    options.isolation,
+  )
 
   return {
     type: CLAUDE_SDK_EXECUTOR,
@@ -551,11 +613,8 @@ export function createClaudeSdkExecutor(options: ClaudeSdkExecutorOptions): Exec
       raindown_mcp: true,
       out_of_band_detection: false,
       // D1：bash 沙箱关闭时经 spawnClaudeCodeProcess 包裹外层 seatbelt；开启时原生 denyRead 只覆盖 Bash，不提供。
-      // 本阶段只声明，尚未施加。
-      credential_isolation: {
-        layers: { 'bash-sandbox-off': 'seatbelt', 'bash-sandbox-on': 'none' },
-        enforced: false,
-      },
+      // 开关 isolation.enforce 关闭时只声明（enforced: false），打开后施加（4.4）。
+      credential_isolation: credentialIsolation,
     },
     classify: classifyClaudeSdk,
     // 节点启动时清理本节点残留的审查 worktree 与私有目录（D10）。
@@ -1069,6 +1128,37 @@ export function createClaudeSdkExecutor(options: ClaudeSdkExecutorOptions): Exec
         if (finished) return
         const query = options.query ?? (await loadSdkQuery())
         if (finished) return
+        // 外层 seatbelt（4.4）：开关打开时包裹 worker 会话。supervisor 唤醒会话的 MCP 按设计仍在本地读取 raindown-home
+        // （唤醒令牌在 state/wake/），不能整体拒绝，因此不包裹。
+        let seatbelt: string[] | undefined
+        if (
+          !supervisor.data &&
+          seatbeltApplies(credentialIsolation, role.data, options.isolation)
+        ) {
+          const prepared = await prepareSeatbelt(options.isolation, {
+            home: options.home,
+            taskId: ctx.taskId,
+            executor: CLAUDE_SDK_EXECUTOR,
+            cwd: sessionCtx.cwd,
+            access: kind === 'read' ? 'read' : 'write',
+            ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
+            ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
+          })
+          if (finished) return
+          if (!prepared.ok) {
+            await cleanupReview()
+            finish(
+              ok({
+                outcome: 'failed',
+                result: result(seatbeltFailureMessage(prepared.error.message), {
+                  reason: prepared.error.code,
+                }),
+              }),
+            )
+            return
+          }
+          seatbelt = prepared.data.prefix
+        }
         const options_ = buildOptions({
           ...(instructions ? { projectInstructions: instructions } : {}),
           role: role.data,
@@ -1086,6 +1176,7 @@ export function createClaudeSdkExecutor(options: ClaudeSdkExecutorOptions): Exec
               }
             : {}),
           canUseTool: makeCanUseTool(perms.data, kind, supervisor.data !== undefined),
+          ...(seatbelt ? { seatbelt } : {}),
           abortController,
           writtenFiles,
           stderr: (data) => {
@@ -1359,6 +1450,11 @@ interface BuildOptionsInput {
   writtenFiles: Set<string>
   /** setting_sources 不含 project 时读到的项目约定纯文本（已脱敏、限长）。 */
   projectInstructions?: string
+  /**
+   * 外层 seatbelt 的命令前缀（tasks 4.4）：给出时经 `spawnClaudeCodeProcess` 包裹 Claude Code 进程，并以 `sandbox`
+   * 选项（flag settings 层，优先于 project / user 设置）强制关闭 bash 沙箱。缺省时选项与之前一致。
+   */
+  seatbelt?: readonly string[]
 }
 
 /** 由角色与任务上下文拼出 SDK 的 `query()` 选项。 */
@@ -1482,6 +1578,14 @@ export function buildOptions(i: BuildOptionsInput): Options & { model: string } 
     ...(i.outputFormat ? { outputFormat: i.outputFormat } : {}),
     allowedTools,
     disallowedTools: i.perms.disallowedTools,
+    // 外层 seatbelt（4.4）：包裹 Claude Code 原生进程；bash 沙箱在外层 seatbelt 内嵌套会失败（退出码 71），
+    // 用 sandbox 选项（flag settings 层）强制关闭，覆盖 project / user 设置中的 sandbox.enabled。
+    ...(i.seatbelt
+      ? {
+          sandbox: { enabled: false },
+          spawnClaudeCodeProcess: seatbeltSpawner(i.seatbelt, i.stderr),
+        }
+      : {}),
     ...(i.perms.maxTurns ? { maxTurns: i.perms.maxTurns } : {}),
     canUseTool: i.canUseTool,
     // canUseTool 可能被 SDK 权限模式、允许规则或会话批准跳过；每次文件调用仍要经过本地边界。

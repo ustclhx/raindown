@@ -7,6 +7,7 @@ export { loadNodeConfig, type NodeConfig, nodeConfigSchema, resolveHubUrl } from
 export {
   buildOptions as buildClaudeSdkOptions,
   CANCEL_GRACE_MS,
+  CLAUDE_SDK_CREDENTIAL_ISOLATION,
   CLAUDE_SDK_EXECUTOR,
   type ClaudeQueryFn,
   type ClaudeQueryHandle,
@@ -157,17 +158,22 @@ export {
   type IsolationProbeOptions,
   identityLaunchWrapper,
   PROBE_CHILD_SCRIPT,
+  type ProbeLaunch,
   type ProbeLaunchWrapper,
   type ProbeTarget,
   probeTargets,
   runIsolationProbe,
+  seatbeltProbeLaunchWrapper,
 } from './isolation-probe/run.ts'
 export {
   cleanLeaseTokenFiles,
+  ensureTaskRunDir,
   leaseTokenDir,
   removeEmptyTaskRunDir,
   removeLeaseTokenFile,
+  removeSeatbeltProfile,
   writeLeaseTokenFile,
+  writeSeatbeltProfile,
 } from './lease-token.ts'
 export {
   DELIVER_GIVE_UP_MS,
@@ -187,6 +193,17 @@ export {
   startNode,
   TIMEOUT_GRACE_MS,
 } from './node.ts'
+export {
+  defaultLsof,
+  defaultPs,
+  LSOF,
+  type LsofRunner,
+  type OrcaPortOptions,
+  PS,
+  type PsRunner,
+  parseLsofPorts,
+  resolveOrcaPorts,
+} from './orca-ports.ts'
 export {
   createPrMergeExecutor,
   DEFAULT_PIPELINE_POLL_MS,
@@ -224,6 +241,18 @@ export {
   reviewDir,
   reviewRef,
 } from './review-prep.ts'
+export {
+  effectiveCredentialIsolation,
+  hubPortOf,
+  IMPLEMENTED_ISOLATION_LAYERS,
+  prepareSeatbelt,
+  SANDBOX_EXEC,
+  type SeatbeltLaunchInput,
+  type SeatbeltOptions,
+  seatbeltActive,
+  seatbeltApplies,
+  writeSeatbeltLaunch,
+} from './seatbelt.ts'
 export {
   cleanWakeTokenDir,
   removeWakeTokenFile,

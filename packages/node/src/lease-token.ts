@@ -1,7 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import { chmod, lstat, mkdir, readdir, rename, rm, rmdir, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
-import { raindownPaths, runTasksDir, taskRunDir } from '@raindown/core'
+import { dirname, join } from 'node:path'
+import {
+  ISOLATION_PROFILE_FILE,
+  raindownPaths,
+  runTasksDir,
+  taskIsolationProfile,
+  taskRunDir,
+} from '@raindown/core'
 
 const SAFE_SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/
 const TOKEN_FILE = /^[A-Za-z0-9_-][A-Za-z0-9_.-]*\.token$/
@@ -24,6 +30,17 @@ async function privateDirectory(path: string): Promise<void> {
   await chmod(path, 0o700)
 }
 
+/** 逐级创建任务私有目录 `run/tasks/<任务>/`（各级 0700，拒绝符号链接与非目录），返回其路径。 */
+export async function ensureTaskRunDir(home: string, taskId: string): Promise<string> {
+  if (!SAFE_SEGMENT.test(taskId)) throw new Error('任务 id 不合法')
+  await privateDirectory(raindownPaths(home).run)
+  const tasks = runTasksDir(home)
+  await privateDirectory(tasks)
+  const dir = join(tasks, taskId)
+  await privateDirectory(dir)
+  return dir
+}
+
 export async function writeLeaseTokenFile(
   home: string,
   taskId: string,
@@ -33,11 +50,7 @@ export async function writeLeaseTokenFile(
   if (!SAFE_SEGMENT.test(taskId) || !SAFE_SEGMENT.test(leaseId)) {
     throw new Error('派工凭证的任务或租约 id 不合法')
   }
-  await privateDirectory(raindownPaths(home).run)
-  const tasks = runTasksDir(home)
-  await privateDirectory(tasks)
-  await privateDirectory(join(tasks, taskId))
-  const dir = join(tasks, taskId, TOKEN_DIR)
+  const dir = join(await ensureTaskRunDir(home, taskId), TOKEN_DIR)
   await privateDirectory(dir)
   const path = join(dir, `${leaseId}.token`)
   // 同目录原子替换：MCP 每次读取同一路径时只会看到完整的旧 token 或新 token。
@@ -81,9 +94,12 @@ export async function removeEmptyTaskRunDir(
  * 同时清理新位置（`run/tasks/`）与旧位置（`state/tasks/`）：节点重启后所有租约凭证都已失效，旧位置的凭证不必迁移。
  */
 export async function cleanLeaseTokenFiles(home: string): Promise<void> {
-  for (const task of await cleanTokenRoot(runTasksDir(home)))
+  for (const task of await cleanTokenRoot(runTasksDir(home))) {
     await removeEmptyTaskRunDir(home, task, [TOKEN_DIR])
+  }
   await cleanTokenRoot(legacyTasksDir(home))
+  // 上次运行残留的外层 seatbelt 配置（4.1）：只在启动 harness 时读取，可以随时删除。
+  await cleanSeatbeltProfiles(home)
 }
 
 /** 清理一个任务根目录下的凭证文件，返回检查过的任务 id。 */
@@ -110,4 +126,55 @@ async function cleanTokenRoot(tasks: string): Promise<string[]> {
     }
   }
   return seen
+}
+
+/**
+ * 删除本任务的外层 seatbelt 配置（`state/tasks/<任务>/isolation.sb`，tasks 4.1）。`sandbox-exec` 只在启动时读取配置，
+ * 任务结束或节点启动清理时即可删除；只删除普通文件或符号链接本身（`rm` 不跟随链接），随后尝试删除变空的任务状态目录。
+ */
+export async function removeSeatbeltProfile(home: string, taskId: string): Promise<void> {
+  if (!SAFE_SEGMENT.test(taskId)) return
+  const path = taskIsolationProfile(home, taskId)
+  const info = await lstat(path).catch(() => undefined)
+  if (info && (info.isFile() || info.isSymbolicLink())) await rm(path, { force: true })
+  await rmdir(dirname(path)).catch(() => {})
+}
+
+/**
+ * 写入本任务的外层 seatbelt 配置（0600，同目录原子替换，不跟随已有的同名链接），返回路径。
+ * 位置在 worker 读写都被拒绝的 `state/tasks/<任务>/`（审查第一轮 H2）；目录不存在时按 0700 创建，拒绝符号链接与非目录。
+ */
+export async function writeSeatbeltProfile(
+  home: string,
+  taskId: string,
+  content: string,
+): Promise<string> {
+  if (!SAFE_SEGMENT.test(taskId)) throw new Error('任务 id 不合法')
+  const path = taskIsolationProfile(home, taskId)
+  const dir = dirname(path)
+  for (const d of [raindownPaths(home).state, dirname(dir), dir]) {
+    await mkdir(d, { recursive: true, mode: 0o700 })
+    const info = await lstat(d)
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`${d} 不是普通目录`)
+  }
+  const pending = join(dir, `${ISOLATION_PROFILE_FILE}.${randomUUID()}.tmp`)
+  try {
+    await writeFile(pending, content, { flag: 'wx', mode: 0o600 })
+    await chmod(pending, 0o600)
+    await rename(pending, path)
+  } finally {
+    await rm(pending, { force: true })
+  }
+  return path
+}
+
+/** 节点启动时删除上次运行残留的外层 seatbelt 配置（`state/tasks/<任务>/isolation.sb`）。 */
+async function cleanSeatbeltProfiles(home: string): Promise<void> {
+  const root = legacyTasksDir(home)
+  const info = await lstat(root).catch(() => undefined)
+  if (!info?.isDirectory() || info.isSymbolicLink()) return
+  for (const task of await readdir(root, { withFileTypes: true })) {
+    if (task.isDirectory() && SAFE_SEGMENT.test(task.name))
+      await removeSeatbeltProfile(home, task.name)
+  }
 }

@@ -1,4 +1,5 @@
 export * from './capability.ts'
 export * from './paths.ts'
 export * from './probe.ts'
+export * from './sbpl.ts'
 export * from './spec.ts'

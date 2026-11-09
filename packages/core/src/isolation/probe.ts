@@ -21,6 +21,8 @@ import type { IsolationSpec } from './spec.ts'
  * - `read`：打开并读取最多 1 字节，字节立即丢弃，不记录、不上报、不打印；
  * - `read_via_symlink`：在探针工作目录里建一个指向目标的符号链接，经链接读取（验证 realpath 规范化），结束后删除链接；
  * - `write_new`：在目标目录下以独占方式新建一个探针文件，成功则立即删除；
+ * - `open_write`：以读写方式打开已有文件后立即关闭，不写入、不截断（验证本任务的 seatbelt 配置不可改写）；
+ * - `rename`：把探针自己在临时位置造的目录改名，成功则立即改回（验证受保护路径的祖先目录不可改名；绝不对真实目录使用）；
  * - `unix_connect` / `tcp_connect`：只建立连接后立即关闭，不发送任何数据；
  * - `http_get`：对中枢的无鉴权端点（`/v1/health`）发 GET；
  * - `process_debug`：跨进程调试，见 `PROCESS_DEBUG_UNVERIFIED`。
@@ -29,6 +31,8 @@ export const PROBE_KINDS = [
   'read',
   'read_via_symlink',
   'write_new',
+  'open_write',
+  'rename',
   'unix_connect',
   'tcp_connect',
   'http_get',
@@ -45,6 +49,8 @@ export const probePlanItem = z.strictObject({
   skip: z.string().max(500).optional(),
   /** 不尝试，直接记为未验证。 */
   unverified: z.string().max(500).optional(),
+  /** 不尝试，直接记为失败（actual 为 error），例如 Orca 端口未解析：无法证明控制端口被拒绝。 */
+  fail: z.string().max(500).optional(),
 })
 export type ProbePlanItem = z.infer<typeof probePlanItem>
 
@@ -87,6 +93,13 @@ export interface ProbePlanInput {
   orcaSockets: ProbeTargets
   /** 每类套接字最多尝试几个（缺省 3）。 */
   maxSockets?: number
+  /**
+   * 改名探针目标：探针在本任务私有目录下自建的目录（其下的文件已作为受保护项加入隔离清单），尝试改名它。
+   * 只用于探针自建的临时目录树，绝不指向真实目录。缺省时该项记为跳过。
+   */
+  renameTarget?: string
+  /** 本次探针实际使用的 seatbelt 配置文件（施加 seatbelt 时存在；不存在时该项按目标不存在跳过）。 */
+  profilePath?: string
 }
 
 const isWithinPath = (parent: string, child: string) =>
@@ -115,6 +128,32 @@ export function buildProbePlan(input: ProbePlanInput): ProbePlan {
       target: paths.hubToken,
     },
     { item: 'write.config', kind: 'write_new', expected: 'deny', target: paths.config },
+    input.renameTarget
+      ? {
+          item: 'rename.protected_ancestor',
+          kind: 'rename',
+          expected: 'deny',
+          target: input.renameTarget,
+        }
+      : {
+          item: 'rename.protected_ancestor',
+          kind: 'rename',
+          expected: 'deny',
+          skip: '没有提供改名探针的临时目录',
+        },
+    input.profilePath
+      ? {
+          item: 'write.own_profile',
+          kind: 'open_write',
+          expected: 'deny',
+          target: input.profilePath,
+        }
+      : {
+          item: 'write.own_profile',
+          kind: 'open_write',
+          expected: 'deny',
+          skip: '没有 seatbelt 配置文件',
+        },
   ]
   if (input.orcaSockets.status === 'found' && input.orcaSockets.paths.length > 0) {
     for (const [i, p] of input.orcaSockets.paths.slice(0, input.maxSockets ?? 3).entries())
@@ -144,12 +183,20 @@ export function buildProbePlan(input: ProbePlanInput): ProbePlan {
         expected: 'deny',
         target: `127.0.0.1:${port}`,
       })
+  } else if (ports.status === 'unresolved') {
+    // 未解析时无法证明 Orca 控制端口被拒绝（任何 worker 都能连本机端口）：记为失败，不是跳过（审查第一轮 M2）。
+    items.push({
+      item: 'connect.orca_port',
+      kind: 'tcp_connect',
+      expected: 'deny',
+      fail: `Orca 端口未解析：${ports.reason}`,
+    })
   } else {
     items.push({
       item: 'connect.orca_port',
       kind: 'tcp_connect',
       expected: 'deny',
-      skip: ports.status === 'unresolved' ? `Orca 端口未解析：${ports.reason}` : '没有 Orca 端口',
+      skip: '没有 Orca 端口（本机没有 Orca 运行时目录）',
     })
   }
   items.push({
