@@ -6,7 +6,9 @@ export function processStopped(pid: number): boolean {
     try {
       if (readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ')[1]?.startsWith('Z')) return true
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true
+      // 进程在读取期间消失时，读 /proc 会报 ENOENT 或 ESRCH。
+      const code = (err as NodeJS.ErrnoException).code
+      if (code === 'ENOENT' || code === 'ESRCH') return true
       throw err
     }
   }
