@@ -217,6 +217,8 @@ export async function loadOrCreateNodeId(home: string, host: string): Promise<Re
 interface Env {
   home: string
   nodeId: string
+  /** 中枢地址；随派工令牌交给任务绑定 MCP（worker 侧不读 config/，add-worker-credential-isolation D3）。 */
+  hubUrl?: string
   client: NodeHubClient
   clock: NodeClock
   registry: ExecutorRegistry
@@ -1356,6 +1358,7 @@ class LeaseRunner {
           ...(grant.inputs?.length ? { inputs: grant.inputs } : {}),
           ...(wakeTokenFile ? { wakeTokenFile } : {}),
           ...(this.leaseTokenFile ? { leaseTokenFile: this.leaseTokenFile } : {}),
+          ...(this.env.hubUrl ? { hubUrl: this.env.hubUrl } : {}),
           precheck,
           reportBranch: (report) => this.reportBranch(report),
           confirmApproval: (reply, live) => this.confirmApproval(reply, live),
@@ -1755,6 +1758,7 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
   const env: Env = {
     home,
     nodeId,
+    hubUrl,
     client,
     clock,
     registry,

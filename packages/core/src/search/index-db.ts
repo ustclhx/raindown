@@ -7,8 +7,17 @@ import { raindownPaths } from '../home.ts'
 import { fail, ok, type Result } from '../result.ts'
 import type { GetOutput, QueryOutput, SearchInput, SearchOutput } from '../schema/search.ts'
 import { type Database, openDatabase, type SqlValue } from '../sqlite.ts'
+import {
+  encodeScopes,
+  entryScopes,
+  filterJournalBody,
+  type KbVisibility,
+  scopesVisible,
+  visibleScopeEncodings,
+} from './visibility.ts'
 
-const INDEX_VERSION = 1
+// 2：entries 增加 scope 列（条目归属的 workspace，用于任务绑定读取的可见范围）；3：scope 改为 JSON 数组编码。
+const INDEX_VERSION = 3
 const JOURNAL_FILE = /^\d{4}-\d{2}-\d{2}\.md$/
 
 function scalar(value: unknown): string | undefined {
@@ -62,7 +71,7 @@ function ensureSchema(db: Database): void {
     DROP TABLE IF EXISTS entries;
     CREATE TABLE entries (
       id TEXT PRIMARY KEY, file TEXT NOT NULL, hash TEXT NOT NULL, mtime REAL NOT NULL,
-      type TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL
+      type TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL, scope TEXT NOT NULL
     );
     CREATE TABLE fields (entry_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL);
     CREATE INDEX fields_lookup ON fields (key, value, entry_id);
@@ -132,9 +141,13 @@ export async function syncIndex(home: string): Promise<Result<undefined>> {
         const title = textField(entry.frontmatter, 'title', entry.id)
         const summary = textField(entry.frontmatter, 'summary')
         const fields = fieldsOf(entry.frontmatter)
+        // journal 的归属按记录在读取时过滤，文件本身记为 global。
+        const scope = entry.id.startsWith('journal/')
+          ? encodeScopes([])
+          : encodeScopes(entryScopes(entry.frontmatter))
         index
-          .prepare('INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?, ?)')
-          .run(entry.id, entry.file, hash, mtime, type, title, summary)
+          .prepare('INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(entry.id, entry.file, hash, mtime, type, title, summary, scope)
         index
           .prepare(
             'INSERT INTO search (id, title, summary, body, field_values) VALUES (?, ?, ?, ?, ?)',
@@ -168,8 +181,51 @@ function excerpt(text: string, query: string): string {
     .trim()}${text.length > start + 160 ? '…' : ''}`
 }
 
-/** 每次检索前同步；FTS 输入统一引用为短语，短查询使用 LIKE。score 越大越相关。 */
-export async function searchIndex(home: string, input: SearchInput): Promise<Result<SearchOutput>> {
+/** 文本是否包含查询词（不区分大小写）；与 trigram 短语匹配、LIKE 子串匹配的语义一致。 */
+const containsQuery = (text: string, query: string) =>
+  text.toLowerCase().includes(query.toLowerCase())
+
+/** 带可见范围检索时每批读取的行数下限，以及最多读取的批数（只有 journal 会在读取后被过滤掉）。 */
+const VISIBLE_BATCH_MIN = 50
+const VISIBLE_BATCH_MAX = 10
+
+/**
+ * 分批读取并过滤，直到取满 `limit`、没有更多行或达到批数上限（返回已取到的）。
+ * 读取的行数因此有上界：`batch × maxBatches`。
+ */
+export function collectPaged<R, T>(
+  fetch: (offset: number, size: number) => R[],
+  keep: (row: R) => T | undefined,
+  limit: number,
+  batch = Math.max(limit * 2, VISIBLE_BATCH_MIN),
+  maxBatches = VISIBLE_BATCH_MAX,
+): T[] {
+  const out: T[] = []
+  for (let i = 0; i < maxBatches && out.length < limit; i++) {
+    const rows = fetch(i * batch, batch)
+    for (const row of rows) {
+      const kept = keep(row)
+      if (kept !== undefined) out.push(kept)
+      if (out.length >= limit) break
+    }
+    if (rows.length < batch) break
+  }
+  return out
+}
+
+/**
+ * 每次检索前同步；FTS 输入统一引用为短语，短查询使用 LIKE。score 越大越相关。
+ *
+ * 给出 `visibility`（任务绑定经中枢读取，D3）时：非 journal 条目在 SQL 中按 scope 过滤（可见的 scope
+ * 编码只有有限几种，用 `IN (...)` 参数化）；journal 在读取后去掉不可见的记录，没有可见记录或不再包含查询词
+ * 时不返回，片段按过滤后的正文重算。为了过滤后仍能取满 `limit`，分批读取（有上限，见 `collectPaged`），
+ * 排序与不带可见范围时相同。
+ */
+export async function searchIndex(
+  home: string,
+  input: SearchInput,
+  visibility?: KbVisibility,
+): Promise<Result<SearchOutput>> {
   const synced = await syncIndex(home)
   if (!synced.ok) return synced
   const db = await openDatabase(join(raindownPaths(home).state, 'index.db'))
@@ -192,28 +248,44 @@ export async function searchIndex(home: string, input: SearchInput): Promise<Res
       params.push(input.type)
     }
     if (input.includeJournal === false) conditions.push("e.type != 'journal'")
-    params.push(input.limit ?? 20)
-    const rows = db
-      .prepare(`
+    if (visibility) {
+      const encodings = visibleScopeEncodings(visibility)
+      conditions.push(`e.scope IN (${encodings.map(() => '?').join(', ')})`)
+      params.push(...encodings)
+    }
+    const limit = input.limit ?? 20
+    type Row = SearchOutput['results'][number] & { body: string; field_values: string }
+    const statement = db.prepare(`
       SELECT e.id, e.type, e.title, e.summary, s.body, s.field_values,
         ${short ? '1.0' : '-bm25(search, 0, 5, 2, 1, 1)'} AS score,
         ${short ? "''" : "snippet(search, -1, '', '', '…', 40)"} AS snippet
       FROM search s JOIN entries e ON e.id = s.id
       WHERE ${conditions.join(' AND ')}
-      ORDER BY (e.type = 'journal'), score DESC, e.id LIMIT ?
+      ORDER BY (e.type = 'journal'), score DESC, e.id LIMIT ? OFFSET ?
     `)
-      .all(...params) as (SearchOutput['results'][number] & {
-      body: string
-      field_values: string
-    })[]
+    const rows = visibility
+      ? collectPaged(
+          (offset, size) => statement.all(...params, size, offset) as Row[],
+          (row): Row | undefined => {
+            if (!row.id.startsWith('journal/')) return row
+            const body = filterJournalBody(row.body, visibility)
+            if (body === row.body) return row
+            if (body === '') return undefined
+            // 去掉了别的 workspace 的记录：只按剩下的正文判断是否命中，片段也只从剩下的正文中取。
+            if (![row.title, row.summary, body].some((v) => containsQuery(v, query)))
+              return undefined
+            return { ...row, body, snippet: short ? '' : excerpt(body, query) }
+          },
+          limit,
+        )
+      : (statement.all(...params, limit, 0) as Row[])
     return ok({
       results: rows.map(({ body, field_values, ...row }) => ({
         ...row,
         snippet: short
           ? excerpt(
-              [row.title, row.summary, body, field_values].find((v) =>
-                v.toLowerCase().includes(query.toLowerCase()),
-              ) ?? body,
+              [row.title, row.summary, body, field_values].find((v) => containsQuery(v, query)) ??
+                body,
               query,
             )
           : row.snippet.replace(/\s+/g, ' ').trim(),
@@ -226,8 +298,12 @@ export async function searchIndex(home: string, input: SearchInput): Promise<Res
   }
 }
 
-/** 多条件 AND；同一字段可以重复指定以匹配数组中的多个值。 */
-export async function queryIndex(home: string, filters: string[]): Promise<Result<QueryOutput>> {
+/** 多条件 AND；同一字段可以重复指定以匹配数组中的多个值。给出 `visibility` 时只返回可见的条目。 */
+export async function queryIndex(
+  home: string,
+  filters: string[],
+  visibility?: KbVisibility,
+): Promise<Result<QueryOutput>> {
   const parsed = filters.map((filter) => /^([^=\s]+)=(.+)$/s.exec(filter))
   if (filters.length === 0 || parsed.some((p) => !p?.[2]?.trim())) {
     return fail('usage', 'invalid_filter', '过滤条件必须为 key=value，且键和值不能为空')
@@ -239,7 +315,12 @@ export async function queryIndex(home: string, filters: string[]): Promise<Resul
     const conditions = parsed.map(
       () => 'EXISTS (SELECT 1 FROM fields f WHERE f.entry_id = e.id AND f.key = ? AND f.value = ?)',
     )
-    const params = parsed.flatMap((p) => [p?.[1] as string, p?.[2] as string])
+    const params: SqlValue[] = parsed.flatMap((p) => [p?.[1] as string, p?.[2] as string])
+    if (visibility) {
+      const encodings = visibleScopeEncodings(visibility)
+      conditions.push(`e.scope IN (${encodings.map(() => '?').join(', ')})`)
+      params.push(...encodings)
+    }
     return ok({
       results: db
         .prepare(
@@ -254,8 +335,16 @@ export async function queryIndex(home: string, filters: string[]): Promise<Resul
   }
 }
 
-/** 从文件读取完整条目，不依赖索引缓存；journal 返回合成的基本元数据。 */
-export async function getEntry(home: string, id: string): Promise<Result<GetOutput>> {
+/**
+ * 从文件读取完整条目，不依赖索引缓存；journal 返回合成的基本元数据。
+ * 给出 `visibility` 时：不可见的条目与不存在的条目返回同样的 not_found（不泄露存在性），
+ * journal 只保留可见的记录。
+ */
+export async function getEntry(
+  home: string,
+  id: string,
+  visibility?: KbVisibility,
+): Promise<Result<GetOutput>> {
   const read = await readBrainEntries(home)
   if (!read.ok) return read
   let entry = read.data.entries.find((e) => e.id === id)
@@ -269,12 +358,27 @@ export async function getEntry(home: string, id: string): Promise<Result<GetOutp
       )
     }
   }
-  if (!entry) return fail('failure', 'not_found', `未找到条目：${id}`)
+  if (
+    !entry ||
+    (visibility &&
+      !entry.id.startsWith('journal/') &&
+      !scopesVisible(entryScopes(entry.frontmatter), visibility))
+  ) {
+    return fail('failure', 'not_found', `未找到条目：${id}`)
+  }
+  const body =
+    visibility && entry.id.startsWith('journal/')
+      ? filterJournalBody(entry.body, visibility)
+      : entry.body
+  // 没有可见记录的 journal 与不存在的条目一样返回 not_found，不暴露那天有日志。
+  if (body === '' && visibility && entry.id.startsWith('journal/')) {
+    return fail('failure', 'not_found', `未找到条目：${id}`)
+  }
   return ok({
     id: entry.id,
     type: textField(entry.frontmatter, 'type'),
     frontmatter: entry.frontmatter,
-    body: entry.body,
+    body,
     file: entry.file,
   })
 }

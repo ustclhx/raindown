@@ -74,6 +74,26 @@ export const HUB_TOKEN_ENV = 'RAINDOWN_HUB_TOKEN'
 export const HUB_TOKEN_FILE_ENV = 'RAINDOWN_HUB_TOKEN_FILE'
 /** worker 派工凭证的文件路径；优先于通用中枢凭证，读取失败时不降级。 */
 export const LEASE_TOKEN_FILE_ENV = 'RAINDOWN_LEASE_TOKEN_FILE'
+/**
+ * 节点随派工令牌交给受管 MCP 的中枢地址（不是凭证；add-worker-credential-isolation D2、D3）。
+ * 只在任务绑定会话（设置了 `RAINDOWN_LEASE_TOKEN_FILE`）中使用：worker 侧不读 `config/hub.yaml`，
+ * 隔离后 `config/` 对 worker 不可读。无绑定与唤醒绑定仍按 `config/hub.yaml` 解析。
+ */
+export const HUB_URL_ENV = 'RAINDOWN_HUB_URL'
+
+/** 任务绑定会话的中枢地址：只接受 http(s) 地址；不合法时返回 undefined（回退到配置）。 */
+export function leaseHubUrl(): string | undefined {
+  if (!readRaindownEnv(LEASE_TOKEN_FILE_ENV)) return undefined
+  const raw = readRaindownEnv(HUB_URL_ENV)
+  if (!raw) return undefined
+  try {
+    const url = new URL(raw)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
+    return raw.replace(/\/+$/, '')
+  } catch {
+    return undefined
+  }
+}
 
 const unavailable = () =>
   fail('retryable', HUB_UNAVAILABLE, '无法连接中枢，请运行 raindown daemon status 检查')
@@ -89,8 +109,12 @@ export class HubClient {
     input?: unknown,
     id?: string,
   ): Promise<Result<ResponseData<N>>> {
-    const config = await loadHubConfig(this.options.home)
-    if (!config.ok) return config
+    let base = leaseHubUrl()
+    if (base === undefined) {
+      const config = await loadHubConfig(this.options.home)
+      if (!config.ok) return config
+      base = resolveHubUrl(config.data)
+    }
     const endpoint = ENDPOINTS[name]
     let token: string | undefined
     if (endpoint.auth) {
@@ -118,10 +142,7 @@ export class HubClient {
       }
       if (!token) return unavailable()
     }
-    const url = new URL(
-      endpoint.path.replace(':id', encodeURIComponent(id ?? '')),
-      resolveHubUrl(config.data),
-    )
+    const url = new URL(endpoint.path.replace(':id', encodeURIComponent(id ?? '')), base)
     if (endpoint.method === 'GET' && input) {
       for (const [key, value] of Object.entries(input)) {
         if (value !== undefined) url.searchParams.set(key, String(value))

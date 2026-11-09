@@ -10,8 +10,8 @@
 
 ## 2. kb 读取经中枢
 
-- [ ] 2.1 中枢只读路由 kb_search / kb_get / kb_query，只接受任务绑定令牌，按 workspace 可见范围过滤（D3）。验证：与 CLI 同查询结果一致的测试；跨 workspace 条目不返回
-- [ ] 2.2 任务绑定的 MCP 改走中枢路由；无绑定与唤醒绑定保持本地。验证：任务绑定会话在 raindown-home 不可读时 kb 操作仍成功
+- [x] 2.1 中枢只读路由 kb_search / kb_get / kb_query，只接受任务绑定令牌，按 workspace 可见范围过滤（D3）。验证：与 CLI 同查询结果一致的测试；跨 workspace 条目不返回
+- [x] 2.2 任务绑定的 MCP 改走中枢路由；无绑定与唤醒绑定保持本地。验证：任务绑定会话在 raindown-home 不可读时 kb 操作仍成功
 
 ## 3. 自检探针
 

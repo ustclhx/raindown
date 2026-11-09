@@ -1,0 +1,20 @@
+{
+  "$id": "https://raindown.local/schemas/protocol/kb-query.request.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "filters": {
+      "maxItems": 20,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 500
+      },
+      "description": "AND 条件，例如 type=data-source owner=ws/xuanxue-saas"
+    }
+  },
+  "required": [
+    "filters"
+  ],
+  "title": "POST /v1/kb/query 请求体"
+}

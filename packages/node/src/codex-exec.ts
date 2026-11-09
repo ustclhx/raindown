@@ -326,6 +326,8 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
           ...env.data,
           CODEX_HOME: isolated.data,
           ...(ctx.leaseTokenFile ? { RAINDOWN_LEASE_TOKEN_FILE: ctx.leaseTokenFile } : {}),
+          // 中枢地址随派工令牌一起交给受管 MCP：任务绑定会话不读 config/hub.yaml（D3）。
+          ...(ctx.leaseTokenFile && ctx.hubUrl ? { RAINDOWN_HUB_URL: ctx.hubUrl } : {}),
         }
         // 不上报任务分支：codex-exec 不创建专用分支或 worktree，cwd 的当前分支不归本任务所有（见 docs/executors.md）。
         if (finished) return

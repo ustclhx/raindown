@@ -428,10 +428,33 @@ describe('启动 Codex 的命令', () => {
     expect(r).toEqual({
       ok: true,
       data:
-        "cd '/wt/t 1' && exec env -u RAINDOWN_HUB_TOKEN -u RAINDOWN_HUB_TOKEN_FILE -u RAINDOWN_LEASE_TOKEN_FILE -u FLOW_LEASE_TOKEN_FILE -u FLOW_HUB_TOKEN -u FLOW_HUB_TOKEN_FILE RAINDOWN_ACTOR=dev FLOW_ACTOR=dev CODEX_HOME=/raindown/run/executors/codex-orca/codex-home codex -m gpt-6.1-sol -c model_reasoning_effort=high " +
+        "cd '/wt/t 1' && exec env -u RAINDOWN_HUB_TOKEN -u RAINDOWN_HUB_TOKEN_FILE -u RAINDOWN_LEASE_TOKEN_FILE -u FLOW_LEASE_TOKEN_FILE -u RAINDOWN_HUB_URL -u FLOW_HUB_URL -u FLOW_HUB_TOKEN -u FLOW_HUB_TOKEN_FILE RAINDOWN_ACTOR=dev FLOW_ACTOR=dev CODEX_HOME=/raindown/run/executors/codex-orca/codex-home codex -m gpt-6.1-sol -c model_reasoning_effort=high " +
         '-c service_tier=priority --dangerously-bypass-approvals-and-sandbox ' +
         '"$(cat /home/state/tasks/t-1/spec.md)"',
     })
+  })
+
+  test('任务绑定：中枢地址随派工令牌传给 Codex 进程（MCP env_vars 透传），没有令牌时不传', () => {
+    const build = (leaseTokenFile?: string) =>
+      buildCodexCommand({
+        codexBin: 'codex',
+        codexHome: '/ch',
+        worktreePath: '/wt',
+        specPath: '/s.md',
+        task: {
+          id: 't-1',
+          workspace: 'ws/demo',
+          home: '/home',
+          hubUrl: 'http://127.0.0.1:7477',
+          ...(leaseTokenFile ? { leaseTokenFile } : {}),
+        },
+        role: { name: 'dev', permissions: { approval: 'on-request', sandbox: 'workspace-write' } },
+      })
+    const withToken = build('/run/t.token')
+    expect(withToken.ok && withToken.data).toContain(' RAINDOWN_HUB_URL=http://127.0.0.1:7477 ')
+    expect(withToken.ok && withToken.data).toContain('"RAINDOWN_HUB_URL"]')
+    const without = build()
+    expect(without.ok && without.data).not.toContain('RAINDOWN_HUB_URL=')
   })
 
   test('on-request 角色：-a 与 -s，并默认将授权弹窗交给 Raindown', () => {
@@ -443,7 +466,7 @@ describe('启动 Codex 的命令', () => {
       role: { name: 'dev', permissions: { approval: 'on-request', sandbox: 'workspace-write' } },
     })
     expect(r.ok && r.data).toBe(
-      'cd /wt && exec env -u RAINDOWN_HUB_TOKEN -u RAINDOWN_HUB_TOKEN_FILE -u RAINDOWN_LEASE_TOKEN_FILE -u FLOW_LEASE_TOKEN_FILE -u FLOW_HUB_TOKEN -u FLOW_HUB_TOKEN_FILE RAINDOWN_ACTOR=dev FLOW_ACTOR=dev CODEX_HOME=/raindown/run/executors/codex-orca/codex-home codex -c approvals_reviewer=user -a on-request -s workspace-write "$(cat /s.md)"',
+      'cd /wt && exec env -u RAINDOWN_HUB_TOKEN -u RAINDOWN_HUB_TOKEN_FILE -u RAINDOWN_LEASE_TOKEN_FILE -u FLOW_LEASE_TOKEN_FILE -u RAINDOWN_HUB_URL -u FLOW_HUB_URL -u FLOW_HUB_TOKEN -u FLOW_HUB_TOKEN_FILE RAINDOWN_ACTOR=dev FLOW_ACTOR=dev CODEX_HOME=/raindown/run/executors/codex-orca/codex-home codex -c approvals_reviewer=user -a on-request -s workspace-write "$(cat /s.md)"',
     )
   })
 

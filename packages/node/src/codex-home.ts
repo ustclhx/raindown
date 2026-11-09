@@ -186,7 +186,7 @@ export function codexTaskMcpConfig(binding: {
   taskId: string
 }): string {
   const args = ['mcp', '--actor', binding.role, '--task', binding.taskId]
-  return `mcp_servers.raindown={command="raindown",args=${JSON.stringify(args)},env={RAINDOWN_HOME=${JSON.stringify(binding.home)},RAINDOWN_ACTOR=${JSON.stringify(binding.role)}},env_vars=["RAINDOWN_LEASE_TOKEN_FILE"],default_tools_approval_mode="approve"}`
+  return `mcp_servers.raindown={command="raindown",args=${JSON.stringify(args)},env={RAINDOWN_HOME=${JSON.stringify(binding.home)},RAINDOWN_ACTOR=${JSON.stringify(binding.role)}},env_vars=["RAINDOWN_LEASE_TOKEN_FILE","RAINDOWN_HUB_URL"],default_tools_approval_mode="approve"}`
 }
 
 /** Codex 默认 shell 环境排除项（大小写不敏感的 glob），加上任务凭证路径本身。 */
