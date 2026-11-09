@@ -7,6 +7,7 @@ import {
   type Activity,
   type DeliveredInput,
   type DeliveredReply,
+  effectiveRoleKind,
   fail,
   loadRoles,
   ok,
@@ -43,6 +44,13 @@ import {
   resumedSignal,
 } from '../executor.ts'
 import { autoApprovedText, needsUserText } from '../precheck.ts'
+import {
+  effectiveCredentialIsolation,
+  prepareSeatbelt,
+  type SeatbeltOptions,
+  seatbeltApplies,
+  seatbeltFailureMessage,
+} from '../seatbelt.ts'
 import { resolveContractCwd } from '../workdir.ts'
 import {
   analyzeTail,
@@ -137,6 +145,11 @@ export interface CodexOrcaOptions {
   /** 目录状态读取；测试可注入暂时性文件系统错误。 */
   directoryStat?: (path: string) => { isDirectory(): boolean }
   logger?: CodexOrcaLogger
+  /**
+   * 外层 seatbelt（tasks 4.2）：`config/node.yaml` 的 `isolation.enforce`。缺省关闭，终端命令与之前逐字节一致；
+   * 打开后，角色沙箱设置为 danger-full-access / bypass 时以 `sandbox-exec -f <配置>` 只包住 `codex` 本身。
+   */
+  isolation?: SeatbeltOptions
 }
 
 /** 合同 `inputs` 中 codex-orca 使用的字段。 */
@@ -195,6 +208,11 @@ const stateSchema = z.object({
   /** 创建终端时 Orca 给出的进程身份；stale 后接管其他 handle 前必须一致（PR #24 复核）。 */
   pty_id: z.string().optional(),
   incarnation_id: z.string().optional(),
+  /**
+   * 终端启动时施加的外层隔离（tasks 4.2）。缺失表示启动时没有施加（升级前或开关关闭时启动的终端）：
+   * 开关打开时这类终端不重新挂接，按无法恢复处理。
+   */
+  isolation_layer: z.literal('seatbelt').optional(),
   /** 按 reply_id 的送达状态（PR #24 审查第 8 条：节点重启后不重复送达）。 */
   replies: z.record(z.string(), replyStateSchema).default({}),
   approval_round: approvalRoundSchema.optional(),
@@ -231,6 +249,11 @@ export function buildCodexCommand(input: {
   specPath: string
   task?: { id: string; workspace: string; home: string; leaseTokenFile?: string; hubUrl?: string }
   role: Pick<Role, 'name' | 'model' | 'effort' | 'permissions'>
+  /**
+   * 外层 seatbelt 的命令前缀（`[sandbox-exec, -f, <配置>]`，tasks 4.2）：只包住 `codex` 本身，放在 `env` 赋值之后；
+   * 任务说明 `"$(cat spec.md)"` 仍由沙箱外的外层 shell 展开。缺省时命令与之前逐字节一致。
+   */
+  seatbelt?: readonly string[]
 }): Result<string> {
   if (input.codexBin.includes('=')) {
     return fail('usage', 'invalid_codex_bin', 'codexBin 不能包含 =，避免被 env 当作环境变量赋值')
@@ -264,7 +287,7 @@ export function buildCodexCommand(input: {
     // 进程环境带有凭证文件路径：在角色配置之后固定 shell 环境排除项，防止角色把它重新暴露给模型命令。
     for (const value of codexShellEnvPolicyConfig(p.config)) argv.push('-c', value)
   }
-  const cmd = argv.map(quote).join(' ')
+  const cmd = [...(input.seatbelt ?? []), ...argv].map(quote).join(' ')
   const taskEnv = input.task
     ? dualRaindownEnv({
         RAINDOWN_TASK_ID: input.task.id,
@@ -409,6 +432,10 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
       options.directoryStat,
     )
   const logger = options.logger
+  const credentialIsolation = effectiveCredentialIsolation(
+    CODEX_CREDENTIAL_ISOLATION,
+    options.isolation,
+  )
 
   return {
     type: 'codex-orca',
@@ -421,7 +448,7 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
       resume_session: false,
       raindown_mcp: true,
       out_of_band_detection: true,
-      credential_isolation: CODEX_CREDENTIAL_ISOLATION,
+      credential_isolation: credentialIsolation,
     },
     classify: classifyCodexOrca,
     run(contract: TaskContract, ctx: ExecutorContext): ExecutorRun {
@@ -1562,6 +1589,10 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
 
         // 每次派工都检查，包含已运行终端的恢复；worker 上轮可能自行创建了项目配置。
         if (await blockProjectConfig(st.worktree_path)) return
+        // 外层 seatbelt（4.2）：开关打开且角色沙箱设置为 danger-full-access / bypass 时施加。
+        const isolation = seatbeltApplies(credentialIsolation, role, options.isolation)
+          ? options.isolation
+          : undefined
 
         // 上一次执行留下的终端仍在运行且属于这个 worktree：接着用它，把带来的回复送进去。
         if (st.handle) {
@@ -1573,6 +1604,12 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
               return failed(
                 'codex_home_mismatch',
                 '已有 Codex 终端未使用当前隔离目录；请先关闭旧终端后重试',
+              )
+            // 存活进程无法事后施加隔离：启动时没有施加外层 seatbelt 的终端（升级前、开关打开前启动）不重新挂接。
+            if (isolation && st.isolation_layer !== 'seatbelt')
+              return failed(
+                'isolation_not_applied',
+                `已有 Codex 终端 ${st.handle} 启动时没有施加外层 seatbelt（升级前或 isolation.enforce 打开前启动），不能重新挂接；请先关闭旧终端后重试`,
               )
             if (ctx.leaseTokenFile && st.lease_token_file !== ctx.leaseTokenFile) {
               // 新派工不能复用仍指向旧租约凭证的 MCP；保留 worktree，在同一分支重启 worker。
@@ -1604,6 +1641,24 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
             await saveState()
           }
           if (!(await requireWorkdir())) return
+          let seatbelt: string[] | undefined
+          if (isolation) {
+            const prepared = await prepareSeatbelt(isolation, {
+              home: options.home,
+              taskId: ctx.taskId,
+              executor: 'codex-orca',
+              executorHome: 'codex-home',
+              cwd: st.worktree_path,
+              access: effectiveRoleKind(role) === 'read' ? 'read' : 'write',
+              ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
+              ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
+              harnessPaths: [{ path: isolated.data, access: 'write' }],
+            })
+            if (finished || stopping) return
+            if (!prepared.ok)
+              return failed(prepared.error.code, seatbeltFailureMessage(prepared.error.message))
+            seatbelt = prepared.data.prefix
+          }
           const cmd = buildCodexCommand({
             codexBin,
             codexHome: isolated.data,
@@ -1617,6 +1672,7 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
               ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
             },
             role,
+            ...(seatbelt ? { seatbelt } : {}),
           })
           if (!cmd.ok) return failed(cmd.error.code, cmd.error.message)
           const title = `[Raindown] ${ctx.taskId}`
@@ -1639,6 +1695,8 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
           // 新终端的首条输入已从 spec 读取恢复提示。
           if (recoveryText) replyState(recoveryId).done = true
           st.codex_home = isolated.data
+          if (seatbelt) st.isolation_layer = 'seatbelt'
+          else delete st.isolation_layer
           if (ctx.leaseTokenFile) st.lease_token_file = ctx.leaseTokenFile
           else delete st.lease_token_file
           if (term.data.ptyId) st.pty_id = term.data.ptyId

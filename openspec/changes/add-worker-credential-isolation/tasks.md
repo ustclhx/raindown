@@ -20,10 +20,14 @@
 
 ## 4. 外层 seatbelt
 
-- [ ] 4.1 由 `IsolationSpec` 生成 SBPL 配置（allow default + 显式 deny + 最窄 allow），写入任务私有目录（0600），内容只来自节点与角色配置。验证：配置生成的快照测试；注入测试（路径中的引号、括号不能改变配置结构）
-- [ ] 4.2 codex-orca：终端命令以 `sandbox-exec -f <profile>` 启动 Codex（仅 harness 沙箱关闭时）；会话恢复与重新挂接后的新进程同样施加。注意：任务说明 `state/tasks/<id>/spec.md` 只能在沙箱外由外层 shell 读取（`"$(cat …)"` 在 `sandbox-exec` 之前展开），`sandbox-exec` 只包 `codex` 本身。验证：命令构造测试
-- [ ] 4.3 codex-exec：子进程经 `sandbox-exec` 启动（同上条件）。验证：spawn 参数测试
-- [ ] 4.4 claude-sdk：经 SDK 的可执行文件或启动钩子包裹 Claude Code 原生进程（同上条件）。施加 seatbelt 时强制关闭 bash 沙箱（覆盖 project settings 中的 `sandbox.enabled`），或探测实际生效的配置后再选择施加层；否则 bash 沙箱在外层 seatbelt 内嵌套失败。验证：启动参数测试
+- [x] 4.1 由 `IsolationSpec` 生成 SBPL 配置（allow default + 显式 deny + 最窄 allow），写入任务私有目录（0600），内容只来自节点与角色配置。验证：配置生成的快照测试；注入测试（路径中的引号、括号不能改变配置结构）
+- [x] 4.2 codex-orca：终端命令以 `sandbox-exec -f <profile>` 启动 Codex（仅 harness 沙箱关闭时）；会话恢复与重新挂接后的新进程同样施加。注意：任务说明 `state/tasks/<id>/spec.md` 只能在沙箱外由外层 shell 读取（`"$(cat …)"` 在 `sandbox-exec` 之前展开），`sandbox-exec` 只包 `codex` 本身。验证：命令构造测试
+- [x] 4.3 codex-exec：子进程经 `sandbox-exec` 启动（同上条件）。验证：spawn 参数测试
+- [x] 4.4 claude-sdk：经 SDK 的可执行文件或启动钩子包裹 Claude Code 原生进程（同上条件）。施加 seatbelt 时强制关闭 bash 沙箱（覆盖 project settings 中的 `sandbox.enabled`），或探测实际生效的配置后再选择施加层；否则 bash 沙箱在外层 seatbelt 内嵌套失败。验证：启动参数测试
+  - 4.1–4.4 的施加由节点级开关 `config/node.yaml` 的 `isolation.enforce` 控制，缺省 false（关闭时启动方式逐字节不变，快照测试锁定）；仅 macOS。
+    SBPL 路径内联并严格转义（未用 `-D`），允许项在前、拒绝项在后（拒绝优先，与 `IsolationSpec` 约定一致）；Orca 端口未解析时不生成端口规则。
+    `native`（workspace-write / read-only 的 Codex permissions profile）**未实现**，留给 5.1：开关打开时这些设置声明为 `none`，不显示为已施加。
+    supervisor 唤醒会话（MCP 仍本地读取 raindown-home）不包裹。说明见 `docs/executors.md`「外层 seatbelt 施加」。
 - [ ] 4.5 真实验收（征得用户同意后在本机执行）：dev 角色跑一个 product-res 任务，worker 内 `cat ~/raindown-home/state/hub.token`、写 `config/policies.yaml`、读其他任务令牌全部失败，`raindown_report` 与 `kb_search` 正常，任务正常完成
 
 ## 5. harness 沙箱开启时的隔离

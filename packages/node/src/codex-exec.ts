@@ -39,6 +39,13 @@ import {
   type ExecutorPlugin,
   resumedSignal,
 } from './executor.ts'
+import {
+  effectiveCredentialIsolation,
+  prepareSeatbelt,
+  type SeatbeltOptions,
+  seatbeltApplies,
+  seatbeltFailureMessage,
+} from './seatbelt.ts'
 
 export { readCodexHome } from './codex-home.ts'
 
@@ -88,6 +95,11 @@ export interface CodexExecOptions {
   codexCommand?: readonly [string, ...string[]]
   resolveRole?: (name: string) => Promise<Result<Role>>
   clock?: NodeClock
+  /**
+   * 外层 seatbelt（tasks 4.3）：`config/node.yaml` 的 `isolation.enforce`。缺省关闭，spawn 参数与之前一致；
+   * 打开后，角色 `permissions.sandbox` 为 danger-full-access 时子进程经 `sandbox-exec -f <配置> codex …` 启动。
+   */
+  isolation?: SeatbeltOptions
 }
 
 const safe = (text: string, max = 16_000) => clipText(redactSecrets(text), max)
@@ -154,6 +166,10 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
       const role = loaded.data.roles.find((r) => r.name === name)
       return role ? ok(role) : fail('failure', 'unknown_role', `没有合法角色 ${name}`)
     })
+  const credentialIsolation = effectiveCredentialIsolation(
+    CODEX_CREDENTIAL_ISOLATION,
+    options.isolation,
+  )
   return {
     type: 'codex-exec',
     mode: 'headless',
@@ -163,7 +179,7 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
       resume_session: true,
       raindown_mcp: true,
       out_of_band_detection: false,
-      credential_isolation: CODEX_CREDENTIAL_ISOLATION,
+      credential_isolation: credentialIsolation,
     },
     // 进程仍在运行时不从中间消息推断提问；无进展由节点判定。
     classify: () => null,
@@ -307,10 +323,8 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
           env.data.CODEX_HOME ??
           process.env.CODEX_HOME ??
           join(homedir(), '.codex')
-        const dir =
-          effectiveRoleKind(role.data) === 'read'
-            ? readCodexHome(options.home)
-            : execCodexHome(options.home)
+        const readRole = effectiveRoleKind(role.data) === 'read'
+        const dir = readRole ? readCodexHome(options.home) : execCodexHome(options.home)
         const isolated = await prepareCodexHome(dir, source)
         if (!isolated.ok) {
           finish(
@@ -322,6 +336,32 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
           return
         }
         if (finished) return
+        // 外层 seatbelt（4.3）：开关打开且角色沙箱为 danger-full-access 时施加；失败时不启动 Codex。
+        let seatbelt: string[] = []
+        if (seatbeltApplies(credentialIsolation, role.data, options.isolation)) {
+          const prepared = await prepareSeatbelt(options.isolation, {
+            home: options.home,
+            taskId: ctx.taskId,
+            executor: 'codex-exec',
+            executorHome: readRole ? 'codex-read-home' : 'codex-home',
+            cwd: ctx.cwd,
+            access: readRole ? 'read' : 'write',
+            ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
+            ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
+            harnessPaths: [{ path: isolated.data, access: 'write' }],
+          })
+          if (finished) return
+          if (!prepared.ok) {
+            finish(
+              ok({
+                outcome: 'failed',
+                result: result(seatbeltFailureMessage(prepared.error.message), prepared.error.code),
+              }),
+            )
+            return
+          }
+          seatbelt = prepared.data.prefix
+        }
         const childEnv = {
           ...env.data,
           CODEX_HOME: isolated.data,
@@ -358,7 +398,8 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
           const processArgs = [...args]
           if (resumeSession) processArgs.push('resume', resumeSession)
           processArgs.push('--', prompt)
-          child = spawn(command[0] ?? 'codex', processArgs, {
+          const argv = [...seatbelt, command[0] ?? 'codex', ...processArgs]
+          child = spawn(argv[0] as string, argv.slice(1), {
             cwd: ctx.cwd,
             env: childEnv,
             shell: false,

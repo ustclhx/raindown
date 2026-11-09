@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type {
@@ -22,6 +30,7 @@ import {
   taskResult,
 } from '@raindown/core'
 import { DEFAULT_ROLE_FILES } from '../../core/src/role-templates.ts'
+import { buildOptions, claudeSdkPermissions, seatbeltSpawner } from '../src/claude-sdk.ts'
 import {
   type ClaudeQueryFn,
   type ClaudeSdkExecutorOptions,
@@ -1999,5 +2008,145 @@ describe('supervisor 会话绑定', () => {
         RAINDOWN_HUB_URL: 'http://127.0.0.1:7477',
       },
     })
+  })
+})
+
+describe('外层 seatbelt（worker-credential-isolation 4.4）', () => {
+  const temps: string[] = []
+  afterEach(() => {
+    for (const t of temps.splice(0)) rmSync(t, { recursive: true, force: true })
+  })
+  function seatbeltHome() {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'raindown-claude-seatbelt-')))
+    temps.push(root)
+    const home = join(root, 'raindown-home')
+    const cwd = join(root, 'repo')
+    mkdirSync(join(home, 'state'), { recursive: true })
+    mkdirSync(cwd)
+    const isolation = {
+      enforce: true,
+      platform: 'darwin' as const,
+      userHome: join(root, 'user'),
+      env: {},
+    }
+    return { root, home, cwd, isolation }
+  }
+  async function runOnce(
+    over: Partial<ClaudeSdkExecutorOptions>,
+    context: Record<string, unknown>,
+  ) {
+    const { query, state } = mockSdk(async function* (io) {
+      await io.nextUser()
+      yield result()
+    })
+    const ex = createClaudeSdkExecutor({
+      home: '/tmp/raindown-home-not-used',
+      query,
+      resolveRole: roleResolver(reviewer()),
+      ...over,
+    })
+    const outcome = await ex.run(contract(), ctx(context)).done
+    return { outcome, state, ex }
+  }
+
+  test('开关关闭：SDK 选项不含 spawnClaudeCodeProcess 与 sandbox（与之前一致）', async () => {
+    const s = seatbeltHome()
+    const { outcome, state, ex } = await runOnce(
+      { home: s.home, isolation: { ...s.isolation, enforce: false } },
+      { cwd: s.cwd, hubUrl: 'http://127.0.0.1:7477' },
+    )
+    expect(outcome.ok && outcome.data.outcome).toBe('done')
+    expect(state.calls[0]).not.toHaveProperty('spawnClaudeCodeProcess')
+    expect(state.calls[0]).not.toHaveProperty('sandbox')
+    expect(ex.adapterCapabilities.credential_isolation).toEqual({
+      layers: { 'bash-sandbox-off': 'seatbelt', 'bash-sandbox-on': 'none' },
+      enforced: false,
+    })
+  })
+
+  test('开关打开：经 spawnClaudeCodeProcess 包裹 sandbox-exec，并强制关闭 bash 沙箱', async () => {
+    const s = seatbeltHome()
+    const { outcome, state, ex } = await runOnce(
+      { home: s.home, isolation: s.isolation },
+      { cwd: s.cwd, hubUrl: 'http://127.0.0.1:7477' },
+    )
+    expect(outcome.ok && outcome.data.outcome).toBe('done')
+    const options = state.calls[0]
+    expect(options?.sandbox).toEqual({ enabled: false })
+    expect(typeof options?.spawnClaudeCodeProcess).toBe('function')
+    const profile = join(s.home, 'run/tasks/t-1/isolation.sb')
+    expect(readFileSync(profile, 'utf8')).toContain(`(subpath ${JSON.stringify(s.cwd)})`)
+    expect(ex.adapterCapabilities.credential_isolation).toEqual({
+      layers: { 'bash-sandbox-off': 'seatbelt', 'bash-sandbox-on': 'none' },
+      enforced: true,
+    })
+  })
+
+  test('开关打开但无法施加（没有中枢地址）：不启动 SDK 会话', async () => {
+    const s = seatbeltHome()
+    const { outcome, state } = await runOnce(
+      { home: s.home, isolation: s.isolation },
+      { cwd: s.cwd },
+    )
+    expect(outcome).toMatchObject({
+      ok: true,
+      data: { outcome: 'failed', result: { reason: 'isolation_hub_url_missing' } },
+    })
+    expect(state.calls).toHaveLength(0)
+  })
+
+  test('seatbeltSpawner：命令前加上 sandbox-exec 前缀，stderr 交给回调', async () => {
+    const s = seatbeltHome()
+    const report = join(s.root, 'argv.txt')
+    const fake = join(s.root, 'fake-sandbox-exec.sh')
+    writeFileSync(
+      fake,
+      `#!/bin/sh\nprintf '%s\\n' "$@" > '${report}'\necho from-stderr >&2\nshift 2\nexec "$@"\n`,
+      { mode: 0o755 },
+    )
+    const errs: string[] = []
+    const spawnFn = seatbeltSpawner([fake, '-f', '/x/isolation.sb'], (d) => errs.push(d))
+    const child = spawnFn({
+      command: '/bin/echo',
+      args: ['--version'],
+      cwd: s.root,
+      env: { PATH: process.env.PATH },
+      signal: new AbortController().signal,
+    })
+    const out: string[] = []
+    child.stdout.on('data', (d: Buffer) => out.push(String(d)))
+    const code = await new Promise<number | null>((resolve) => child.once('exit', resolve))
+    await waitFor(() => errs.join('').includes('from-stderr'), 'stderr 回调')
+    expect(code).toBe(0)
+    expect(readFileSync(report, 'utf8').trimEnd().split('\n')).toEqual([
+      '-f',
+      '/x/isolation.sb',
+      '/bin/echo',
+      '--version',
+    ])
+    expect(out.join('')).toBe('--version\n')
+  })
+
+  test('buildOptions：给出前缀时才加 sandbox 与 spawnClaudeCodeProcess', () => {
+    const base = {
+      env: {},
+      role: reviewer(),
+      perms: claudeSdkPermissions.parse({}),
+      ctx: ctx(),
+      home: '/h',
+      raindownCommand: ['raindown'],
+      canUseTool: async () => ({ behavior: 'allow' as const, updatedInput: {} }),
+      abortController: new AbortController(),
+      stderr: () => {},
+      writtenFiles: new Set<string>(),
+    }
+    const plain = buildOptions(base)
+    expect(plain).not.toHaveProperty('sandbox')
+    expect(plain).not.toHaveProperty('spawnClaudeCodeProcess')
+    const wrapped = buildOptions({ ...base, seatbelt: ['/usr/bin/sandbox-exec', '-f', '/p.sb'] })
+    expect(wrapped.sandbox).toEqual({ enabled: false })
+    expect(typeof wrapped.spawnClaudeCodeProcess).toBe('function')
+    const { sandbox: _s, spawnClaudeCodeProcess: _p, ...rest } = wrapped
+    expect(Object.keys(rest)).toEqual(Object.keys(plain))
   })
 })

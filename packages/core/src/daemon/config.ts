@@ -87,6 +87,20 @@ export const nodeReservedSchema = z
   })
   .meta({ title: 'Node reserved slots' })
 
+/**
+ * 节点级的 worker 隔离开关（add-worker-credential-isolation 4.1–4.4）。`enforce` 缺省 false：
+ * 关闭时各适配器的 harness 启动方式与之前逐字节一致，只声明施加层、不施加；打开后对施加层为 `seatbelt`
+ * 的角色以 `/usr/bin/sandbox-exec` 包裹 harness 进程（仅 macOS）。真实开启需用户同意（tasks 4.5）。
+ */
+export const nodeIsolationSchema = z
+  .strictObject({
+    enforce: z.boolean().default(false).meta({
+      description:
+        '是否施加外层 seatbelt（仅 macOS）；缺省 false，只声明不施加。改为 true 后需重启节点；改回 false 即回滚',
+    }),
+  })
+  .meta({ title: 'Node worker isolation' })
+
 export const nodeConfigSchema = z
   .strictObject({
     capabilities: z
@@ -107,6 +121,10 @@ export const nodeConfigSchema = z
     reserved: nodeReservedSchema.default({ ...NODE_RESERVED_DEFAULTS }).meta({
       description:
         '在 concurrency 之外为 supervisor 预留的执行槽（add-m1-supervisor D12）：普通槽满时仍为它们领取任务',
+    }),
+    isolation: nodeIsolationSchema.default({ enforce: false }).meta({
+      description:
+        'worker 凭证隔离（add-worker-credential-isolation）；缺省不施加（enforce: false）',
     }),
   })
   .meta({ title: 'Raindown node config', description: 'config/node.yaml' })

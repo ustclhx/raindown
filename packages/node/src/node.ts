@@ -72,6 +72,7 @@ import {
   cleanLeaseTokenFiles,
   removeEmptyTaskRunDir,
   removeLeaseTokenFile,
+  removeSeatbeltProfile,
   writeLeaseTokenFile,
 } from './lease-token.ts'
 import { acquireNodeLock } from './node-lock.ts'
@@ -1437,6 +1438,8 @@ class LeaseRunner {
         await this.tokenWrites
         if (wakeTokenFile) await removeWakeTokenFile(wakeTokenFile).catch(() => {})
         if (this.leaseTokenFile) await removeLeaseTokenFile(this.leaseTokenFile).catch(() => {})
+        // 外层 seatbelt 配置只在启动 harness 时读取（4.1），执行结束即删除。
+        await removeSeatbeltProfile(this.env.home, this.grant.task_id).catch(() => {})
         // 任务私有目录变空时一并删除（审查目录由执行器在会话结束时清理）。
         await removeEmptyTaskRunDir(this.env.home, this.grant.task_id).catch(() => {})
       }

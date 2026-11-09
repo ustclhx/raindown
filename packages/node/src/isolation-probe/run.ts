@@ -13,6 +13,7 @@ import {
   type IsolationProbeItem,
   type IsolationProbeReport,
   type IsolationProbeRun,
+  type IsolationSpec,
   isolationProbeItem,
   ORCA_RUNTIME_DIR,
   PROBE_FAKE_TOKEN_CONTENT,
@@ -25,16 +26,24 @@ import {
   runTasksDir,
 } from '@raindown/core'
 import { z } from 'zod'
-import { removeEmptyTaskRunDir, removeLeaseTokenFile, writeLeaseTokenFile } from '../lease-token.ts'
+import {
+  removeEmptyTaskRunDir,
+  removeLeaseTokenFile,
+  removeSeatbeltProfile,
+  writeLeaseTokenFile,
+} from '../lease-token.ts'
+import { hubPortOf, type SeatbeltOptions, writeSeatbeltLaunch } from '../seatbelt.ts'
 
 /**
  * 节点侧的隔离自检探针（add-worker-credential-isolation D6，tasks 3.1）：
  * 1. 对每个执行器 × 沙箱设置（声明的施加层不是 none）计算隔离清单（`computeIsolationSpec`）；
  * 2. 造临时的"他人任务"假令牌与"本任务"令牌、临时工作目录；
- * 3. 以与 worker 相同的包裹方式启动探针子进程（`launchWrapper`，本阶段恒等，适配器尚未施加隔离），在节点进程之外逐项尝试；
+ * 3. 以与 worker 相同的包裹方式启动探针子进程（`launchWrapper`），在节点进程之外逐项尝试；
  * 4. 删除全部临时文件，返回结构化结果。
  *
- * 本阶段适配器都是 `enforced: false`，探针实际以 none 方式运行，受保护项可读 → 不通过；这正是要如实上报的状态。
+ * 开关 `isolation.enforce` 关闭时适配器都是 `enforced: false`，探针实际以 none 方式（恒等包裹）运行，受保护项可读 → 不通过；
+ * 这正是要如实上报的状态。开关打开时节点传入 `seatbeltProbeLaunchWrapper`：施加层为 seatbelt 的目标用与 worker 相同的
+ * SBPL 生成函数写配置并以 `sandbox-exec -f` 启动（tasks 4.1–4.4 的探针联动）。
  */
 
 /** 子进程入口（与本文件同目录）。 */
@@ -49,9 +58,35 @@ export interface ProbeTarget {
   applied_layer: string
 }
 
-/** 启动包装：接收探针子进程的 argv，返回实际执行的 argv（4.x 在这里加上 sandbox-exec 等）。本阶段为恒等。 */
-export type ProbeLaunchWrapper = (target: ProbeTarget, argv: readonly string[]) => string[]
+/** 启动包装的上下文：探针临时任务与它的隔离清单（与 worker 同一个 `computeIsolationSpec` 结果）。 */
+export interface ProbeLaunch {
+  home: string
+  taskId: string
+  spec: IsolationSpec
+}
+
+/** 启动包装：接收探针子进程的 argv，返回实际执行的 argv（施加 seatbelt 时加上 sandbox-exec）。缺省为恒等。 */
+export type ProbeLaunchWrapper = (
+  target: ProbeTarget,
+  argv: readonly string[],
+  launch: ProbeLaunch,
+) => string[] | Promise<string[]>
 export const identityLaunchWrapper: ProbeLaunchWrapper = (_target, argv) => [...argv]
+
+/**
+ * 开关打开时的启动包装：实际施加层为 seatbelt 的目标，用与 worker 相同的 SBPL 生成与写入（`writeSeatbeltLaunch`）
+ * 写入探针临时任务目录的 `isolation.sb`，以 `sandbox-exec -f <配置>` 启动探针子进程；其他施加层恒等。
+ */
+export function seatbeltProbeLaunchWrapper(
+  o: Pick<SeatbeltOptions, 'sandboxExec'> = {},
+): ProbeLaunchWrapper {
+  return async (target, argv, launch) => {
+    if (target.applied_layer !== 'seatbelt') return [...argv]
+    const prepared = await writeSeatbeltLaunch(o, launch.home, launch.taskId, launch.spec)
+    if (!prepared.ok) throw new ProbeError(prepared.error.code, prepared.error.message)
+    return [...prepared.data.prefix, ...argv]
+  }
+}
 
 export interface IsolationProbeOptions {
   home: string
@@ -110,12 +145,6 @@ function executorHomeFor(target: ProbeTarget): string | undefined {
     return target.setting === 'read-only' ? 'codex-read-home' : 'codex-home'
   if (target.executor === 'codex-orca') return 'codex-home'
   return undefined
-}
-
-const hubPortOf = (hubUrl: string): number => {
-  const u = new URL(hubUrl)
-  if (u.port) return Number(u.port)
-  return u.protocol === 'https:' ? 443 : 80
 }
 
 /** 列出 Orca 运行时目录（及 `daemon/`）中的 unix 套接字；只看目录项类型，不读文件、不连接。 */
@@ -303,7 +332,11 @@ async function runOne(
       orcaSockets: shared.sockets,
     })
     const wrap = o.launchWrapper ?? identityLaunchWrapper
-    const argv = wrap(target, [o.execPath ?? process.execPath, PROBE_CHILD_SCRIPT])
+    const argv = await wrap(target, [o.execPath ?? process.execPath, PROBE_CHILD_SCRIPT], {
+      home: o.home,
+      taskId: ownTask,
+      spec: spec.data,
+    })
     const items = await spawnProbe(argv, plan, o.timeoutMs ?? PROBE_TIMEOUT_MS, cwd)
     return { ...base, items, passed: probeRunPassed({ items }) }
   } catch (err) {
@@ -314,6 +347,7 @@ async function runOne(
     )
   } finally {
     for (const t of tokens) await removeLeaseTokenFile(t).catch(() => {})
+    await removeSeatbeltProfile(o.home, ownTask).catch(() => {})
     for (const task of [ownTask, otherTask])
       await removeEmptyTaskRunDir(o.home, task).catch(() => {})
     if (cwd) await rm(cwd, { recursive: true, force: true }).catch(() => {})

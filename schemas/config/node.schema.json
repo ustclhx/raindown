@@ -51,6 +51,22 @@
       },
       "additionalProperties": false,
       "title": "Node reserved slots"
+    },
+    "isolation": {
+      "default": {
+        "enforce": false
+      },
+      "description": "worker 凭证隔离（add-worker-credential-isolation）；缺省不施加（enforce: false）",
+      "type": "object",
+      "properties": {
+        "enforce": {
+          "default": false,
+          "description": "是否施加外层 seatbelt（仅 macOS）；缺省 false，只声明不施加。改为 true 后需重启节点；改回 false 即回滚",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "title": "Node worker isolation"
     }
   },
   "additionalProperties": false,

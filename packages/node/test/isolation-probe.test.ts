@@ -10,6 +10,7 @@ import {
   NO_ADAPTER_CAPABILITIES,
   type ProbePlan,
   probeRunPassed,
+  renderSeatbeltProfile,
   runTasksDir,
 } from '@raindown/core'
 import { type ProbeSystem, runProbeItems } from '../src/isolation-probe/checks.ts'
@@ -18,7 +19,9 @@ import {
   findOrcaSockets,
   probeTargets,
   runIsolationProbe,
+  seatbeltProbeLaunchWrapper,
 } from '../src/isolation-probe/run.ts'
+import { effectiveCredentialIsolation } from '../src/seatbelt.ts'
 
 /** 假受保护文件的特征字符串：断言探针输出中绝不出现。 */
 const MARKER = 'PROBE-MARKER-must-not-leak'
@@ -451,4 +454,107 @@ describe('审查修复', () => {
     expect(cwd).toContain('raindown-isolation-probe-')
     expect(cwd.startsWith(await realpath(s.tmp))).toBe(true)
   })
+})
+
+describe('探针联动（worker-credential-isolation 4.1–4.4）', () => {
+  test('启动包装：只有实际施加层为 seatbelt 的目标加上 sandbox-exec -f <同一生成函数写出的配置>', async () => {
+    const s = await setup()
+    const seen: string[][] = []
+    const wrapper = seatbeltProbeLaunchWrapper({ sandboxExec: '/nonexistent/sandbox-exec' })
+    const report = await runIsolationProbe({
+      ...probeOptions(s, [codexExec(true)]),
+      launchWrapper: async (target, argv, launch) => {
+        const out = await wrapper(target, argv, launch)
+        seen.push(out)
+        if (target.applied_layer === 'seatbelt') {
+          // 配置与 worker 使用同一个生成函数，内容来自同一份隔离清单。
+          const profile = await readFile(out[2] as string, 'utf8')
+          const expected = renderSeatbeltProfile(launch.spec)
+          expect(expected.ok && expected.data).toBe(profile)
+          expect(out[2]).toBe(join(s.home, 'run/tasks', launch.taskId, 'isolation.sb'))
+        }
+        return out
+      },
+    })
+    // seatbelt 目标以假的 sandbox-exec 启动失败（如实报告无法运行）；native 目标（未施加）恒等运行。
+    const bySetting = Object.fromEntries(report.runs.map((r) => [r.setting, r]))
+    expect(bySetting['danger-full-access']?.error?.code).toBe('probe_spawn_failed')
+    expect(seen.find((a) => a[0] === '/nonexistent/sandbox-exec')?.slice(1, 2)).toEqual(['-f'])
+    expect(seen.some((a) => a[0] === process.execPath)).toBe(true)
+    // 配置随临时任务目录一起删除。
+    const tasks = runTasksDir(s.home)
+    expect(existsSync(tasks) ? readdirSync(tasks) : []).toEqual([])
+  })
+
+  test('开关打开时的能力声明：native 未实现，声明为 none，不探测', () => {
+    const declared = effectiveCredentialIsolation(
+      {
+        layers: {
+          'danger-full-access': 'seatbelt',
+          'workspace-write': 'native',
+          'read-only': 'native',
+        },
+        enforced: false,
+      },
+      { enforce: true, platform: 'darwin' },
+    )
+    expect(declared).toEqual({
+      layers: { 'danger-full-access': 'seatbelt', 'workspace-write': 'none', 'read-only': 'none' },
+      enforced: true,
+    })
+    const targets = probeTargets([
+      {
+        type: 'codex-exec',
+        adapter_capabilities: { ...NO_ADAPTER_CAPABILITIES, credential_isolation: declared },
+      },
+    ])
+    expect(targets).toEqual([
+      {
+        executor: 'codex-exec',
+        setting: 'danger-full-access',
+        declared_layer: 'seatbelt',
+        applied_layer: 'seatbelt',
+      },
+    ])
+    // 开关关闭或非 macOS：原样返回。
+    const original = { layers: { x: 'native' }, enforced: false }
+    expect(effectiveCredentialIsolation(original, { enforce: false, platform: 'darwin' })).toBe(
+      original,
+    )
+    expect(effectiveCredentialIsolation(original, { enforce: true, platform: 'linux' })).toBe(
+      original,
+    )
+  })
+
+  test.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))(
+    'macOS 实测：开关打开时探针以 sandbox-exec 运行，受保护项全部拒绝、允许项可用，通过',
+    async () => {
+      const s = await setup()
+      const report = await runIsolationProbe({
+        ...probeOptions(s, [codexExec(true)]),
+        launchWrapper: seatbeltProbeLaunchWrapper(),
+      })
+      const run = report.runs.find((r) => r.setting === 'danger-full-access')
+      if (!run) throw new Error('没有 seatbelt 目标的运行')
+      expect(run.applied_layer).toBe('seatbelt')
+      expect(run.error).toBeUndefined()
+      const by = Object.fromEntries(run.items.map((i) => [i.item, i]))
+      for (const id of [
+        'read.hub_token',
+        'read.ledger_db',
+        'read.other_task_token',
+        'read.age_key',
+        'read.hub_token_via_symlink',
+        'write.config',
+      ])
+        expect({ id, actual: by[id]?.actual }).toEqual({ id, actual: 'deny' })
+      for (const id of ['write.workdir', 'read.own_task_token', 'connect.hub'])
+        expect({ id, actual: by[id]?.actual }).toEqual({ id, actual: 'allow' })
+      expect(run.passed).toBe(true)
+      expect(probeRunPassed(run)).toBe(true)
+      expect(JSON.stringify(report)).not.toContain(MARKER)
+      const tasks = runTasksDir(s.home)
+      expect(existsSync(tasks) ? readdirSync(tasks) : []).toEqual([])
+    },
+  )
 })

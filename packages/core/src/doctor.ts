@@ -541,7 +541,7 @@ export async function runDoctor(
 /**
  * 各节点每个执行器 × 沙箱设置的隔离状态（worker-credential-isolation 3.2）：声明的施加层、是否已施加、最近探针时间、
  * 失败项（只列项名与路径，不含内容）、跳过项与未验证项及原因。
- * - 探针不通过：warning（本阶段适配器尚未施加隔离，探针预期不通过，不影响退出码）；
+ * - 探针不通过：warning（开关 isolation.enforce 关闭时适配器尚未施加隔离，探针预期不通过；不影响退出码）；
  * - 未探测、施加层为 none、通过：info；
  * - 中枢不可用或读取失败：info，说明无法汇总。
  */
@@ -579,9 +579,11 @@ export async function isolationProbeChecks(
           ok: false,
           severity: 'warning',
           message,
-          hint: row.enforced
-            ? '隔离可能失效：检查 macOS 更新与 seatbelt 配置'
-            : '适配器尚未施加隔离（tasks 第 4、5 阶段），探针如实报告受保护项可访问',
+          // 失败的探针不会让 enforced 为 true；按探针实际运行的施加层区分“已施加但失效”与“尚未施加”。
+          hint:
+            row.run && row.run.applied_layer !== 'none'
+              ? '已施加隔离但探针不通过，隔离可能失效：检查失败项、macOS 更新与 seatbelt 配置'
+              : '适配器尚未施加隔离（config/node.yaml 的 isolation.enforce 为 false、不在 macOS 上或该施加层尚未实现），探针如实报告受保护项可访问',
         })
       else if (row.probe === 'untested')
         checks.push({

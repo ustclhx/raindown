@@ -383,7 +383,12 @@ describe('守护进程配置', () => {
     })
     expect(await loadNodeConfig(home)).toEqual({
       ok: true,
-      data: { capabilities: [], concurrency: 1, reserved: { supervisor: 1, reply: 1 } },
+      data: {
+        capabilities: [],
+        concurrency: 1,
+        reserved: { supervisor: 1, reply: 1 },
+        isolation: { enforce: false },
+      },
     })
   })
 

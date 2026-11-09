@@ -4,6 +4,7 @@ import {
   describeIsolationStatus,
   fail,
   isolationStatusRows,
+  loadNodeConfig,
   type NodeView,
   ok,
   raindownPaths,
@@ -18,6 +19,9 @@ import {
   createFakeExecutor,
   createPrMergeExecutor,
   nodeHubClientFromHome,
+  type SeatbeltOptions,
+  seatbeltActive,
+  seatbeltProbeLaunchWrapper,
   startNode,
 } from '@raindown/node'
 import { defineCommand } from '../command.ts'
@@ -37,20 +41,31 @@ export const nodeStartCommand = defineCommand({
     if (rotated.data && process.env.XPC_SERVICE_NAME === 'dev.raindown.node') {
       return fail('retryable', 'log_rotated', '日志已轮转，等待 launchd 重新启动节点')
     }
+    // 外层 seatbelt 开关（config/node.yaml 的 isolation.enforce，缺省 false；worker-credential-isolation 4.1–4.4）。
+    // 关闭时各执行器的启动方式与之前一致、探针以恒等包裹运行；打开时（仅 macOS）探针与 worker 用同一 SBPL 生成函数。
+    const nodeConfig = await loadNodeConfig(home)
+    if (!nodeConfig.ok) return nodeConfig
+    const isolation: SeatbeltOptions = { enforce: nodeConfig.data.isolation.enforce }
+    if (isolation.enforce && !seatbeltActive(isolation))
+      console.error(
+        'config/node.yaml 的 isolation.enforce 已打开，但外层 seatbelt 只支持 macOS，本机不施加',
+      )
     // fake 用于端到端测试；其余执行器调用本机的 Orca / Codex、Claude Agent SDK 与 gh。
     const started = await startNode({
       home,
       executors: [
         createFakeExecutor(),
-        createCodexOrcaExecutor({ home }),
-        createClaudeSdkExecutor({ home }),
-        createCodexExecExecutor({ home }),
+        createCodexOrcaExecutor({ home, isolation }),
+        createClaudeSdkExecutor({ home, isolation }),
+        createCodexExecExecutor({ home, isolation }),
         // 不调用模型，按确定性条件合并 PR（add-m1-supervisor D10）。
         createPrMergeExecutor({ home }),
       ],
       // 隔离自检探针：启动时、每 6 小时、macOS 版本变化时运行，结果随注册上报（worker-credential-isolation 3.1）。
       // 探针只判断受保护文件能否打开，不读取内容。
-      isolationProbe: {},
+      isolationProbe: seatbeltActive(isolation)
+        ? { launchWrapper: seatbeltProbeLaunchWrapper(isolation) }
+        : {},
     })
     if (!started.ok) return started
     const node = started.data

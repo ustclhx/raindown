@@ -5,8 +5,8 @@ import { raindownPaths } from '../home.ts'
 /**
  * `run/` 的布局（add-worker-credential-isolation D2）：
  * - `run/executors/<执行器>/`：执行器级的 harness 目录，例如 Raindown 管理的 CODEX_HOME；
- * - `run/tasks/<任务 id>/`：任务私有目录：派工令牌（`dispatch-tokens/<租约>.token`）与 claude-sdk 审查目录
- *   （`review/<node-id>/`）。
+ * - `run/tasks/<任务 id>/`：任务私有目录：派工令牌（`dispatch-tokens/<租约>.token`）、claude-sdk 审查目录
+ *   （`review/<node-id>/`）与施加外层 seatbelt 时生成的配置 `isolation.sb`。
  * 各级目录均为 0700。节点自己的任务状态（任务说明、orca.json 等）仍在 `state/tasks/<id>/`。
  */
 export const runExecutorsDir = (home: string) => join(raindownPaths(home).run, 'executors')
@@ -14,6 +14,11 @@ export const runTasksDir = (home: string) => join(raindownPaths(home).run, 'task
 export const executorRunDir = (home: string, executor: string) =>
   join(runExecutorsDir(home), executor)
 export const taskRunDir = (home: string, taskId: string) => join(runTasksDir(home), taskId)
+/** 外层 seatbelt 配置文件名（任务私有目录内，0600；tasks 4.1）。 */
+export const ISOLATION_PROFILE_FILE = 'isolation.sb'
+/** 本任务的外层 seatbelt 配置：`run/tasks/<任务>/isolation.sb`。 */
+export const taskIsolationProfile = (home: string, taskId: string) =>
+  join(taskRunDir(home, taskId), ISOLATION_PROFILE_FILE)
 
 const MAX_LINKS = 40
 

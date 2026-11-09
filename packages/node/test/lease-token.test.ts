@@ -10,7 +10,9 @@ import {
   leaseTokenDir,
   removeEmptyTaskRunDir,
   removeLeaseTokenFile,
+  removeSeatbeltProfile,
   writeLeaseTokenFile,
+  writeSeatbeltProfile,
 } from '../src/lease-token.ts'
 
 const homes: string[] = []
@@ -488,4 +490,24 @@ test('启动清理与 removeEmptyTaskRunDir 只删除变空的任务私有目录
   await symlink(outside, taskRunDir(home, 't-link'))
   await removeEmptyTaskRunDir(home, 't-link')
   expect(existsSync(outside)).toBe(true)
+})
+
+test('外层 seatbelt 配置：0600、原子替换不跟随已有链接；任务结束与启动清理时删除', async () => {
+  const home = await tempHome()
+  const outside = join(home, 'outside.sb')
+  await writeFile(outside, 'keep')
+  await mkdir(taskRunDir(home, 't-1'), { recursive: true })
+  const profilePath = join(taskRunDir(home, 't-1'), 'isolation.sb')
+  await symlink(outside, profilePath)
+  expect(await writeSeatbeltProfile(home, 't-1', '(version 1)\n')).toBe(profilePath)
+  expect((await stat(profilePath)).mode & 0o777).toBe(0o600)
+  expect(await readFile(outside, 'utf8')).toBe('keep')
+  await removeSeatbeltProfile(home, 't-1')
+  expect(existsSync(profilePath)).toBe(false)
+  // 启动清理：残留的配置与变空的任务目录一并删除。
+  await writeLeaseTokenFile(home, 't-2', 'l-1', 'x')
+  await writeSeatbeltProfile(home, 't-2', '(version 1)\n')
+  await cleanLeaseTokenFiles(home)
+  expect(existsSync(taskRunDir(home, 't-2'))).toBe(false)
+  await expect(writeSeatbeltProfile(home, '../x', 'bad')).rejects.toThrow()
 })
