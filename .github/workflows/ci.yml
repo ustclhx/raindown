@@ -28,16 +28,16 @@ jobs:
       # 测试会调用真实的 gitleaks（写入前扫描与提交前钩子），版本与 README 的验证版本一致。
       - name: Install gitleaks
         run: |
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+          curl -sSfL --retry 5 --retry-delay 5 --retry-all-errors "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
             | tar -xz -C /usr/local/bin gitleaks
           gitleaks version
 
       # 官方 Linux x64 release；固定 SHA-256 来自对应官方 release 资产。
       - name: Install sops and age (verified)
         run: |
-          curl -sSfL "https://github.com/getsops/sops/releases/download/v${SOPS_VERSION}/sops-v${SOPS_VERSION}.linux.amd64" -o sops
+          curl -sSfL --retry 5 --retry-delay 5 --retry-all-errors "https://github.com/getsops/sops/releases/download/v${SOPS_VERSION}/sops-v${SOPS_VERSION}.linux.amd64" -o sops
           echo "e5bec3346a873ae91d871550f3e698c1aad962aff462a080e40f25fde17fef6b  sops" | sha256sum --check
-          curl -sSfL "https://github.com/FiloSottile/age/releases/download/v${AGE_VERSION}/age-v${AGE_VERSION}-linux-amd64.tar.gz" -o age.tar.gz
+          curl -sSfL --retry 5 --retry-delay 5 --retry-all-errors "https://github.com/FiloSottile/age/releases/download/v${AGE_VERSION}/age-v${AGE_VERSION}-linux-amd64.tar.gz" -o age.tar.gz
           echo "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10  age.tar.gz" | sha256sum --check
           tar -xzf age.tar.gz
           sudo install -m 0755 sops age/age age/age-keygen /usr/local/bin/
