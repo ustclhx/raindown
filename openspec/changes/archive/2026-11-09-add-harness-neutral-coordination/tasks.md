@@ -73,4 +73,6 @@
 ## 9. 文档与验收
 
 - [x] 9.1 `docs/executors.md`（适配器接入指南）、`docs/supervisor.md`（observe、原始指令、交回）、`docs/prd.md` §19 补充
-- [ ] 9.2 真实验收：一轮 product-res 任务，worker 用 raindown_report 提问并由 supervisor 代答；PR 上 CI 失败直通 worker 修复；审查崩溃后 task_retry；observe 跑一轮并看一致率
+- [x] 9.2 真实验收：一轮 product-res 任务，worker 用 raindown_report 提问并由 supervisor 代答；PR 上 CI 失败直通 worker 修复；审查崩溃后 task_retry；observe 跑一轮并看一致率
+  - 2026-11-07 实测（product-res，dev-claude 临时角色 + claude-sdk）：worker 用 raindown_report 提问（basis: reported）并由 supervisor 代答；无规则命中与含 git.push / pr.create 的授权直接转给用户（Telegram）；ready → branch_unknown → blocked 回退；supervisor 建审查任务并订阅 PR #35，审查 approve；github.watch 采集 check_run 为 pr.event（allowed:false，只作上下文、不唤醒）；`raindown supervisor report` 可运行。
+  - 按用户决定以测试覆盖代替的项：CI 失败直通 worker 修复、审查崩溃后 task_retry、observe 代批一致率（本轮没有 supervisor 档位的授权，observe 表为 0）。

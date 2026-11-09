@@ -73,7 +73,6 @@
 - **WHEN** 只有 `scope: * action: tool:* level: auto` 规则，请求的命令为 `sed -i … ~/raindown-home/config/polic*.yaml`，或写入 `~/raindown-home/CONFIG/Policies.yaml`，或编辑一个指向策略文件的符号链接
 - **THEN** 请求被识别为 `policy.edit`，交给用户
 
-
 ### Requirement: 项目改名期间的策略兼容
 加载策略 SHALL 将 `tool:mcp__flow__<操作>` 规范化为 `tool:mcp__raindown__<操作>`，将 `flow.admin` 规范化为 `raindown.admin`；保留规则档位和原始索引，并在 hub status 与 doctor 中报告迁移 warning，不作为无效规则排除。受保护命令识别 SHALL 将 raindown 与 flow 两个可执行前缀视为同一动作；新旧 home 的配置路径同样受保护。
 
@@ -84,3 +83,14 @@
 #### Scenario: 别名不能绕过受保护动作
 - **WHEN** 执行 `raindown secrets get` 或 `flow secrets get`，或两种前缀的 hub 管理命令
 - **THEN** 分别识别为相同的 secrets 或 raindown.admin 动作
+
+### Requirement: 策略版本
+系统 SHALL 为每次加载的 `policies.yaml` 计算版本哈希（对规范化后的有效规则计算，注释与空白不影响哈希），并在 `policy.decided`、代回复委托与 supervisor 的代批代答记录中写入该哈希。`raindown hub status` 与 `raindown doctor` MUST 显示当前策略版本。
+
+#### Scenario: 只改了注释
+- **WHEN** 用户只修改了 `policies.yaml` 里的注释
+- **THEN** 策略版本哈希不变，不产生策略变化事件
+
+#### Scenario: 追溯一次代批
+- **WHEN** 用户查看 supervisor 代批 `pnpm check` 的记录
+- **THEN** 记录中有当时的策略版本哈希与命中的规则
