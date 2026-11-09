@@ -19,6 +19,8 @@ import {
   type IsolationSpecInput,
   isWithin,
   NO_ADAPTER_CAPABILITIES,
+  PROBE_REQUIRED_DENY_ITEMS,
+  type ProbeEvidence,
   roleSandboxInfo,
   roleSandboxSetting,
   type SandboxSetting,
@@ -81,8 +83,9 @@ describe('computeIsolationSpec', () => {
     const realToken = R('raindown-home/run/tasks/t-1/dispatch-tokens/l-1.token')
     // raindown-home 内的受保护项（state/、config/、brain/、节点锁与日志）由整体拒绝覆盖，不单列。
     expect(r.data.deny_read).toEqual(protectedDirs)
-    // 令牌只读：显式写拒绝。
-    expect(r.data.deny_write).toEqual([...protectedDirs, realToken].sort())
+    // 令牌只读：令牌所在的 dispatch-tokens 目录本身也拒绝写（不能经改名父目录绕开只读，#93 N3）。
+    const realTokenDir = R('raindown-home/run/tasks/t-1/dispatch-tokens')
+    expect(r.data.deny_write).toEqual([...protectedDirs, realTokenDir].sort())
     expect(r.data.deny_children_except).toEqual([
       { dir: R('raindown-home'), keep: R('raindown-home/run') },
       {
@@ -321,8 +324,47 @@ describe('credential_isolation 能力与角色沙箱设置', () => {
       ...caps,
       credential_isolation: { ...caps.credential_isolation, enforced: true },
     }
-    expect(credentialIsolationFor(enforced, 'bash-sandbox-off').enforced).toBe(true)
-    expect(credentialIsolationFor(enforced, 'bash-sandbox-on').enforced).toBe(false)
+    // enforced 由探针决定：没有探针结果、探针不通过、探针属于别的设置、结果过期时都为 false。
+    const NOW = Date.parse('2026-11-09T12:00:00.000Z')
+    const run = (
+      passed: boolean,
+      setting = 'bash-sandbox-off',
+      ran_at = '2026-11-09T06:00:00.000Z',
+    ): ProbeEvidence => ({
+      ran_at,
+      run: {
+        executor: 'claude-sdk',
+        setting,
+        declared_layer: 'seatbelt',
+        applied_layer: 'seatbelt',
+        passed,
+        items: PROBE_REQUIRED_DENY_ITEMS.map((item) => ({
+          item,
+          expected: 'deny' as const,
+          actual: passed ? ('deny' as const) : ('allow' as const),
+          ok: passed,
+        })),
+      },
+    })
+    const on = (
+      c: typeof caps,
+      e: ProbeEvidence | null,
+      setting: SandboxSetting = 'bash-sandbox-off',
+    ) => credentialIsolationFor(c, setting, e, NOW).enforced
+    expect(credentialIsolationFor(enforced, 'bash-sandbox-off').enforced).toBe(false)
+    expect(on(enforced, run(false))).toBe(false)
+    expect(on(enforced, run(true))).toBe(true)
+    expect(on(enforced, run(true, 'bash-sandbox-on'))).toBe(false)
+    // 适配器未施加（enforced: false）时，即使探针通过也不算已施加。
+    expect(on(caps, run(true))).toBe(false)
+    expect(on(enforced, run(true, 'bash-sandbox-on'), 'bash-sandbox-on')).toBe(false)
+    // 审查修复 L3：超过 12 小时的结果不算已施加。
+    expect(on(enforced, run(true, 'bash-sandbox-off', '2026-11-08T23:59:00.000Z'))).toBe(false)
+    // 审查修复 M2：上报的 ok / passed 不可信，按预期与实际重新计算。
+    const lying = run(false)
+    lying.run.passed = true
+    lying.run.items = lying.run.items.map((i) => ({ ...i, ok: true }))
+    expect(on(enforced, lying)).toBe(false)
     expect(describeCredentialIsolation(caps)).toBe(
       'bash-sandbox-off→seatbelt、bash-sandbox-on→none（仅声明，未施加）',
     )
@@ -415,6 +457,32 @@ describe('审查修复（第一轮）', () => {
     expect(explicit.data.deny_read).toContain(join(s.real, 'env-flow-home'))
     expect(explicit.data.deny_read).not.toContain(join(s.real, 'user', 'flow-home'))
     expect(explicit.data.deny_read).not.toContain(s.real)
+  })
+
+  test('#93 N1：遗留 home 是工作目录的祖先时，错误写明遗留 home 及其来源变量', async () => {
+    const s = setup()
+    const legacy = join(s.root, 'old-flow-home')
+    const cwd = join(legacy, 'worktrees', 'w1')
+    mkdirSync(cwd, { recursive: true })
+    const r = await computeIsolationSpec({ ...s.base, cwd, env: { FLOW_HOME: legacy } })
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.error.code).toBe('isolation_allow_in_deny')
+    expect(r.error.message).toContain('遗留 home')
+    expect(r.error.message).toContain('FLOW_HOME')
+    expect(r.error.details).toMatchObject({
+      legacy_home: join(s.real, 'old-flow-home'),
+      legacy_source: '环境变量 FLOW_HOME',
+    })
+  })
+
+  test('#93 N3：令牌直接位于任务目录下时只拒绝写文件本身', async () => {
+    const s = setup()
+    const token = join(s.home, 'run', 'tasks', 't-1', 'l-1.token')
+    const r = await computeIsolationSpec({ ...s.base, leaseTokenFile: token })
+    if (!r.ok) throw new Error(r.error.message)
+    expect(r.data.deny_write).toContain(join(s.real, 'raindown-home/run/tasks/t-1/l-1.token'))
+    expect(r.data.deny_write).not.toContain(join(s.real, 'raindown-home/run/tasks/t-1'))
   })
 
   test('L4：age 私钥目录是用户主目录或其上级时返回明确错误', async () => {

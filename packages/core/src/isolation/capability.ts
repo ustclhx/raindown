@@ -4,6 +4,11 @@ import {
   type IsolationLayer,
   type SandboxSetting,
 } from '../ledger/adapter.ts'
+import {
+  type IsolationProbeRun,
+  PROBE_MAX_AGE_MS,
+  probeRunPassed,
+} from '../ledger/isolation-probe.ts'
 import type { Role } from '../roles.ts'
 
 const CODEX_SANDBOXES: readonly string[] = ['danger-full-access', 'workspace-write', 'read-only']
@@ -95,19 +100,37 @@ export interface CredentialIsolationView {
   reported: boolean
   /** 声明的施加层；未上报、设置未知或未列出时为 none。 */
   layer: IsolationLayer
-  /** 适配器是否已经真正施加；只有为 true 且自检通过才能算已隔离。 */
+  /** 适配器声明已施加、施加层非 none 且最近一次探针通过时为 true。 */
   enforced: boolean
 }
 
+/** 一次探针运行及其所属报告的运行时间（判断是否过期）。 */
+export interface ProbeEvidence {
+  run: IsolationProbeRun
+  ran_at: string
+}
+
+/**
+ * `enforced` 由探针决定（worker-credential-isolation 3.2）：适配器声明已施加、施加层不是 none，
+ * 该执行器 × 沙箱设置最近一次探针（按条目重新计算）全部通过，并且结果没有过期（`PROBE_MAX_AGE_MS`）才为 true。
+ * 没有探针结果（旧节点、未探测）一律为 false。
+ */
 export function credentialIsolationFor(
   capabilities: Pick<AdapterCapabilities, 'credential_isolation'>,
   setting: SandboxSetting | undefined,
+  probe?: ProbeEvidence | null,
+  now: number = Date.now(),
 ): CredentialIsolationView {
   const declared = capabilities.credential_isolation
   if (!declared) return { reported: false, layer: 'none', enforced: false }
   // 较新节点上报的未知施加层按 none（只能收紧，不能被当作已支持的隔离）。
   const layer = setting === undefined ? 'none' : knownLayer(declared.layers[setting])
-  return { reported: true, layer, enforced: declared.enforced && layer !== 'none' }
+  const ranAt = probe ? Date.parse(probe.ran_at) : Number.NaN
+  const fresh =
+    Number.isFinite(ranAt) && now - ranAt <= PROBE_MAX_AGE_MS && ranAt - now <= PROBE_MAX_AGE_MS
+  const probed =
+    probe != null && probe.run.setting === setting && fresh && probeRunPassed(probe.run)
+  return { reported: true, layer, enforced: declared.enforced && layer !== 'none' && probed }
 }
 
 /** 一行文字描述执行器的隔离声明（`node list` 等展示用），明确标出“未施加”。 */
@@ -122,5 +145,5 @@ export function describeCredentialIsolation(
         .map(([k, v]) => `${k}→${knownLayer(v) === v ? v : `${v}（未知，按 none）`}`)
         .join('、')
     : 'none'
-  return `${layers}（${declared.enforced ? '已施加，以自检结果为准' : '仅声明，未施加'}）`
+  return `${layers}（${declared.enforced ? '适配器已施加，是否生效以自检结果为准' : '仅声明，未施加'}）`
 }

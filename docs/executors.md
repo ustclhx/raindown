@@ -84,7 +84,8 @@ supervisor 是否代答提问看的是卡住的 `basis`（见下文「上报与�
   codex-orca 取 `permissions.sandbox`，其次 `permissions.config.sandbox_mode`，都没有时无法确定，按 `none` 处理。
   表中没有列出的设置同样按 `none`。查询用 `credentialIsolationFor`。
 - **目前全部适配器都是 `enforced: false`**：只声明将要支持的施加层，尚未施加任何隔离（施加见 tasks 第 4、5 阶段）。
-  `raindown node list` 在每个执行器后标出“仅声明，未施加”，不能读成已隔离。自检结果（tasks 3.x）另行上报，不复用这个字段。
+  `raindown node list` 在每个执行器后标出“仅声明，未施加”，不能读成已隔离。自检结果随注册另行上报（见下文「隔离自检探针」）；
+  `credentialIsolationFor` 给出的 `enforced` 只有在适配器声明已施加、施加层不是 `none`、且该执行器 × 沙箱设置最近一次探针全部通过时才为 true。
 - 旧节点不上报时投影中没有该字段，显示“未上报（按 none 处理）”，不影响派工。注册时沙箱设置的键与施加层都只校验格式：
   较新节点上报的未知施加层（例如将来的新取值）照常入账，`node list` 标为“未知，按 none”，`credentialIsolationFor` 按 `none` 处理，
   不会被当作已支持的隔离；格式不合法（非小写标识）返回 400。读取账本与投影时不合法字段逐项降级。
@@ -406,6 +407,7 @@ raindown doctor --json
 | `tool.claude` | SDK 默认使用的当前平台原生 CLI 文件存在且可执行；PATH 上另装的 claude 不会替代缺失的 SDK 原生包 |
 | `claude.credentials` | `ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN` 之一非空，或 Claude 配置目录下存在 `.credentials.json` |
 | `role.<name>.creatable_by` | 角色的 `creatable_by` 缺省或为 `[]` 时给 info 提示：仅 user 可创建该角色的任务（见下文） |
+| `isolation.<节点>.<执行器>.<沙箱设置>` | 经中枢读取各节点上报的隔离自检结果：不通过为 warning，未探测为 info，中枢不可用时给一条 `isolation.probe` info（见「隔离自检探针」） |
 
 Claude 配置目录取 `CLAUDE_CONFIG_DIR`，否则取用户目录的 `.claude`。凭证只查存在性，
 不读取文件内容、不输出变量值、不运行 claude、不发起 API 调用；不能确认过期、权限或订阅额度。
@@ -992,6 +994,89 @@ PR #68 起受管 worker 不再加载用户 Codex 配置（见「Codex 配置隔�
 reviewer 的 canUseTool 审批需要选择不在 allowedTools 中、也未被 Raindown 策略自动放行的工具请求；
 triage 则需先得到一条真实提问，再用文字回复验证 exec resume。Codex TUI 文本会随版本变化，
 识别问题应附脱敏的终端片段，更新 fixture 后再验证。
+
+## 隔离自检探针（worker-credential-isolation 3.1–3.2）
+
+节点自带探针程序（`packages/node/src/isolation-probe/`），用来证明隔离是否真的生效（design D6）。
+**本阶段适配器尚未施加任何隔离**（tasks 第 4、5 阶段才改 harness 的启动方式），所以探针实际以 `none` 方式运行，
+受保护项可读，结果是“不通过”。这是要如实上报的状态，不是故障。
+
+### 运行方式
+
+- 入口：`runIsolationProbe`（节点进程内）为每个执行器 × 沙箱设置（声明的施加层不是 `none`）计算隔离清单（`computeIsolationSpec`），
+  推导探针清单（core 的 `buildProbePlan`），再启动子进程 `child.ts` 逐项尝试。子进程在节点进程之外、以探针的临时工作目录为 cwd 运行，
+  清单经 stdin 传入，结果经 stdout 返回，环境变量只传 `PATH` 与 `HOME`。
+- 同一实际施加层（`applied_layer`）的组合每轮只真正运行一次（受保护文件每轮每个施加层只打开一次），结果复用到同层的其他执行器 × 沙箱设置；
+  复用时只按各自的读写类别重新设定 `write.workdir` 的预期。本阶段全部是 `none`，所以每轮只运行一次。
+- 子进程按与 worker 相同的包裹方式启动：接口接受一个“启动包装”（`launchWrapper`），本阶段为恒等；
+  4.x 施加 seatbelt 后在这里加上 `sandbox-exec`，探针与 worker 走同一施加层。
+- 运行前在 `run/tasks/isolation-probe-other-<hex>/dispatch-tokens/` 造一个内容明显为假的“他人任务”令牌，
+  在 `run/tasks/isolation-probe-self-<hex>/` 造“本任务”令牌，在系统临时目录建工作目录；结束后全部删除
+  （中断残留由下次运行与节点启动清理删除；节点启动时还会删除 `config/` 下名字精确为 `.raindown-isolation-probe-<16 位十六进制>` 的残留普通文件）。
+- 运行时机：节点启动时（首次注册之前）、每 6 小时、macOS 版本（`sw_vers -productVersion`，每小时检查一次）与上次探针不同时。
+  只有 `raindown node start` 开启探针；`startNode` 缺省不运行（测试不触碰真实用户目录）。
+
+### 项目清单
+
+| 项 | 预期 | 做法 |
+| --- | --- | --- |
+| `read.hub_token` | 拒绝 | 打开 `state/hub.token` 并读取最多 1 字节 |
+| `read.ledger_db` | 拒绝 | 同上，`state/raindown.db` |
+| `read.other_task_token` | 拒绝 | 同上，临时伪造的他人任务令牌 |
+| `read.age_key` | 拒绝 | 同上，age 私钥文件（默认 `~/.config/sops/age/keys.txt`） |
+| `read.hub_token_via_symlink` | 拒绝 | 在工作目录建指向 hub.token 的符号链接再读取（验证 realpath 规范化），用后删除 |
+| `write.config` | 拒绝 | 在 `config/` 下独占新建探针文件；新建成功即记为“可写”，随后立即删除，删除失败时在说明中写出残留路径 |
+| `connect.orca_socket.<n>` | 拒绝 | 对 Orca 运行时目录（及 `daemon/`）中的 unix 套接字只 `connect`，不发送任何数据；没有套接字时为“跳过” |
+| `connect.orca_port.<端口>` | 拒绝 | 对解析出的 Orca 本机端口只建立 TCP 连接后立即关闭；端口未解析时为“跳过” |
+| `debug.process` | 拒绝 | **未验证**，原因见下 |
+| `write.workdir` | 可写（只读角色为拒绝） | 在工作目录独占新建文件后删除 |
+| `read.own_task_token` | 可读 | 读取本任务令牌 |
+| `connect.hub` | 可连 | `GET /v1/health`（无鉴权） |
+
+- **探针绝不读出受保护文件的内容**：只判断打开/读取是否成功，读取最多 1 字节，字节立即清零丢弃，不记录、不上报、不打印；
+  结果只含项名、路径、预期、实际与错误码（`EACCES`、`EPERM` 等），不含错误消息正文。测试用带特征字符串的假文件断言输出中不出现内容。
+- 判定：`EACCES`/`EPERM`/`EROFS` 为拒绝；`ENOENT` 为跳过（目标不存在，无法验证）；连接得到 `ECONNREFUSED` 记为拒绝并注明歧义
+  （seatbelt 拒绝 unix 连接时 bun 报的也是 `ECONNREFUSED`，与失效套接字、无人监听的端口无法区分）；其他错误为失败。
+- **通过**：没有不符合预期的项、没有运行错误，并且核心受保护项 `read.hub_token`、`read.ledger_db`、`read.other_task_token`、`write.config`
+  全部出现且确实被拒绝。跳过与未验证不计入通过或失败，但会显示（核心项被跳过同样不能通过）。
+- `ok` 与 `passed` 由中枢按预期与实际重新计算后才写入（deny/allow 为 `actual === expected`，skipped/unverified 为 null，error 为 false），节点上报的值不用。
+- 探针运行本身抛错时，节点改为上报每个目标都带 `probe_failed` 错误的不通过结果，不继续上报之前的结果。
+- 跨进程调试为什么未验证：不需要 sudo、不触碰真实进程的检查都区分不了“隔离生效”与“系统本来就不允许”——`task_for_pid` 需要调试授权，
+  未授权的探针进程无论是否隔离都会失败；探针能起的 `/bin/sleep`、bun 都是平台或加固二进制，本来就拒绝 attach。
+  探针不 attach 任何进程；seatbelt 配置（4.1）显式拒绝 `mach-priv-task-port`、`mach-task-name`，由配置生成测试覆盖。
+- 隔离清单无法计算时（例如遗留 home 是工作目录的祖先，错误 `isolation_allow_in_deny` 写明遗留 home 及其来源变量），该运行记为不通过并带原因。
+
+### 上报与显示
+
+- 结果随节点注册上报（注册请求的可选字段 `isolation_probe`：运行时间、macOS 版本、每个执行器 × 沙箱设置的 `{item, target, expected, actual, ok, detail}`）。
+  中枢投影保存最近一次结果；从未上报过的节点（旧节点）显示“未探测”。不带结果的注册（节点重启后探针尚未完成等）沿用之前的结果，
+  使“通过 → 不通过”的比较不被打断。旧中枢不认识该字段时，节点告警一次并改为不带结果注册。
+- `enforced` 还要求结果不超过 12 小时（`PROBE_MAX_AGE_MS`）：过期结果不算已施加。
+- `raindown node list` 与 `raindown doctor`（经中枢读取节点列表汇总）显示每个执行器 × 沙箱设置：声明的施加层、是否已施加、
+  最近探针时间与 macOS 版本、失败项（项名与路径）、跳过项与原因、未验证项与原因。
+- 探针从通过变为不通过时，中枢写一条 Digest 级收件箱条目（来源 `isolation`）；结果未变化、首次就不通过或从未探测变为不通过都不写。
+
+### 解读 doctor 输出
+
+```text
+[warn] 隔离 n-mac-abc123 codex-orca × danger-full-access：声明 seatbelt，未施加；最近探针 2026-11-09T08:00:00.000Z，macOS 15.1（实际以 none 运行）：不通过
+         失败 read.hub_token（~/raindown-home/state/hub.token）：预期拒绝，实际 allow
+         跳过 connect.orca_port：Orca 端口未解析：没有提供 Orca 端口解析
+         未验证 debug.process：…
+       修复：适配器尚未施加隔离（tasks 第 4、5 阶段），探针如实报告受保护项可访问
+```
+
+- `[warn] … 不通过`：本阶段的预期结果（未施加）；施加隔离之后出现则说明隔离失效（例如 macOS 更新），不影响退出码。
+- `[info] … 未探测`：节点是旧版本或刚启动尚未上报；`[info] … 施加层为 none，不探测`：该沙箱设置不提供隔离。
+- `[ok] … 通过`：只有声明已施加且全部通过时才显示“已施加”。
+- `[info] 无法从中枢读取节点的隔离自检结果`：中枢未运行，doctor 不能汇总。
+
+### 部署到真实节点后的行为
+
+升级并重启节点后，探针会在用户真实的 raindown-home 上运行：尝试打开真实的 `state/hub.token`、`state/raindown.db`、
+`~/.config/sops/age/keys.txt`（只判断能否打开，读取最多 1 字节且立即丢弃，不读出内容），在 `config/` 下尝试新建并立即删除一个
+`.raindown-isolation-probe-*` 文件，对 `~/Library/Application Support/orca/` 中的 unix 套接字只建立连接后立即关闭（不发送数据），
+`GET` 中枢的 `/v1/health`。因为本阶段没有施加隔离，结果会是“不通过”，doctor 显示 warning，不触发收件箱通知（没有“通过”的上一次）。
 
 ## 隔离实测（worker-credential-isolation 1.1）
 

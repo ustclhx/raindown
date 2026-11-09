@@ -9,16 +9,23 @@ import {
   type CompleteLeaseRequest,
   capabilitiesSatisfy,
   clipDiffStat,
+  clipText,
   completeLeaseRequest,
   type DeliveredInput,
   fail,
+  INBOX_BODY_MAX,
+  INBOX_TITLE_MAX,
   isSqliteBusy,
   type LeaseGrant,
   type LeaseSlots,
   type LedgerEvent,
   leaseSlotFor,
   type NodeView,
+  normalizeProbeReport,
   ok,
+  probeRegressions,
+  probeRunSummary,
+  type RegisterNodeRequest,
   type RenewLeaseData,
   type RenewLeaseRequest,
   type ReplyView,
@@ -628,6 +635,46 @@ export function createNodeService(o: NodeServiceOptions): NodeService {
     return ok({ lease, task })
   }
 
+  /**
+   * 隔离自检从通过变为不通过时写一条 Digest 收件箱条目（worker-credential-isolation 3.2；design Open Question 先取 Digest）。
+   * 只比较同一执行器 × 沙箱设置的上一次与这一次结果；未探测或一直不通过不写，同一结果重复上报不重复写。
+   * 条目只列项名与路径，不含任何文件内容。写入失败只记日志，不影响注册。
+   */
+  function notifyProbeRegression(
+    nodeId: string,
+    seq: number,
+    previous: NodeView['isolation_probe'],
+    next: RegisterNodeRequest['isolation_probe'],
+  ) {
+    const regressed = probeRegressions(previous, next ?? null)
+    if (regressed.length === 0) return
+    const lines = [`节点 ${nodeId} 的隔离自检从通过变为不通过（${next?.ran_at ?? '—'}）`]
+    for (const run of regressed) {
+      lines.push(`${run.executor} × ${run.setting}（声明 ${run.declared_layer}）：`)
+      if (run.error) lines.push(`  无法运行：${run.error.code} ${run.error.message}`)
+      for (const f of probeRunSummary(run).failed) lines.push(`  失败 ${f}`)
+    }
+    lines.push('运行 raindown doctor 查看详情')
+    const r = ledger.append(
+      {
+        type: 'inbox.item_created',
+        payload: {
+          item_id: `iso.${seq}`,
+          level: 'digest',
+          source: 'isolation',
+          source_ref: nodeId,
+          reason: 'probe_failed',
+          title: clipText(`节点 ${nodeId} 隔离自检不通过`, INBOX_TITLE_MAX),
+          body: clipText(lines.join('\n'), INBOX_BODY_MAX),
+          actions: [],
+        },
+      },
+      { actor: 'hub' },
+    )
+    if (!r.ok && r.error.code !== 'duplicate_item')
+      o.logger?.warn('隔离自检通知写入失败', r.error.code)
+  }
+
   const notRegistered = (nodeId: string) =>
     fail('failure', 'node_not_registered', `节点 ${nodeId} 尚未注册`, { node_id: nodeId })
 
@@ -635,12 +682,23 @@ export function createNodeService(o: NodeServiceOptions): NodeService {
     registerNode(body, actor) {
       const req = parse(registerNodeRequest, body, '节点注册请求')
       if (!req.ok) return req
+      const previousProbe = ledger.getNode(req.data.node_id)?.isolation_probe ?? null
+      // 节点上报的 ok / passed 不可信：写入前由中枢按预期与实际重新计算。
+      const payload = req.data.isolation_probe
+        ? { ...req.data, isolation_probe: normalizeProbeReport(req.data.isolation_probe) }
+        : req.data
       const written = ledger.append(
-        { type: 'node.registered', payload: req.data },
+        { type: 'node.registered', payload },
         // 未声明身份（unknown）或用 user token 未降级（user）时，记为该节点。
         { actor: actor === 'unknown' || actor === 'user' ? `node:${req.data.node_id}` : actor },
       )
       if (!written.ok) return written
+      notifyProbeRegression(
+        req.data.node_id,
+        written.data.seq,
+        previousProbe,
+        payload.isolation_probe,
+      )
       ledger.touchNode(req.data.node_id)
       const node = ledger.getNode(req.data.node_id)
       return node ? ok({ node }) : fail('failure', 'internal_error', '节点写入后不可见')

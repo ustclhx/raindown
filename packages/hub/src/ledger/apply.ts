@@ -286,12 +286,13 @@ export function createApplier(db: Database): Applier {
         const p = e.payload
         stmt(
           `INSERT INTO nodes (node_id, hostname, version, capabilities_json, executors_json,
-             concurrency, registered_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
+             concurrency, registered_at, isolation_probe_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (node_id) DO UPDATE SET hostname = excluded.hostname,
              version = excluded.version, capabilities_json = excluded.capabilities_json,
              executors_json = excluded.executors_json, concurrency = excluded.concurrency,
-             registered_at = excluded.registered_at`,
+             registered_at = excluded.registered_at,
+             isolation_probe_json = COALESCE(excluded.isolation_probe_json, nodes.isolation_probe_json)`,
         ).run(
           p.node_id,
           p.hostname,
@@ -301,6 +302,9 @@ export function createApplier(db: Database): Applier {
           JSON.stringify(readExecutorInfo.array().parse(p.executors ?? [])),
           p.concurrency,
           e.ts,
+          // 不带探针结果的注册（节点重启后探针尚未完成、旧中枢回退、降级到旧节点）沿用之前的结果，
+          // 使“通过 → 不通过”的比较不会被中间的空注册打断；过期结果不会被当作已施加（PROBE_MAX_AGE_MS）。
+          p.isolation_probe ? JSON.stringify(p.isolation_probe) : null,
         )
         return
       }

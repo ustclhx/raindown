@@ -4,6 +4,7 @@ import {
   chmod,
   lstat,
   mkdir,
+  readdir,
   readlink,
   realpath,
   rename,
@@ -77,6 +78,7 @@ export async function migrateCodexHomes(
   log: (message: string) => void,
 ): Promise<{ migrated: string[] }> {
   const migrated: string[] = []
+  await cleanTmpLinks(home, log)
   for (const loc of Object.values(codexHomeLocations(home))) {
     let info: Awaited<ReturnType<typeof lstat>>
     try {
@@ -134,6 +136,33 @@ export async function migrateCodexHomes(
     }
   }
   return { migrated }
+}
+
+/** 迁移时在旧位置旁创建的临时链接名（`codex-<x>-home.<16 位十六进制>.link`）。 */
+const TMP_LINK_RE = /^codex-(?:orca|exec|read)-home\.[0-9a-f]{16}\.link$/
+
+/**
+ * 删除上次迁移中途被打断时残留在 `state/` 下的临时链接（#93 N2）。只删除名字匹配且确实是符号链接的条目，
+ * `rm` 不跟随链接，不影响链接目标。
+ */
+async function cleanTmpLinks(home: string, log: (message: string) => void): Promise<void> {
+  const state = raindownPaths(home).state
+  let names: string[]
+  try {
+    names = await readdir(state)
+  } catch (err) {
+    if (!missing(err)) log(`无法列出 ${state}，跳过临时链接清理：${(err as Error).message}`)
+    return
+  }
+  for (const name of names) {
+    if (!TMP_LINK_RE.test(name)) continue
+    const p = join(state, name)
+    try {
+      if ((await lstat(p)).isSymbolicLink()) await rm(p, { force: true })
+    } catch (err) {
+      if (!missing(err)) log(`无法删除残留的临时链接 ${p}：${(err as Error).message}`)
+    }
+  }
 }
 
 /** 只报告 auth.json 的存在性与是否为链接，不读取内容。 */

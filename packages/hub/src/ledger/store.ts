@@ -30,6 +30,7 @@ import {
   type ReplyView,
   type Result,
   readExecutorInfo,
+  readIsolationProbeReport,
   redactKnownSecrets,
   type SqlValue,
   sanitizeText,
@@ -464,6 +465,7 @@ interface NodeRow {
   registered_at: string
   last_seen_at: string | null
   active_leases: number
+  isolation_probe_json: string | null
 }
 
 interface InboxRow {
@@ -595,6 +597,17 @@ function rowToNode(r: NodeRow): NodeView {
     registered_at: r.registered_at,
     last_seen_at: r.last_seen_at,
     active_leases: r.active_leases,
+    isolation_probe: readIsolationProbeReport.parse(
+      r.isolation_probe_json ? safeJson(r.isolation_probe_json) : null,
+    ),
+  }
+}
+
+const safeJson = (text: string): unknown => {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
   }
 }
 

@@ -36,6 +36,7 @@ export const INBOX_LEVEL_RANK: Readonly<Record<InboxLevel, number>> = {
  *   动作路由到中枢的提案接受 / 驳回，不受提案目录扫描（`proposal_removed`）影响；
  * - `merge_request`：supervisor 的合并请求等待用户批准（D10，4.8 接入）；
  * - `decision`：到期决策的回看提醒（D11：决策没有 workspace 或 workspace 未启用 supervisor 时）。
+ * - `isolation`：节点的隔离自检从通过变为不通过（worker-credential-isolation 3.2，默认 Digest）。
  */
 export const INBOX_SOURCES = [
   'task',
@@ -50,6 +51,7 @@ export const INBOX_SOURCES = [
   'merge_request',
   'decision',
   'pr_comment',
+  'isolation',
 ] as const
 export type InboxSource = (typeof INBOX_SOURCES)[number]
 export const inboxSource = z.enum(INBOX_SOURCES).meta({ description: '条目来源' })
