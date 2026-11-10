@@ -1256,7 +1256,9 @@ export function createTaskService(o: TaskServiceOptions): TaskService {
       const base = { task_id: id, workspace: task.workspace }
       const written = ledger.appendMany(
         [
-          ...(!ledger
+          // 从未开始执行（中枢判定隔离不可用而卡住，attempt 为 0）时没有可结束的派工。
+          ...(task.attempt > 0 &&
+          !ledger
             .taskEvents(id)
             .some(
               (event) =>

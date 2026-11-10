@@ -77,6 +77,40 @@ export const readScope = z.enum(['cwd']).meta({
     '仅 claude-sdk 可配置，其他执行器报配置错误；cwd：所有工具的路径类参数只能落在合同 cwd 与任务私有目录内，拒绝 ~、..、隐藏路径段、绝对 glob 与符号链接越界，只允许白名单内置工具与字段（Bash、WebFetch、非 Raindown 的 MCP 等一律拒绝）；Raindown MCP 不受影响',
 })
 
+/**
+ * 角色的隔离要求（add-worker-credential-isolation 6.1）：
+ * - `required`：只派给对该执行器 × 该角色沙箱设置隔离已施加且自检通过的节点；不满足时任务 `blocked(other)`，
+ *   原因 `isolation_unavailable`，不启动 harness；
+ * - `preferred`（缺省）：照常派送，节点未隔离时在任务与收件箱标明“未隔离”；
+ * - `off`：不检查、不标注。
+ */
+export const ROLE_ISOLATION_LEVELS = ['required', 'preferred', 'off'] as const
+export const roleIsolation = z.enum(ROLE_ISOLATION_LEVELS).meta({
+  description:
+    '隔离要求：required 只派给隔离已施加且自检通过的节点，否则任务 blocked(other)（isolation_unavailable）、不启动 harness；preferred（缺省）照常派送，未隔离时在任务与收件箱标明；off 不检查。supervisor 角色与 pr-merge 不支持 required',
+})
+export type RoleIsolation = z.infer<typeof roleIsolation>
+/** 缺省为 preferred。 */
+export const DEFAULT_ROLE_ISOLATION: RoleIsolation = 'preferred'
+
+/** 角色的有效隔离要求（缺省 preferred）。 */
+export const roleIsolationOf = (role: Partial<Pick<Role, 'isolation'>> | null | undefined) =>
+  role?.isolation ?? DEFAULT_ROLE_ISOLATION
+
+/**
+ * `isolation: required` 在这些配置下不可满足，加载时拒绝（doctor 报错）：
+ * supervisor 唤醒会话（沙箱设置 supervisor-session，按设计不施加外层隔离）与 pr-merge（in-node，不启动 harness）。
+ */
+export function requiredIsolationUnsupported(
+  role: Pick<Role, 'executor'> & Partial<Pick<Role, 'kind'>>,
+): string | undefined {
+  if (role.executor === 'pr-merge')
+    return '执行器 pr-merge 在节点内执行（in-node），不支持隔离，不能设为 isolation: required'
+  if (role.executor === 'claude-sdk' && role.kind === 'supervisor')
+    return 'supervisor 唤醒会话（supervisor-session）不支持隔离，不能设为 isolation: required'
+  return undefined
+}
+
 export const roleSchema = z
   .strictObject({
     name: z
@@ -102,6 +136,7 @@ export const roleSchema = z
       description:
         '除 user 之外，允许哪些身份创建该角色的任务（精确值或 node:*、remote:*、* 等前缀通配）；缺省时只有 user 可以创建',
     }),
+    isolation: roleIsolation.optional(),
   })
   .superRefine((role, ctx) => {
     if (role.kind === 'supervisor' && role.executor !== 'claude-sdk') {
@@ -131,6 +166,9 @@ export const roleSchema = z
         message: 'writable_paths 仅适用于 claude-sdk 执行器',
       })
     }
+    const unsupported =
+      role.isolation === 'required' ? requiredIsolationUnsupported(role) : undefined
+    if (unsupported) ctx.addIssue({ code: 'custom', path: ['isolation'], message: unsupported })
     if (role.permissions?.read_scope !== undefined && role.executor !== 'claude-sdk') {
       ctx.addIssue({
         code: 'custom',

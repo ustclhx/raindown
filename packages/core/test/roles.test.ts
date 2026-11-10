@@ -182,6 +182,7 @@ describe('角色配置', () => {
       'permissions',
       'no_progress_minutes',
       'creatable_by',
+      'isolation',
     ])
   })
 

@@ -1460,6 +1460,41 @@ doctor 多一项 `isolation.mds`，探针配置与 worker 一样放行 mds（探
 `.raindown-isolation-probe-*` 文件，对 `~/Library/Application Support/orca/` 中的 unix 套接字只建立连接后立即关闭（不发送数据），
 `GET` 中枢的 `/v1/health`。开关关闭（缺省）时没有施加隔离，结果会是“不通过”，doctor 显示 warning，不触发收件箱通知（没有“通过”的上一次）。
 
+## 角色隔离要求（worker-credential-isolation 6.1）
+
+角色配置的 `isolation` 决定任务对凭证隔离的要求，缺省 `preferred`：
+
+```yaml
+# config/roles/dev.yaml
+isolation: required   # required | preferred | off
+```
+
+“已隔离”指节点上该执行器 × 该角色沙箱设置的 `credentialIsolationFor(...).enforced` 为 true：适配器声明已施加、施加层不是 `none`、
+最近一次探针全部通过且未过期（12 小时）。沙箱设置按**合同执行器** × 角色权限推出（`roleSandboxSetting`），无法确定时按 `none`。
+旧节点（不上报 `credential_isolation` 或执行器信息）按 `none` 处理。
+
+| 取值 | 中枢派送 | 节点启动 harness 前 |
+| --- | --- | --- |
+| `required` | 只派给已隔离的节点；另有满足能力且已隔离的已注册节点时留在队列等它；一个也没有时中枢直接把任务写成 `blocked(other)`，不经节点、不启动 harness | 再确认一次（本地能力声明、开关、平台、本地最近一次探针）；不满足时不启动 harness，以 `blocked(other)` 结束 |
+| `preferred` | 照常派送；节点未隔离时在 `task.started` 上记 `unisolated`（缺什么），并写一条 Digest 级收件箱条目（来源 `isolation`，原因 `unisolated`，条目 id `unisolated.<任务 id>`，同一任务只提示一次） | 不拦截 |
+| `off` | 不检查、不标注 | 不拦截 |
+
+- **原因码**：`blocked_reason` 仍是 `other`（枚举不变，新旧节点与中枢兼容），消息以 `isolation_unavailable：` 开头，
+  逐个节点说明缺什么：开关关闭（`config/node.yaml` 的 `isolation.enforce`）/ 平台不支持（节点侧能区分，中枢只能写“开关关闭或平台不支持”）/
+  施加层 none / 未探测 / 探针过期 / 探针失败项。卡住不委托给 supervisor（`no_delegate`），收件箱按 `other` 的档位开条目。
+- **中枢卡住排队中的任务**：状态机新增 `queued → blocked` 这一条边，只允许中枢以 `isolation_unavailable` 写入、不带租约
+  （账本校验身份与消息前缀）。此时任务 `attempt` 仍为 0，重试不写 `task.attempt_ended`。
+- **恢复**：沿用现有的重试机制，不另起轮询。节点恢复隔离（打开开关、探针转为通过并重新注册）后，用户或 supervisor
+  对卡住的任务 `task_retry`，任务重新排队并按新的节点状态派送；仍不可满足时会再次卡住。没有任何具备该执行器能力的节点时，
+  任务与以前一样留在队列等待（不卡住）。
+- **中枢与节点不一致时以节点为准**：中枢按节点注册上报的能力与探针结果判断，角色配置每次领取前按 2 秒有效期重新读取；
+  节点在领到租约后按本机的角色配置与最近一次探针再判断一次。中枢认为已隔离、节点认为未隔离时由节点卡住任务；
+  反过来（例如中枢看到的探针已过期而节点刚跑完新的探针、尚未重新注册）中枢可能已把任务卡住，节点重新注册后重试即可。
+- **不支持 required 的设置**：supervisor 唤醒会话（沙箱设置 `supervisor-session`，按设计不施加外层隔离）与 pr-merge
+  （`in-node`，不启动 harness）设为 `required` 时角色加载失败，`raindown doctor` 报错“不支持隔离”，该角色的任务无法创建
+  （fail-closed）。这两种设置在 `preferred` 下也不标注“未隔离”。
+- `isolation` 的非法取值同样在加载时报错（doctor 的 `roles.config.<文件>.isolation`）。
+
 ## 隔离实测（worker-credential-isolation 1.1）
 
 2026-11-07 在本机实测，服务于 `openspec/changes/add-worker-credential-isolation` 的 D1、D2、D4、D6。全程不调用模型。

@@ -619,6 +619,8 @@ describe('事件触发的状态转换', () => {
       ['blocked', 'failed'],
     ],
     'task.blocked': [
+      // 仅中枢的 isolation_unavailable（store 另行校验身份与消息，worker-credential-isolation 6.1）。
+      ['queued', 'blocked'],
       ['running', 'blocked'],
       ['verifying', 'blocked'],
       ['blocked', 'blocked'],

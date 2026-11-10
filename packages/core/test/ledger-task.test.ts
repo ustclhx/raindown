@@ -196,6 +196,8 @@ describe('状态与状态机', () => {
     'blocked>failed',
     'blocked>done',
     'queued>cancelled',
+    // worker-credential-isolation 6.1：中枢判定 isolation: required 不可满足时直接卡住（不带租约）。
+    'queued>blocked',
     'running>cancelled',
     'verifying>cancelled',
     'running>queued',

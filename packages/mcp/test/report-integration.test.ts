@@ -200,7 +200,12 @@ test('真实中枢派工经 MCP 上报、续约下发并引用 dropped 完成，
           })
         ).doc,
       ).toMatchObject({ ok: false, error: { code: 'unauthorized' } })
-      expect(must(await node.listInbox()).items).toEqual([])
+      // fake 执行器不隔离：dev 角色缺省 preferred，只有一条“未隔离”提示（6.1），没有其他条目。
+      expect(
+        must(await node.listInbox()).items.filter(
+          (i) => !(i.source === 'isolation' && i.reason === 'unisolated'),
+        ),
+      ).toEqual([])
     } finally {
       await mcp.close()
     }
