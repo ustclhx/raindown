@@ -138,9 +138,11 @@ export class FakeOrca implements OrcaCli {
       ok([{ handle: this.handle, worktreePath: input.worktreePath, agentIdentity: 'codex' }])
     )
   }
+  /** 注入的关闭终端结果（缺省成功）。 */
+  closeResult: Result<void> | undefined
   async terminalClose(input: unknown): Promise<Result<void>> {
     this.calls.push({ op: 'terminalClose', input })
-    return ok(undefined)
+    return this.closeResult ?? ok(undefined)
   }
 }
 

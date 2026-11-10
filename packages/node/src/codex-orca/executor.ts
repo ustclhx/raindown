@@ -47,7 +47,13 @@ import {
   idleSignal,
   resumedSignal,
 } from '../executor.ts'
-import { heldMdsBaselines, mdsBaselineHeld, setMdsBaselineHold, verifyMdsBaseline } from '../mds.ts'
+import {
+  describeMdsVerification,
+  heldMdsBaselines,
+  mdsBaselineHeld,
+  setMdsBaselineHold,
+  verifyMdsBaseline,
+} from '../mds.ts'
 import { autoApprovedText, needsUserText } from '../precheck.ts'
 import { prepareSealedWorkdir, rollbackSealedClone, type SealedWorkdir } from '../sealed-workdir.ts'
 import {
@@ -548,6 +554,8 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
       })
       let finished = false
       let stopping = false
+      /** 取消时关闭终端失败：终端可能仍在运行，mds 基线保留 hold。 */
+      let closeFailed = false
       let handle: string | undefined
       let state: OrcaTaskState | undefined
       /** 终端是本执行器这一次新建的（只有这种终端才自动确认信任提示）。 */
@@ -608,8 +616,17 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
         void Promise.all([
           removeTaskScratch(options.home, ctx.taskId),
           removeSealedCodexHome(options.home, ctx.taskId),
-          // 任务完成或取消，终端随之结束：解除 mds 基线的 hold，节点在执行结束出口校验并重置（4.5，审查第一轮）。
-          setMdsBaselineHold(options.home, ctx.taskId, false).catch(() => {}),
+          // 任务完成或取消，终端随之结束：对 hold 的 mds 基线做最后一次校验并删除（4.5）。不能只解除 hold 交给节点的
+          // 执行结束出口：上报 done 时节点经 forceDone 先走完出口（那时基线仍被 hold，跳过），之后没有人再校验（4.5 试运行发现）。
+          // 关闭终端失败时终端可能仍在运行：保留 hold，节点下次启动时由 prepare() 处理。重置通知已写进 state/mds-notices/。
+          closeFailed
+            ? Promise.resolve()
+            : verifyMdsBaseline(options.home, ctx.taskId, { force: true })
+                .then((v) => {
+                  const text = v ? describeMdsVerification(v) : undefined
+                  if (text) logger?.warn(`任务 ${ctx.taskId}：${text}`)
+                })
+                .catch(() => {}),
         ]).finally(() => settle(r))
       }
       const result = (summary: string, extra: Partial<TaskResult> = {}): TaskResult => ({
@@ -703,7 +720,10 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
         // 取消：关闭终端，worktree 保留用于排查（由后续清理流程处理）。
         if (handle) {
           const r = await orca.terminalClose({ handle })
-          if (!r.ok) logger?.warn(`关闭任务 ${ctx.taskId} 的终端失败`, r.error.message)
+          if (!r.ok) {
+            closeFailed = true
+            logger?.warn(`关闭任务 ${ctx.taskId} 的终端失败`, r.error.message)
+          }
         }
         finish(ok({ outcome: 'cancelled', message }))
         await saving

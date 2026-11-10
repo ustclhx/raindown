@@ -2364,7 +2364,7 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
     await s.run.cancel()
   })
 
-  test('mds（4.5，审查第一轮）：启动前记录基线并在终端运行期间 hold；任务取消（终端结束）时解除', async () => {
+  test('mds（4.5，审查第一轮）：启动前记录基线并在终端运行期间 hold；任务取消（终端结束）时校验并删除基线', async () => {
     const home = orcaHome()
     // 注入的假 DARWIN_USER_CACHE_DIR，绝不碰真实的 /private/var/folders/*/C/mds。
     const cacheDir = join(home.root, 'C')
@@ -2393,9 +2393,36 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
     // 旧的 hold 基线已删除，新终端用新记录的基线（旧基线会带着 planted.db 的重置标记）。
     const baseline = JSON.parse(readFileSync(mdsBaselinePath(home.home, 't-orca-1'), 'utf8'))
     expect(Object.keys(baseline.entries)).toEqual(['mds.lock'])
+    // 终端运行期间的改动：任务取消（终端结束）时由执行器校验、重置并删除基线，不依赖节点的执行结束出口（4.5 试运行发现）。
+    writeFileSync(join(cacheDir, 'mds', 'during.db'), 'x')
     await s.run.cancel()
     await s.run.done
     expect(mdsBaselineHeld(home.home, 't-orca-1')).toBe(false)
+    expect(existsSync(mdsBaselinePath(home.home, 't-orca-1'))).toBe(false)
+    expect(existsSync(join(cacheDir, 'mds', 'during.db'))).toBe(false)
+    expect(existsSync(join(cacheDir, 'mds', 'mds.lock'))).toBe(true)
+  })
+
+  test('mds（4.5）：取消时关闭终端失败（终端可能仍在运行）则保留 hold 的基线，留给节点启动时处理', async () => {
+    const home = orcaHome()
+    // 注入的假 DARWIN_USER_CACHE_DIR，绝不碰真实的 /private/var/folders/*/C/mds。
+    const cacheDir = join(home.root, 'C')
+    mkdirSync(join(cacheDir, 'mds'), { recursive: true })
+    writeFileSync(join(cacheDir, 'mds', 'mds.lock'), '')
+    const leaseTokenFile = await token(home, 'l-1')
+    const s = await start({}, (o) => o.show('working'), {
+      home,
+      leaseTokenFile,
+      hubUrl: HUB,
+      isolation: { ...on(home), darwinUserCacheDir: cacheDir },
+    })
+    await ready(s)
+    expect(mdsBaselineHeld(home.home, 't-orca-1')).toBe(true)
+    s.orca.closeResult = fail('failure', 'orca_error', 'orca terminal close 失败')
+    await s.run.cancel()
+    await s.run.done
+    expect(existsSync(mdsBaselinePath(home.home, 't-orca-1'))).toBe(true)
+    expect(mdsBaselineHeld(home.home, 't-orca-1')).toBe(true)
   })
 
   test('mds（审查第二轮）：节点启动时终端已不存在的 hold 基线做最后一次校验并删除；仍在运行的保留', async () => {

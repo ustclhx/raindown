@@ -56,10 +56,15 @@
     Claude Code 在按任务配置目录与 `CLAUDE_SECURESTORAGE_CONFIG_DIR` 下能否取到钥匙串凭证与刷新；预置信任能否消除信任弹窗；
     仓库 setup（`bun install`）在冷的任务缓存下的耗时；husky 等写 `core.hooksPath` 的工具；工具写 `~/Library/Application Support` 等位置的失败（按 docs 排查追加）；
     经 cfprefsd 的偏好设置写入未拦住（Risks）。
-- [ ] 4.5 真实验收（征得用户同意后在本机执行）：dev 角色跑一个 product-res 任务，worker 内 `cat ~/raindown-home/state/hub.token`、写 `config/policies.yaml`、读其他任务令牌全部失败，`raindown_report` 与 `kb_search` 正常，任务正常完成
+- [x] 4.5 真实验收（征得用户同意后在本机执行）：dev 角色跑一个 product-res 任务，worker 内 `cat ~/raindown-home/state/hub.token`、写 `config/policies.yaml`、读其他任务令牌全部失败，`raindown_report` 与 `kb_search` 正常，任务正常完成
   - 试运行发现（2026-11-10）：pnpm 12 的 store 与锁目录（PR #100）；Codex 在外层 seatbelt 内无法启动——独立 CODEX_HOME 内部白名单太窄、
     Security 框架需要写 `<DARWIN_USER_CACHE_DIR>/mds/`。用户决定：CODEX_HOME 整体可写（只保留 `auth.json` 链接与目录改名的拒绝），
     `mds/` 放行并由节点在 harness 前后校验与重置（design D2、Risks）；Codex `tmp/arg0` 硬链接别名被拒只打印 WARNING，保持现状。
+  - 验收通过（2026-11-10，PR #101 之后，codex-orca × danger-full-access）：任务 `t-20261110-041013-460319` 在独立 clone 中完成并开 product-res PR #36；
+    worker 内读 `hub.token` 失败（退出码 1）；`raindown_report` 与 `kb_search`（经中枢）正常；用户的主检出未被改动；
+    `pnpm install` 正常；mds 无重置。三个施加组合（codex-orca、codex-exec × danger-full-access，claude-sdk × bash 沙箱关闭）探针均通过。
+    发现：任务以上报 done 结束时，节点经 forceDone 先走完执行结束出口（基线仍被 hold），之后无人校验，基线残留——改为执行器在任务完成或取消时校验并删除。
+    未覆盖：claude-sdk 写类任务的真实运行（钥匙串登录、进程组结束）与真实 Orca 下的终端存活检查，随后续使用观察。
 
 ## 5. harness 沙箱开启时的隔离
 
