@@ -264,6 +264,7 @@ PR 直通的内容（见 [supervisor.md](supervisor.md) 第 13 节）由中枢�
 5. 只在自己创建分支时调用 `reportBranch`；把 `ctx.recovery` 与 `ctx.inputs` 用 core 模板放在输入开头。
 6. 验证会话标识、恢复身份、目录丢失与带外操作；支持检测时，检查事件关联和用户通知，以及任务按实际状态恢复或卡住。
 7. 记录已验证版本、真实 harness 证据与尚未覆盖的边界；若加载来源尚无法隔离，应明确限制，不能宣称完整满足隔离契约。
+8. 按沙箱设置声明 `credential_isolation`（见「凭证隔离声明」），施加层接入 `IsolationSpec` 并让探针走同一施加层；写入白名单下的失败按「升级到隔离」第 6 步排查。doctor 中对应组合通过之前，不要把用到它的角色设为 `isolation: required`。
 
 ## Codex 配置隔离
 
@@ -478,7 +479,15 @@ creatable_by:
 permissions:
   approval: never
   sandbox: danger-full-access
+# 隔离要求 isolation：required | preferred | off，缺省 preferred（照常派送，未隔离时在任务与收件箱标明）。
+# 建议在前提满足后改为 required：config/node.yaml 的 isolation.enforce: true（仅 macOS）、重启节点，
+# 且 raindown doctor 显示 codex-orca × danger-full-access“已施加 … 通过”。required 不满足时任务 blocked(other)（isolation_unavailable），
+# 不启动 harness。需要 commit 的写类角色保持 danger-full-access（外层 seatbelt + 独立 clone）；
+# native（workspace-write）下 .git 只读，不能 commit。见 docs/executors.md「升级到隔离」。
+# isolation: required
 ```
+
+模板只以注释说明 `isolation`，实际取值保持缺省 `preferred`；升级与回滚见下文「升级到隔离」「回滚隔离」。
 
 `approval` 对应 Codex 的 `-a` 审批模式，`sandbox` 对应 `-s` 沙箱模式。
 这两个默认值组合会变成 `--dangerously-bypass-approvals-and-sandbox`，沿用用户原来的脚本做法。
@@ -537,6 +546,7 @@ permissions:
     - "docs/**/*.webp"
     - "**/*.md"
     - "**/*.mdx"
+# isolation 缺省 preferred；隔离开关打开后经外层 seatbelt 施加（Raindown 不开启 bash 沙箱）。见 docs/executors.md「升级到隔离」。
 ```
 
 - `permissionMode` 默认 `default`：未被 SDK 权限规则直接放行的调用进入 `canUseTool`。
@@ -728,6 +738,7 @@ creatable_by:
   - "*"
 permissions:
   sandbox: read-only
+# isolation 缺省 preferred；隔离开关打开后经 Codex permissions profile（native）施加。见 docs/executors.md「升级到隔离」。
 ```
 
 `sandbox` 可取 `read-only`（缺省）、`workspace-write`、`danger-full-access`，控制初始执行与恢复执行的 Codex 沙箱。
@@ -824,7 +835,8 @@ gh 版本：按已验证的 gh 2.102.0 要求（需要 `gh api graphql --hostnam
 宽泛的 Bash 自动放行实质上允许任意代码，真正的边界应放在沙箱、工具权限和文件系统/网络隔离上。
 
 默认 dev 会跳过 Codex 审批和沙箱，可以以节点的系统用户权限执行命令、读写文件和访问网络，
-不会保证每个危险动作都经过 Raindown。只给可信仓库和已授权任务使用，收紧时使用上面的临时角色。
+不会保证每个危险动作都经过 Raindown。打开凭证隔离（`isolation.enforce`）后，外层 seatbelt 拒绝它读写 Raindown 的状态、配置与密钥，
+写入限于白名单，但网络与其余读取不受限制；做法见「升级到隔离」。只给可信仓库和已授权任务使用，收紧时使用上面的临时角色。
 同一系统用户下能读取中枢 user token 的进程还可以取得用户身份，见 [中枢鉴权的信任边界](hub-auth.md#信任边界)。
 角色、workspace 和 policies 配置本身也属于提权面。
 
@@ -1697,6 +1709,41 @@ isolation: required   # required | preferred | off
   （`in-node`，不启动 harness）设为 `required` 时角色加载失败，`raindown doctor` 报错“不支持隔离”，该角色的任务无法创建
   （fail-closed）。这两种设置在 `preferred` 下也不标注“未隔离”。
 - `isolation` 的非法取值同样在加载时报错（doctor 的 `roles.config.<文件>.isolation`）。
+
+## 升级到隔离（worker-credential-isolation 6.2）
+
+隔离打开前后 worker 能接触到什么，见 [中枢鉴权的信任边界](hub-auth.md#信任边界)。本节是打开隔离的建议顺序。
+
+1. **先升级中枢，再升级节点与 CLI**：任务绑定的 kb 读取改经中枢，旧中枢上返回 `hub_kb_unsupported`，不回退到本地读取（见 [hub-auth.md「知识读取经中枢」](hub-auth.md#知识读取经中枢add-worker-credential-isolation-d3)）。
+2. **打开开关**：`config/node.yaml` 写 `isolation.enforce: true`（仅 macOS），重启节点（见上文「外层 seatbelt 施加」的「开关」）。
+3. **确认自检通过**：等第一轮探针完成后运行 `raindown doctor`，每个要用的 执行器 × 沙箱设置 都应显示 `[ok] … 声明 <施加层>，已施加；… （实际以 <施加层> 运行）：通过`，
+   例如 `codex-orca × danger-full-access：声明 seatbelt，已施加 … 通过`、`codex-exec × read-only：声明 native，已施加 … 通过`。
+   不通过时按「隔离自检探针」的「解读 doctor 输出」处理，不要先改 `required`。native 组合首次探针完成前领取的任务会以 `isolation_not_applied` 失败，重试即可。
+4. **把写类角色设为 `required`**：dev 等写类角色（`danger-full-access`，或配置了 `writable_paths` 的 claude-sdk 角色）在第 3 步通过后改为
+   `isolation: required`。不满足时任务以 `blocked(other)`、消息 `isolation_unavailable：…` 停下，不启动 harness（见上文「角色隔离要求」）。
+   其余角色保持缺省 `preferred`：照常派送，未隔离时在任务与收件箱标明。supervisor 唤醒会话与 merger（pr-merge）不支持 `required`，保持缺省。
+   claude-sdk 写类任务（独立 clone + 推送）尚未有真实运行记录（tasks 4.5），reviewer 等 claude-sdk 写类角色可以先保持 `preferred`，观察几次真实任务后再改。
+5. **需要 commit 的写类角色用 `danger-full-access`**：外层 seatbelt 下写类任务在独立 clone 中运行，可以 commit 与推送（推送与新建分支的写法见 dev 模板提示词）。
+   不要为了“开沙箱更安全”改成 `workspace-write`：native（Codex permissions profile）下 Codex 自己把可写根内的 `.git` 整体收为只读，worker **不能 commit**（见「`native`」）。
+   `workspace-write` / `read-only` 适合不需要提交的分析、分诊类角色。claude-sdk 的写类角色保持 bash 沙箱关闭（Raindown 目前不开启），走外层 seatbelt。
+6. **新 harness 或新工具写入失败**：外层 seatbelt 下写入是白名单，工具写自己的目录会得到 `Operation not permitted`（`EPERM`）。
+   按「写白名单」中“4.5 验收时按失败追加”的步骤排查：先用环境变量把缓存指到任务私有的 `cache/`，不行再在 `isolation.extra_write` 追加**具体子目录**并重启节点；
+   harness 自身的运行状态改适配器声明，不要用 `extra_write` 绕过；`.git/config`、hooks、shell 启动文件等是有意拦截的写入。
+   接入新 harness 时还要按「新 harness 接入清单」声明 `credential_isolation`，并确认 doctor 中对应组合通过后再把用到它的角色设为 `required`。
+
+## 回滚隔离（worker-credential-isolation 6.2）
+
+- **关开关、重启节点**：`isolation.enforce` 改回 `false`（或删掉 `isolation` 一节），重启节点。新起的 harness 不再包裹，能力声明回到 `enforced: false`（见上文「外层 seatbelt 施加」的「回滚」）。
+- **`required` 角色要同时改回**：开关关闭后探针不再通过，`required` 角色的任务全部以 `isolation_unavailable` 卡住。回滚时把这些角色同时改为 `preferred` 或 `off`
+  （或删掉 `isolation` 一行），再对已卡住的任务 `task_retry`。
+- **已在 seatbelt 中运行的 codex-orca 终端**：关开关不会改变已经启动的进程，它们继续在 seatbelt 中运行，开关关闭时仍可重新挂接；需要立即解除时结束这些终端（或等任务完成）。
+- **独立 clone 中的任务分支**：开关关闭后同一任务再次运行时，节点先把 clone 中的任务分支快进取回登记仓库，不能快进时取到 `raindown/recovered/<任务>`，再删除 clone；
+  codex-orca 任务以 `isolation_layout_changed` 失败并写明取回的分支，重试后在 Orca worktree 中继续。clone 核对不通过时不取回、不删除，交给用户处理（见「写白名单」中的“独立 clone”）。
+  clone 中尚未推送、也未被节点取回的提交，在删除 clone 之前手动取回。
+- **回退到旧版本**：
+  - 账本中一旦出现中枢写入的 `queued → blocked`（`required` 角色卡在队列中），旧版中枢重放账本时会拒绝这条转换，**不能再回退中枢版本**（见「角色隔离要求」）。
+  - `orca.json` 中出现 `isolation_layer: 'native'` 后，旧版本节点读不出这条记录（会尝试重建 Orca worktree，也找不到仍在运行的终端）。
+    回退节点版本前先关开关并结束这些任务的终端（见「外层 seatbelt 施加」的「部署到真实节点后（开关关闭）」）。
 
 ## 隔离实测（worker-credential-isolation 1.1）
 
