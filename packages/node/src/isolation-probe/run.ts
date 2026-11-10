@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -22,6 +22,7 @@ import {
   type ProbeTargets,
   probeItemOk,
   probeRunPassed,
+  probeTempPath,
   type Result,
   type Role,
   raindownPaths,
@@ -599,6 +600,13 @@ async function runOne(
       gitConfigFile: join(cwd, '.git', 'config'),
       ...(native ? { codexHomeAuth: join(probeCodexHome, 'auth.json') } : {}),
     })
+    // 经符号链接读取的项：链接由节点在沙箱外预先建在工作目录中（只读角色的工作目录在沙箱内不可写）。
+    for (const item of plan.items)
+      if (item.kind === 'read_via_symlink' && item.target && !item.skip && !item.link) {
+        const link = probeTempPath(cwd, `link-${randomBytes(4).toString('hex')}`)
+        await symlink(item.target, link)
+        item.link = link
+      }
     const wrap = o.launchWrapper ?? identityLaunchWrapper
     const argv = await wrap(target, [o.execPath ?? process.execPath, PROBE_CHILD_SCRIPT], {
       home: o.home,
@@ -684,6 +692,8 @@ function reuseRun(rep: IsolationProbeRun, target: ProbeTarget): IsolationProbeRu
   const items = rep.items.map((i) => {
     // 工作目录与登记仓库 .git 中 worktree 必需部分只对写类角色放行（tasks 4.6）。
     if (i.item !== 'write.workdir' && i.item !== 'write.git_objects') return i
+    // native 下 `.git/objects` 恒为拒绝（Codex 把可写根内的 `.git` 收为只读），不随读写类别变化。
+    if (i.item === 'write.git_objects' && target.applied_layer === 'native') return i
     const expected = targetAccess(target) === 'write' ? ('allow' as const) : ('deny' as const)
     return { ...i, expected, ok: probeItemOk({ expected, actual: i.actual }) }
   })

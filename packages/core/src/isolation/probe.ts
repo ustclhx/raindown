@@ -53,6 +53,11 @@ export const probePlanItem = z.strictObject({
   unverified: z.string().max(500).optional(),
   /** 不尝试，直接记为失败（actual 为 error），例如 Orca 端口未解析：无法证明控制端口被拒绝。 */
   fail: z.string().max(500).optional(),
+  /**
+   * `read_via_symlink`：节点在沙箱外预先建好的、指向 `target` 的符号链接。给出时探针只经它读取，不在工作目录新建链接
+   * （只读角色的工作目录本就不可写，沙箱内建链接必然失败；4.5 真实节点发现）。
+   */
+  link: z.string().min(1).max(1024).optional(),
 })
 export type ProbePlanItem = z.infer<typeof probePlanItem>
 
@@ -122,7 +127,7 @@ export interface ProbePlanInput {
    * - 读拒绝项、`write.config`、`rename.protected_ancestor`、`write.shell_startup` 与 seatbelt 相同；
    * - `write.own_profile` 跳过：profile 经命令行 `-c` 传入，没有可改写的配置文件；
    * - `write.git_commondir`、`write.registered_git`、`write.shared_tmp` 跳过（见 `NATIVE_CODEX_WRITE_ITEMS`）；
-   *   `write.git_hooks`、新增的 `write.git_config` 预期拒绝，`write.git_objects` 按读写类别；新增 `read.codex_home_auth` 预期拒绝；
+   *   `write.git_hooks`、新增的 `write.git_config`、`write.git_objects` 预期拒绝（Codex 把可写根内的 `.git` 收为只读）；新增 `read.codex_home_auth` 预期拒绝；
    * - `connect.hub` 跳过：native 下 worker 经沙箱外的 Raindown MCP 访问中枢，沙箱内命令的网络按角色设置；
    * - `write.workdir` 按读写类别（read-only 下工作目录不可写不算失败）。
    */
@@ -378,6 +383,9 @@ const NATIVE_CODEX_WRITE_ITEMS: ReadonlySet<string> = new Set([
 
 /** native 下改为跳过的项（见 `ProbePlanInput.layer`）：只保留项名、种类与预期，不尝试。 */
 function nativeItem(i: ProbePlanItem): ProbePlanItem {
+  // Codex 的 `:workspace` 把可写根内的 `.git` 整体收为只读（实测 codex-cli 0.167.0：hooks、config、index.lock、objects
+  // 都拒绝写；只有 /tmp 这类本身就是可写根的位置例外），所以 native 下工作目录 `.git/objects` 预期拒绝（5.1 真实节点发现）。
+  if (i.item === 'write.git_objects') return { ...i, expected: 'deny' }
   const skip = NATIVE_CODEX_WRITE_ITEMS.has(i.item)
     ? PROBE_NATIVE_CODEX_WRITE_SKIP
     : i.item === 'write.own_profile'

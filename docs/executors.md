@@ -1373,14 +1373,18 @@ extends = ":workspace"            # read-only 角色为 ":read-only"
 - **只读例外的检查（审查第一轮 H2）**：每个 `"read"` 例外都必须是规范化后的真实路径、不是符号链接、是普通文件或目录；`CODEX_HOME/tmp` 必须是真实目录
   （不存在时节点创建为 0700 目录）。否则（例如 `tmp` 被换成指向 `state/` 的链接）不生成 profile、不启动，错误码 `codex_profile_unsafe_read`。
 - 写入不另设白名单：由 Codex 沙箱决定（`:workspace` 只放行工作区与临时目录，`:read-only` 全部拒绝）；写类角色工作目录 `.git` 中会在沙箱外被执行或加载的
-  hooks、config 等以 `"read"` 收回为只读（更具体的条目优先）。`.git/objects`、refs 等仍可写（commit 需要）。
+  hooks、config 等以 `"read"` 收回为只读（更具体的条目优先，纵深防御）。注意 Codex 自己的 `:workspace` 已把可写根内的 `.git` 整体收为只读
+  （见下方实测），所以 native 下的写类角色**不能在沙箱内 commit**：这是 Codex workspace-write 本来的行为，与 Raindown 无关；需要 commit 的写类角色
+  （例如 dev）应使用 danger-full-access + 外层 seatbelt。
   `.git/hooks/`、`.git/info/` 不存在时节点先建成空目录再声明（审查第二轮，否则 worker 可以新建它们）；文件类的指针（`config.worktree`、`commondir`、`gitdir`）
   不能预先创建（会改变 git 的行为），不存在时无法声明。
 - **受保护路径位于可写工作目录之内**（工作目录是某个受保护路径的祖先，例如把用户主目录或 raindown-home 的上级当作工作目录）时，worker 可以改名其上级目录
   绕过按路径的拒绝：workspace-write 下拒绝启动，错误码 `codex_profile_protected_in_workdir`（审查第二轮）。
-  **已实测（2026-11-10，codex-cli 0.167.0）**：不加这些条目时 `:workspace` **允许**写 `.git/hooks` 与 `.git/config`（`git config core.fsmonitor …` 成功，
-  随后的 `git status` 执行了它）；加上 `"<repo>/.git/hooks"="read"`、`"<repo>/.git/config"="read"` 后，写 hooks、追加 config、`git config` 全部
-  `Operation not permitted`，`git status`、`add`、`commit`、`checkout -b` 正常。所以这两项条目是必需的，不是纵深防御。
+  **已实测（2026-11-11 更正，codex-cli 0.167.0）**：在一般位置（例如 `/var/tmp`、用户目录下）的仓库里，`:workspace` 不加任何条目时
+  写 `.git/hooks`、`.git/config`（`git config`）、`.git/objects`、`.git/index.lock`（`git commit`）全部 `Operation not permitted`——Codex 把可写根内的
+  `.git` 整体收为只读。早先（2026-11-10）“`:workspace` 允许写 `.git`”的结论是在 `/private/tmp` 下的仓库里测的：`/tmp` 本身是 `:workspace` 的可写根，
+  例外。加上 `"read"` 条目后同样拒绝；`"read"` 条目的上级目录不能改名（`mv .git …`、`mv .git/hooks …` 拒绝）。
+  探针按此在 native 下把 `write.git_objects` 预期为拒绝。
 - 路径写成 TOML 基本字符串，严格转义反斜杠、引号与全部控制字符（换行、回车、NUL、DEL、C1 都写成 `\uXXXX`），不能改变内联表结构
   （`packages/core/test/isolation-codex-profile.test.ts` 的注入测试用 TOML 解析器还原比对）；不是绝对路径时返回 `codex_profile_invalid_path`。
 
@@ -1449,7 +1453,7 @@ profile 内容只来自节点与角色配置，worker 写不了：它不落盘�
 
 判定：与 seatbelt 相同的读拒绝项为必过项（`read.hub_token`、`read.ledger_db`、`read.other_task_token`），另加 `write.config`、
 `rename.protected_ancestor`、`write.shell_startup`（`PROBE_NATIVE_REQUIRED_DENY_ITEMS`）。native 另有：`read.codex_home_auth`（读执行器 CODEX_HOME 的 `auth.json`，预期拒绝）、
-`write.git_hooks` 与 `write.git_config`（探针工作目录是模拟仓库，预期拒绝：profile 把它们收回为只读）、`write.git_objects`（按读写类别）、
+`write.git_hooks`、`write.git_config` 与 `write.git_objects`（探针工作目录是 `/var/tmp` 下的模拟仓库，预期拒绝：Codex 把可写根内的 `.git` 收为只读，profile 的 `"read"` 条目是纵深防御）、
 `write.workdir`（read-only 下预期拒绝）。跳过并写明原因的：`write.own_profile`（profile 不落盘）、`write.git_commondir`（不存在的指针无法预先声明）、
 `write.registered_git`（native 的写类角色直接在登记仓库中工作，由 git_hooks / git_config 覆盖）、`write.shared_tmp`（`:workspace` 放行 TMPDIR）、
 `connect.hub`（worker 经沙箱外的 MCP 访问中枢）。测试用假的 codex 脚本截获参数（`isolation-probe.test.ts`「native 探针」），不运行真实 codex。
@@ -1583,7 +1587,7 @@ doctor 多一项 `isolation.mds`，探针配置与 worker 一样放行 mds（探
 | `write.shell_startup` | 拒绝 | 写白名单（4.6）：在探针自建的 `run/isolation-probe-<hex>/home/` 中独占新建 `.zshenv`（白名单之外）；成功则立即删除。**不碰真实的 `~/.zshenv`** |
 | `write.git_hooks` | 拒绝 | 写白名单（4.6、审查第一轮）：探针工作目录造成独立 clone 的形状（`.git` 是真实目录，`objects/info/alternates` 指向自建的模拟登记仓库 `run/isolation-probe-<hex>/repo/.git`，只写文件不运行 git），按 worker 同规则计算白名单；独占新建工作目录 `.git/hooks/post-checkout`，成功则立即删除 |
 | `write.registered_git` | 拒绝 | 审查第一轮 H1：在模拟登记仓库的 `.git/objects/` 中新建探针文件（登记仓库的 `.git` 对 worker 整体只读） |
-| `write.git_objects` | 可写（只读角色为拒绝） | 工作目录（独立 clone 形状）`.git/objects/` 中新建探针文件后删除 |
+| `write.git_objects` | 可写（只读角色为拒绝；native 下恒为拒绝） | 工作目录（独立 clone 形状）`.git/objects/` 中新建探针文件后删除 |
 | `write.shared_tmp` | 拒绝 | 审查第一轮 M2：在共享的系统临时目录（`TMPDIR`）新建探针文件；worker 改用按任务私有的临时目录 |
 | `write.git_commondir` | 拒绝 | 审查第二轮 H1：在探针工作目录（独立 clone 形状）独占新建 `.git/commondir`，成功则立即删除 |
 | `debug.process` | 拒绝 | **未验证**，原因见下 |
