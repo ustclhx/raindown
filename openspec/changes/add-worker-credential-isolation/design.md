@@ -184,7 +184,7 @@ seatbelt 的规则后者优先，允许项写得最窄（具体文件，而不�
 1. 先合并 D3（kb 经中枢）与探针（不施加隔离，只报告），观察一周。
 2. 外层 seatbelt 以 `preferred` 对 danger-full-access 角色启用。验收通过后，dev 角色改为 `required`。
 3. 根据任务 1.1 的结论启用 harness 原生读限制，或者提出独立用户方案并请用户批准。
-4. 回滚：角色改回 `isolation: off` 即恢复旧行为。D3 的路由保留，不影响旧节点（旧节点继续本地读取）。
+4. 回滚：施加由节点级开关决定，角色改回 `isolation: off` 只取消派送要求与未隔离提示，不停止施加；回滚施加需关闭 `config/node.yaml` 的 `isolation.enforce` 并重启节点（见 `docs/executors.md`「回滚隔离」）。D3 的路由保留，不影响旧节点（旧节点继续本地读取）。
 
 ## Open Questions
 

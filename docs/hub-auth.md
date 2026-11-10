@@ -425,7 +425,7 @@ worker 只持有本次派工的令牌（`run/tasks/<任务>/dispatch-tokens/<租
 
 | 施加层 | 用于 | 保护什么 | 不保护什么 |
 | --- | --- | --- | --- |
-| 外层 seatbelt | Codex `danger-full-access`（codex-orca、codex-exec）；claude-sdk（bash 沙箱关闭） | harness 进程及其全部子进程（含 Read 等进程内工具）：拒绝读写 raindown-home 的 `state/`、`config/`、其他任务目录与令牌，密钥私钥目录、`~/Library/LaunchAgents`、Orca 运行时目录、套接字与本机端口；拒绝调试同用户进程；写入为白名单（写类任务在独立 clone 中工作，登记仓库 `.git`、shell 启动文件、`~/.gitconfig`、PATH 目录等不可写） | 网络与白名单之外的读取；harness 自己的登录凭证与本任务会话记录（可读可写）；见下文“仍然存在的边界” |
+| 外层 seatbelt | Codex `danger-full-access`（codex-orca、codex-exec）；claude-sdk（bash 沙箱关闭） | harness 进程及其全部子进程（含 Read 等进程内工具）：拒绝读写 raindown-home 的 `state/`、`config/`、其他任务目录与令牌，密钥私钥目录、`~/Library/LaunchAgents`、Orca 运行时目录、Orca 的 unix 套接字与 Orca 本机端口（其他本机端口不拒绝）；拒绝调试同用户进程；写入为白名单（写类任务在独立 clone 中工作，登记仓库 `.git`、shell 启动文件、`~/.gitconfig`、PATH 目录等不可写） | 网络与白名单之外的读取；harness 的登录凭证（可读，可被替换）与本任务的会话记录（可读可写）；见下文“仍然存在的边界” |
 | native（Codex permissions profile） | Codex `workspace-write`、`read-only`（codex-orca、codex-exec） | 沙箱内执行的命令：raindown-home 整体、私钥目录、用户 `~/.codex`、执行器的 CODEX_HOME 等拒绝读取，只放行本任务派工令牌；写入沿用 Codex 沙箱（`.git` hooks、config 收回只读） | Codex 进程本身及其内置工具、MCP 服务器；经审批越出沙箱的命令（批准即解除该命令的隔离，这类授权一律交给用户，supervisor 不代批） |
 | none | claude-sdk bash 沙箱开启、supervisor 唤醒会话、pr-merge（节点内执行） | — | 同“隔离前” |
 
