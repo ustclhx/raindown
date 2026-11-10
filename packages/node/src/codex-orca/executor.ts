@@ -608,8 +608,9 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
         void Promise.all([
           removeTaskScratch(options.home, ctx.taskId),
           removeSealedCodexHome(options.home, ctx.taskId),
-          // 任务完成或取消，终端随之结束：解除 mds 基线的 hold，节点在执行结束出口校验并重置（4.5，审查第一轮）。
-          setMdsBaselineHold(options.home, ctx.taskId, false).catch(() => {}),
+          // 任务完成或取消，终端随之结束：对 hold 的 mds 基线做最后一次校验并删除（4.5）。不能只解除 hold 交给节点的
+          // 执行结束出口：上报 done 时节点经 forceDone 先走完出口（那时基线仍被 hold，跳过），之后没有人再校验（4.5 试运行发现）。
+          verifyMdsBaseline(options.home, ctx.taskId, { force: true }).catch(() => {}),
         ]).finally(() => settle(r))
       }
       const result = (summary: string, extra: Partial<TaskResult> = {}): TaskResult => ({
