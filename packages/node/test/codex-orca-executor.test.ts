@@ -2403,6 +2403,28 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
     expect(existsSync(join(cacheDir, 'mds', 'mds.lock'))).toBe(true)
   })
 
+  test('mds（4.5）：取消时关闭终端失败（终端可能仍在运行）则保留 hold 的基线，留给节点启动时处理', async () => {
+    const home = orcaHome()
+    // 注入的假 DARWIN_USER_CACHE_DIR，绝不碰真实的 /private/var/folders/*/C/mds。
+    const cacheDir = join(home.root, 'C')
+    mkdirSync(join(cacheDir, 'mds'), { recursive: true })
+    writeFileSync(join(cacheDir, 'mds', 'mds.lock'), '')
+    const leaseTokenFile = await token(home, 'l-1')
+    const s = await start({}, (o) => o.show('working'), {
+      home,
+      leaseTokenFile,
+      hubUrl: HUB,
+      isolation: { ...on(home), darwinUserCacheDir: cacheDir },
+    })
+    await ready(s)
+    expect(mdsBaselineHeld(home.home, 't-orca-1')).toBe(true)
+    s.orca.closeResult = fail('failure', 'orca_error', 'orca terminal close 失败')
+    await s.run.cancel()
+    await s.run.done
+    expect(existsSync(mdsBaselinePath(home.home, 't-orca-1'))).toBe(true)
+    expect(mdsBaselineHeld(home.home, 't-orca-1')).toBe(true)
+  })
+
   test('mds（审查第二轮）：节点启动时终端已不存在的 hold 基线做最后一次校验并删除；仍在运行的保留', async () => {
     const home = orcaHome()
     const cacheDir = join(home.root, 'C')
