@@ -18,6 +18,7 @@ import {
   type DeliveredReply,
   fail,
   HUB_TOKEN_ENV,
+  ISOLATION_UNAVAILABLE,
   type IsolationProbeReport,
   isolationUnavailableMessage,
   LEASE_SLOT_KINDS,
@@ -37,7 +38,7 @@ import {
   type ReportQuestion,
   type RepoSnapshot,
   type Result,
-  type RoleSet,
+  type Role,
   raindownPaths,
   readRaindownEnv,
   redactLines,
@@ -190,9 +191,10 @@ export interface StartNodeOptions {
   /** 运行平台（隔离不可用时区分“平台不支持”与“开关关闭”）；缺省 `process.platform`，测试注入。 */
   platform?: NodeJS.Platform
   /**
-   * 领到租约时读取角色配置（无进展阈值与隔离要求）；缺省读取 `config/roles/`。测试注入以避免真实文件 I/O 与虚拟时钟交错。
+   * 领到租约时按名字读取角色配置（无进展阈值与隔离要求）；缺省读取 `config/roles/`。返回 null 表示没有合法的该角色。
+   * 测试注入以避免真实文件 I/O 与虚拟时钟交错。
    */
-  loadRoles?: () => Promise<Result<RoleSet>>
+  loadRole?: (name: string) => Promise<Result<Role | null>>
 }
 
 export interface IsolationProbeNodeOptions
@@ -1964,27 +1966,41 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
       stopper.signal.addEventListener('abort', done, { once: true })
     })
 
+  const defaultLoadRole = async (name: string): Promise<Result<Role | null>> => {
+    const loaded = await loadRoles(home)
+    return loaded.ok ? ok(loaded.data.roles.find((r) => r.name === name) ?? null) : loaded
+  }
+
   /**
    * 每次领到租约时重新读取 `config/roles/`（改了角色无需重启节点）：
    * - 无进展阈值：显式传入的 resolver 优先，读取失败时用默认值；
    * - 隔离要求（6.1）：角色 `isolation: required` 时按本地的能力声明与最近一次探针确认隔离已施加，
-   *   不满足时给出卡住消息（不启动 harness）。读取失败时无法判断，不拦截（执行器自己读不到角色也会失败）。
+   *   不满足时给出卡住消息（不启动 harness）。读取失败或找不到角色时同样卡住（fail closed）。
    */
   const roleContext = async (
     contract: TaskContract,
   ): Promise<{ resolver: NoProgressResolver | undefined; isolationBlock?: string }> => {
-    const loaded = await (options.loadRoles ?? (() => loadRoles(home)))()
-    if (!loaded.ok) {
-      logger.warn('读取角色配置失败', loaded.error.code)
-      return { resolver: options.noProgressMinutes }
+    const loaded = await (options.loadRole ?? defaultLoadRole)(contract.role)
+    // 读不到角色时无法确认隔离要求：按 required 不满足处理，不启动 harness（审查第一轮 L1，fail closed）。
+    if (!loaded.ok || !loaded.data) {
+      const why = loaded.ok
+        ? `本节点 ${nodeId} 的 config/roles/ 中没有合法的角色 ${contract.role}（未定义或文件有错，运行 raindown doctor 查看）`
+        : `本节点 ${nodeId} 无法读取角色配置：${loaded.error.code} ${loaded.error.message}`
+      logger.warn(`任务 ${contract.role} 的角色配置不可用，不启动 harness`, why)
+      return {
+        resolver: options.noProgressMinutes,
+        isolationBlock: [
+          `${ISOLATION_UNAVAILABLE}：无法确认角色 ${contract.role} 的隔离要求，未启动 harness`,
+          `- ${why}`,
+          '修正角色配置后重试任务（task_retry）',
+        ].join('\n'),
+      }
     }
-    const minutes = new Map(loaded.data.roles.map((r) => [r.name, r.no_progress_minutes]))
+    const role = loaded.data
     const resolver: NoProgressResolver =
-      options.noProgressMinutes ?? ((c: TaskContract) => minutes.get(c.role))
-    const target = roleIsolationTarget(
-      loaded.data.roles.find((r) => r.name === contract.role),
-      contract,
-    )
+      options.noProgressMinutes ??
+      ((c: TaskContract) => (c.role === role.name ? role.no_progress_minutes : undefined))
+    const target = roleIsolationTarget(role, contract)
     if (target?.requirement !== 'required') return { resolver }
     const info = registry.info().find((e) => e.type === contract.executor)
     const assessed = assessIsolation({

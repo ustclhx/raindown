@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
+  fail,
   ISOLATION_UNAVAILABLE,
   type IsolationProbeReport,
   ok,
@@ -9,6 +10,7 @@ import {
 } from '@raindown/core'
 import type { ExecutorPlugin } from '../src/executor.ts'
 import { createFakeExecutor } from '../src/fake.ts'
+import type { StartNodeOptions } from '../src/node.ts'
 import { type Bench, bench } from './harness.ts'
 
 /**
@@ -85,13 +87,14 @@ async function start(o: {
   declared?: 'enforced' | 'declared_only' | 'legacy'
   probe?: IsolationProbeReport | null
   platform?: NodeJS.Platform
+  loadRole?: StartNodeOptions['loadRole']
 }) {
   const { e, runs } = executor(o.declared ?? 'enforced')
   const report = o.probe
   current = await bench({
     executors: [e],
     platform: o.platform ?? 'darwin',
-    loadRoles: async () => ok({ roles: [role(o.isolation)], errors: [] }),
+    loadRole: o.loadRole ?? (async (name) => ok(name === 'dev' ? role(o.isolation) : null)),
     ...(report
       ? {
           isolationProbe: {
@@ -170,4 +173,39 @@ describe('preferred 与 off 不在节点拦截', () => {
       expect(runs.count).toBe(1)
     })
   }
+})
+
+describe('审查修复（第一轮）', () => {
+  test('L1：找不到角色时 fail closed：不启动 harness，blocked(other) isolation_unavailable，不委托', async () => {
+    const { b, id, runs } = await start({
+      isolation: 'off',
+      probe: probe(true),
+      loadRole: async () => ok(null),
+    })
+    const t = await b.until(id, (t) => t.status === 'blocked')
+    expect(t.blocked?.reason).toBe('other')
+    expect(t.blocked?.message.startsWith(`${ISOLATION_UNAVAILABLE}：`)).toBe(true)
+    expect(t.blocked?.message).toContain('没有合法的角色 dev')
+    expect(t.blocked?.no_delegate).toBe(true)
+    expect(runs.count).toBe(0)
+  })
+
+  test('L1：读取角色配置失败时 fail closed', async () => {
+    const { b, id, runs } = await start({
+      isolation: 'off',
+      probe: probe(true),
+      loadRole: async () => fail('failure', 'read_failed', '无法读取'),
+    })
+    const t = await b.until(id, (t) => t.status === 'blocked')
+    expect(t.blocked?.message).toContain('无法读取角色配置')
+    expect(runs.count).toBe(0)
+  })
+
+  test('L4：节点侧 isolation_unavailable 卡住带 no_delegate', async () => {
+    const { b, id } = await start({ isolation: 'required', probe: probe(false) })
+    const t = await b.until(id, (t) => t.status === 'blocked')
+    expect(t.blocked?.no_delegate).toBe(true)
+    const blocked = b.events(id).find((e) => e.type === 'task.blocked')
+    expect(blocked?.type === 'task.blocked' && blocked.payload.no_delegate).toBe(true)
+  })
 })

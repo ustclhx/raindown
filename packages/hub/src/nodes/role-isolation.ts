@@ -6,8 +6,9 @@ export const ROLE_ISOLATION_TTL_MS = 2_000
 
 /**
  * 基于 raindown-home 的 `config/roles/` 的角色隔离要求（worker-credential-isolation 6.1）。
- * 每次领取请求开始时按 TTL 重新读取（不另起定时器）；读取失败或角色文件有错时沿用上一次成功的结果，
- * 从未成功时没有角色（不检查，节点侧兜底仍按节点的角色配置判断）。
+ * 每次领取请求开始与长轮询唤醒派送前按 TTL 重新读取（不另起定时器），`force` 时立即重新读取；
+ * 读取失败时沿用上一次成功的结果。找不到的角色（从未读取成功、文件有错或未定义）`lookup` 返回 undefined，
+ * 派送方据此不派该任务（fail closed）。
  */
 export function roleIsolationFromHome(
   home: string,
@@ -22,8 +23,8 @@ export function roleIsolationFromHome(
     lookup(contract) {
       return roleIsolationTarget(roles.get(contract.role), contract)
     },
-    refresh() {
-      if (now() - loadedAt < ttl) return Promise.resolve()
+    refresh(opts = {}) {
+      if (!opts.force && now() - loadedAt < ttl) return Promise.resolve()
       loading ??= (async () => {
         try {
           const loaded = await loadRoles(home)

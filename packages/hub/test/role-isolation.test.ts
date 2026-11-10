@@ -75,6 +75,7 @@ type NodeKind = 'isolated' | 'unisolated' | 'probe_failed' | 'switch_off' | 'leg
 interface Ctx {
   ledger: LedgerStore
   protocol: NodeProtocol
+  clock: FakeClock
   level: { value: RoleIsolation }
   register(nodeId: string, kind: NodeKind): void
   create(over?: Partial<TaskContractInput>): Promise<string>
@@ -118,6 +119,7 @@ async function setup(opts: { roleIsolation?: RoleIsolationSource } = {}): Promis
   return {
     ledger: t.store,
     protocol,
+    clock,
     level,
     register(nodeId, kind) {
       const base = {
@@ -258,7 +260,9 @@ describe('派送：三种取值 × 节点情况', () => {
     expect(s?.type === 'task.started' && s.payload.unisolated).toContain('未隔离')
     const items = unisolatedItems(c.ledger)
     expect(items).toHaveLength(1)
-    expect(items[0]).toMatchObject({ level: 'digest', source_ref: id, id: `unisolated.${id}` })
+    expect(items[0]).toMatchObject({ level: 'digest', source_ref: `n-plain/codex-exec/${SETTING}` })
+    expect(items[0]?.body).toContain(`最近一个任务：${id}`)
+    expect(items[0]?.body).toContain('施加层为 none')
   })
 
   test('off：未隔离节点照常派送，不标注', async () => {
@@ -294,7 +298,10 @@ describe('派送：细节', () => {
     c.level.value = 'preferred'
     const b = await c.create()
     expect(await c.acquire('n-old')).toBe(b)
-    expect(unisolatedItems(c.ledger).map((i) => i.source_ref)).toEqual([b])
+    expect(unisolatedItems(c.ledger).map((i) => i.source_ref)).toEqual([
+      `n-old/codex-exec/${SETTING}`,
+    ])
+    expect(unisolatedItems(c.ledger)[0]?.body).toContain(b)
   })
 
   test('preferred：同一任务重新派送时收件箱只提示一次', async () => {
@@ -386,6 +393,163 @@ describe('派送：细节', () => {
       wait_s: 0,
     })
     expect(a.ok && a.data.lease?.task_id).toBe(r.data.task.id)
+  })
+})
+
+describe('审查修复（第一轮）', () => {
+  test('M1：同一 节点 × 执行器 × 沙箱设置 连续多个任务只有一条未隔离提示', async () => {
+    const c = await setup()
+    c.level.value = 'preferred'
+    c.register('n-plain', 'unisolated')
+    const ids: string[] = []
+    for (let i = 0; i < 3; i++) {
+      const id = await c.create()
+      expect(await c.acquire('n-plain')).toBe(id)
+      ids.push(id)
+    }
+    const items = unisolatedItems(c.ledger)
+    expect(items).toHaveLength(1)
+    expect(items[0]?.body).toContain(`最近一个任务：${ids[0]}`)
+    // 每个任务上仍有“未隔离”标记。
+    for (const id of ids) {
+      const [s] = started(c.ledger, id)
+      expect(s?.type === 'task.started' && s.payload.unisolated).toContain('未隔离')
+    }
+  })
+
+  test('M1：原因变化时重新提示；恢复隔离后再次未隔离也重新提示', async () => {
+    const c = await setup()
+    c.level.value = 'preferred'
+    c.register('n1', 'unisolated')
+    await c.create()
+    await c.acquire('n1')
+    expect(unisolatedItems(c.ledger)).toHaveLength(1)
+    // 原因变化：施加层 none → 开关关闭。
+    c.register('n1', 'switch_off')
+    const b = await c.create()
+    expect(await c.acquire('n1')).toBe(b)
+    expect(unisolatedItems(c.ledger)).toHaveLength(2)
+    const latest = unisolatedItems(c.ledger).find((i) => i.body.includes(b))
+    expect(latest?.body).toContain('isolation.enforce')
+    // 同样原因不再提示。
+    await c.create()
+    await c.acquire('n1')
+    expect(unisolatedItems(c.ledger)).toHaveLength(2)
+    // 恢复隔离（重新注册且探针通过）后再次变为同样原因的未隔离：重新提示。
+    c.register('n1', 'isolated')
+    const d = await c.create()
+    expect(await c.acquire('n1')).toBe(d)
+    c.register('n1', 'switch_off')
+    await c.create()
+    await c.acquire('n1')
+    expect(unisolatedItems(c.ledger)).toHaveLength(3)
+  })
+
+  test('M1：中枢重启后（新的派送服务）同样原因不重复提示', async () => {
+    const c = await setup()
+    c.level.value = 'preferred'
+    c.register('n1', 'unisolated')
+    await c.create()
+    await c.acquire('n1')
+    const again = createNodeProtocol({
+      ledger: c.ledger,
+      clock: c.clock,
+      leaseTtlS: 60,
+      leaseWaitMaxS: 30,
+      roleIsolation: {
+        lookup: (contract) =>
+          roleIsolationTarget(
+            {
+              name: contract.role,
+              executor: 'codex-exec',
+              permissions: { sandbox: SETTING },
+              isolation: 'preferred',
+            },
+            contract,
+          ),
+      },
+    })
+    cleanups.push(() => again.stop())
+    await c.create()
+    const r = await again.service.acquire({
+      node_id: 'n1',
+      capabilities: ['executor:codex-exec'],
+      wait_s: 0,
+    })
+    expect(r.ok && r.data.lease).toBeTruthy()
+    expect(unisolatedItems(c.ledger)).toHaveLength(1)
+  })
+
+  test('M2：已隔离节点离线时 required 任务卡住，消息注明离线；在线时等待', async () => {
+    const c = await setup()
+    c.register('n-iso', 'isolated')
+    c.register('n-plain', 'unisolated')
+    const a = await c.create()
+    expect(await c.acquire('n-plain')).toBeNull()
+    expect(c.ledger.getTask(a)?.status).toBe('queued')
+    // n-iso 之后没有任何活动；n-plain 继续领取。
+    c.clock.time += 10 * 60_000
+    expect(await c.acquire('n-plain')).toBeNull()
+    const task = c.ledger.getTask(a)
+    expect(task?.status).toBe('blocked')
+    expect(task?.blocked?.message).toContain('已隔离节点 n-iso 最近活动于')
+    expect(task?.blocked?.message).toContain('当前离线')
+  })
+
+  test('M3：缓存过期 + 长轮询等待中的旧节点：新改为 required 的角色不被派给它', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'raindown-role-iso-m3-'))
+    cleanups.push(() => rmSync(home, { recursive: true, force: true }))
+    const rolesDir = join(home, 'config/roles')
+    mkdirSync(rolesDir, { recursive: true })
+    const writeRole = (isolation: string) =>
+      writeFileSync(
+        join(rolesDir, 'developer.yaml'),
+        `name: developer\nexecutor: codex-exec\nprompt: 测试\npermissions:\n  sandbox: ${SETTING}\nisolation: ${isolation}\n`,
+      )
+    writeRole('off')
+    let now = NOW
+    const source = roleIsolationFromHome(home, { now: () => now, ttlMs: 1000 })
+    const c = await setup({ roleIsolation: source })
+    c.register('n-old', 'legacy')
+    // 旧节点开始长轮询（此时缓存里角色为 off）。
+    const pending = c.protocol.service.acquire({
+      node_id: 'n-old',
+      capabilities: ['executor:codex-exec'],
+      wait_s: 30,
+    })
+    for (let i = 0; i < 20 && c.protocol.service.waiting() === 0; i++)
+      await new Promise((r) => setTimeout(r, 1))
+    expect(c.protocol.service.waiting()).toBe(1)
+    writeRole('required')
+    now += 5000
+    const id = await c.create()
+    for (let i = 0; i < 100 && c.ledger.getTask(id)?.status === 'queued'; i++)
+      await new Promise((r) => setTimeout(r, 2))
+    expect(c.ledger.getTask(id)?.status).toBe('blocked')
+    expect(started(c.ledger, id)).toEqual([])
+    await c.clock.advance(30_000)
+    const r = await pending
+    expect(r.ok && r.data.lease).toBeNull()
+  })
+
+  test('M3：角色不在缓存中时强制刷新；仍找不到则不派送（fail closed）', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'raindown-role-iso-m3b-'))
+    cleanups.push(() => rmSync(home, { recursive: true, force: true }))
+    const rolesDir = join(home, 'config/roles')
+    mkdirSync(rolesDir, { recursive: true })
+    const source = roleIsolationFromHome(home, { now: () => NOW, ttlMs: 60_000 })
+    const c = await setup({ roleIsolation: source })
+    c.register('n-iso', 'isolated')
+    const id = await c.create()
+    // 角色未定义：不派送，留在队列。
+    expect(await c.acquire('n-iso')).toBeNull()
+    expect(c.ledger.getTask(id)?.status).toBe('queued')
+    // 缓存仍在有效期内时新写入角色：强制刷新后即可派送。
+    writeFileSync(
+      join(rolesDir, 'developer.yaml'),
+      `name: developer\nexecutor: codex-exec\nprompt: 测试\npermissions:\n  sandbox: ${SETTING}\nisolation: required\n`,
+    )
+    expect(await c.acquire('n-iso')).toBe(id)
   })
 })
 

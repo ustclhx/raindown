@@ -158,7 +158,11 @@ export async function bench(
       ? {}
       : {
           noProgressMinutes: () => undefined,
-          loadRoles: async () => ({ ok: true as const, data: { roles: [], errors: [] } }),
+          // 任何角色都存在且不要求隔离（节点兜底对未定义的角色 fail closed）。
+          loadRole: async (name: string) => ({
+            ok: true as const,
+            data: { name, executor: 'fake', prompt: '测试', isolation: 'off' as const },
+          }),
         }),
     ...startOptions,
   })
