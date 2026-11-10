@@ -127,7 +127,7 @@ export interface ProbePlanInput {
    * - 读拒绝项、`write.config`、`rename.protected_ancestor`、`write.shell_startup` 与 seatbelt 相同；
    * - `write.own_profile` 跳过：profile 经命令行 `-c` 传入，没有可改写的配置文件；
    * - `write.git_commondir`、`write.registered_git`、`write.shared_tmp` 跳过（见 `NATIVE_CODEX_WRITE_ITEMS`）；
-   *   `write.git_hooks`、新增的 `write.git_config` 预期拒绝，`write.git_objects` 按读写类别；新增 `read.codex_home_auth` 预期拒绝；
+   *   `write.git_hooks`、新增的 `write.git_config`、`write.git_objects` 预期拒绝（Codex 把可写根内的 `.git` 收为只读）；新增 `read.codex_home_auth` 预期拒绝；
    * - `connect.hub` 跳过：native 下 worker 经沙箱外的 Raindown MCP 访问中枢，沙箱内命令的网络按角色设置；
    * - `write.workdir` 按读写类别（read-only 下工作目录不可写不算失败）。
    */

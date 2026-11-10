@@ -1453,7 +1453,7 @@ profile 内容只来自节点与角色配置，worker 写不了：它不落盘�
 
 判定：与 seatbelt 相同的读拒绝项为必过项（`read.hub_token`、`read.ledger_db`、`read.other_task_token`），另加 `write.config`、
 `rename.protected_ancestor`、`write.shell_startup`（`PROBE_NATIVE_REQUIRED_DENY_ITEMS`）。native 另有：`read.codex_home_auth`（读执行器 CODEX_HOME 的 `auth.json`，预期拒绝）、
-`write.git_hooks` 与 `write.git_config`（探针工作目录是模拟仓库，预期拒绝：profile 把它们收回为只读）、`write.git_objects`（按读写类别）、
+`write.git_hooks`、`write.git_config` 与 `write.git_objects`（探针工作目录是 `/var/tmp` 下的模拟仓库，预期拒绝：Codex 把可写根内的 `.git` 收为只读，profile 的 `"read"` 条目是纵深防御）、
 `write.workdir`（read-only 下预期拒绝）。跳过并写明原因的：`write.own_profile`（profile 不落盘）、`write.git_commondir`（不存在的指针无法预先声明）、
 `write.registered_git`（native 的写类角色直接在登记仓库中工作，由 git_hooks / git_config 覆盖）、`write.shared_tmp`（`:workspace` 放行 TMPDIR）、
 `connect.hub`（worker 经沙箱外的 MCP 访问中枢）。测试用假的 codex 脚本截获参数（`isolation-probe.test.ts`「native 探针」），不运行真实 codex。
@@ -1587,7 +1587,7 @@ doctor 多一项 `isolation.mds`，探针配置与 worker 一样放行 mds（探
 | `write.shell_startup` | 拒绝 | 写白名单（4.6）：在探针自建的 `run/isolation-probe-<hex>/home/` 中独占新建 `.zshenv`（白名单之外）；成功则立即删除。**不碰真实的 `~/.zshenv`** |
 | `write.git_hooks` | 拒绝 | 写白名单（4.6、审查第一轮）：探针工作目录造成独立 clone 的形状（`.git` 是真实目录，`objects/info/alternates` 指向自建的模拟登记仓库 `run/isolation-probe-<hex>/repo/.git`，只写文件不运行 git），按 worker 同规则计算白名单；独占新建工作目录 `.git/hooks/post-checkout`，成功则立即删除 |
 | `write.registered_git` | 拒绝 | 审查第一轮 H1：在模拟登记仓库的 `.git/objects/` 中新建探针文件（登记仓库的 `.git` 对 worker 整体只读） |
-| `write.git_objects` | 可写（只读角色为拒绝） | 工作目录（独立 clone 形状）`.git/objects/` 中新建探针文件后删除 |
+| `write.git_objects` | 可写（只读角色为拒绝；native 下恒为拒绝） | 工作目录（独立 clone 形状）`.git/objects/` 中新建探针文件后删除 |
 | `write.shared_tmp` | 拒绝 | 审查第一轮 M2：在共享的系统临时目录（`TMPDIR`）新建探针文件；worker 改用按任务私有的临时目录 |
 | `write.git_commondir` | 拒绝 | 审查第二轮 H1：在探针工作目录（独立 clone 形状）独占新建 `.git/commondir`，成功则立即删除 |
 | `debug.process` | 拒绝 | **未验证**，原因见下 |

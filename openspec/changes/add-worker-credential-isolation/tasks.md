@@ -37,7 +37,7 @@
   - claude-sdk 施加时改用 Raindown 管理的 `CLAUDE_CONFIG_DIR`（`run/executors/claude-sdk/claude-config/`，用户设置与扩展只读链接），
     `CLAUDE_SECURESTORAGE_CONFIG_DIR` 保持原钥匙串条目，`CLAUDE_CODE_TMPDIR` 改到本用户 `TMPDIR`（第一轮审查后改为按任务的目录与任务私有临时目录，见下）。
   - 登记仓库 `.git` 的最小写集合曾由 darwin 上真实 `sandbox-exec` + git 实测确定；第一轮审查后被独立 clone 取代（见下），登记仓库的 `.git` 整体只读。
-  - 探针新增必过项 `write.shell_startup`、`write.git_hooks`（只在探针自建的 `run/isolation-probe-<hex>/` 中操作），以及 `write.git_objects`（按角色读写类别）。
+  - 探针新增必过项 `write.shell_startup`、`write.git_hooks`（只在探针自建的 `run/isolation-probe-<hex>/` 中操作），以及 `write.git_objects`（按角色读写类别；native 下恒为拒绝，见 5.1）。
   - 新配置 `isolation.extra_write`（绝对路径；不能是受保护路径、持久化位置、用户主目录或其祖先），doctor 显示。
   - PR #99 第一轮审查（用户批准第一步方案：Orca 方案 (b)、codex-exec / claude-sdk 写类角色同样用独立 clone、`dissociate` 缺省 false、known_hosts 记为限制）：
     - H1、H2、M4：施加时写类任务在独立 clone `run/tasks/<任务>/repo`（`git clone --shared`，不硬链接对象）中运行，登记仓库的 `.git` 整体只读；
