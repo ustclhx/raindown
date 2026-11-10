@@ -13,6 +13,7 @@ import {
   inferRoleKind,
   loadRoles,
   type Role,
+  roleIsolationOf,
   roleSchema,
   supervisorRoleProblem,
 } from '../src/roles.ts'
@@ -289,6 +290,34 @@ describe('creatable_by（角色创建权限）', () => {
       supervisor: undefined,
       triage: ['*'],
     })
+  })
+
+  test('默认模板：isolation 只以注释说明，实际取值保持缺省 preferred（worker-credential-isolation 6.2）', async () => {
+    const home = tempHome('raindown-roles-')
+    for (const [name, text] of Object.entries(DEFAULT_ROLE_FILES)) {
+      writeText(join(home, 'config/roles', name), text)
+    }
+    const loaded = data(await loadRoles(home))
+    expect(loaded.errors).toEqual([])
+    for (const r of loaded.roles) {
+      expect(r.isolation).toBeUndefined()
+      expect(roleIsolationOf(r)).toBe('preferred')
+    }
+    const dev = DEFAULT_ROLE_FILES['dev.yaml'] ?? ''
+    expect(dev).toContain('# isolation: required')
+    expect(dev).toContain('isolation.enforce: true')
+    expect(dev).toContain('isolation_unavailable')
+    for (const name of [
+      'reviewer.yaml',
+      'triage.yaml',
+      'pr-reviewer.yaml',
+      'supervisor.yaml',
+      'merger.yaml',
+    ])
+      expect(DEFAULT_ROLE_FILES[name] ?? '').toContain('isolation')
+    // 注释之外不出现 isolation 键。
+    for (const text of Object.values(DEFAULT_ROLE_FILES))
+      expect(text.split('\n').filter((line) => /^\s*isolation\s*:/.test(line))).toEqual([])
   })
 })
 

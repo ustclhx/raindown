@@ -404,16 +404,54 @@ raindown hub token revoke tok_0123456789ab                        # 立即生效
 ## 信任边界
 
 **本机上以同一系统用户运行、能读取 `state/hub.token` 的任何进程，都可以获得 `user` 身份。**
-目前 worker 与节点以同一 Unix 用户运行，部分角色（如 dev）不启用沙箱，因此能读到 `state/hub.token`（user 令牌）
-和其他任务的派工令牌文件。0600 只隔离不同系统用户，不能隔离同一用户的任务。
-在 worker 沙箱隔离落地之前，任务绑定的范围是纵深防御，不是硬边界。
 例如，直接读取 `hub.token` 并用 curl 携带该 token、且不声明 AI 身份的进程仍是 `user`。
-这一点是有意保留的：CLI 本身就靠读这个文件工作，同一用户的进程也能读 age 私钥、改配置。
-本设计防的是：
+这一点是有意保留的：CLI 本身就靠读这个文件工作。0600 只隔离不同系统用户，不能隔离同一用户的任务。
+因此 worker 能否拿到 user 身份，取决于凭证隔离（add-worker-credential-isolation）是否施加在它身上。
+
+### 隔离前（`isolation.enforce` 关闭，缺省）
+
+worker 与节点以同一 Unix 用户运行。dev 等不开 harness 沙箱的角色（`danger-full-access`）能直接读写 Raindown 的全部状态：
+`state/hub.token`（user 令牌）、其他任务的派工令牌与唤醒令牌、账本数据库、`config/`（含 `policies.yaml`），
+以及密钥私钥 `~/.config/sops/age/keys.txt`（能解密 `config/secrets.sops.yaml`），还能操作 Orca 的其他终端。
+开了 Codex 沙箱（workspace-write / read-only）的角色同样能**读**这些文件：Codex 沙箱缺省只限制写。
+任务绑定令牌（只能访问本任务、只列六个 MCP 工具）此时只是纵深防御，不是硬边界：被提示注入的 worker 可以绕过 Raindown 的全部授权。
+
+### 隔离后（`isolation.enforce: true`，仅 macOS）
+
+worker 只持有本次派工的令牌（`run/tasks/<任务>/dispatch-tokens/<租约>.token`，经 `RAINDOWN_LEASE_TOKEN_FILE` 交给受管 MCP），
+经任务绑定的 MCP 访问中枢；知识读取（`kb_search`、`kb_get`、`kb_query`）也经中枢执行（见上文「知识读取经中枢」），worker 进程无需读取 raindown-home。
+节点凭证不经环境变量传给 worker。施加层按 执行器 × 沙箱设置 决定（[executors.md「凭证隔离声明」](executors.md#凭证隔离声明)），
+只有 `raindown doctor` 显示“已施加 … 通过”的组合才算已隔离：
+
+| 施加层 | 用于 | 保护什么 | 不保护什么 |
+| --- | --- | --- | --- |
+| 外层 seatbelt | Codex `danger-full-access`（codex-orca、codex-exec）；claude-sdk（bash 沙箱关闭） | harness 进程及其全部子进程（含 Read 等进程内工具）：拒绝读写 raindown-home 的 `state/`、`config/`、其他任务目录与令牌，密钥私钥目录、`~/Library/LaunchAgents`、Orca 运行时目录、Orca 的 unix 套接字与 Orca 本机端口（其他本机端口不拒绝）；拒绝调试同用户进程；写入为白名单（写类任务在独立 clone 中工作，登记仓库 `.git`、shell 启动文件、`~/.gitconfig`、PATH 目录等不可写） | 网络与白名单之外的读取；harness 的登录凭证（可读，可被替换）与本任务的会话记录（可读可写）；见下文“仍然存在的边界” |
+| native（Codex permissions profile） | Codex `workspace-write`、`read-only`（codex-orca、codex-exec） | 沙箱内执行的命令：raindown-home 整体、私钥目录、用户 `~/.codex`、执行器的 CODEX_HOME 等拒绝读取，只放行本任务派工令牌；写入沿用 Codex 沙箱（`.git` hooks、config 收回只读） | Codex 进程本身及其内置工具、MCP 服务器；经审批越出沙箱的命令（批准即解除该命令的隔离，这类授权一律交给用户，supervisor 不代批） |
+| none | claude-sdk bash 沙箱开启、supervisor 唤醒会话、pr-merge（节点内执行） | — | 同“隔离前” |
+
+细节见 [executors.md「外层 seatbelt 施加」](executors.md#外层-seatbelt-施加worker-credential-isolation-414) 与其中的「`native`」。
+角色可用 `isolation: required` 要求隔离，不满足时不启动 harness；升级与回滚见 [executors.md「升级到隔离」](executors.md#升级到隔离worker-credential-isolation-62)
+与 [「回滚隔离」](executors.md#回滚隔离worker-credential-isolation-62)。
+
+### 隔离后仍然存在的边界
+
+逐项见 executors.md 外层 seatbelt 的「已知边界」与「写白名单」的残留风险、`native` 的已知边界，以及 design 的 Risks。要点：
+
+- **同用户进程**：环境变量可读（`ps eww`）、可以互相发信号，seatbelt 拦不住；节点凭证因此不放进环境变量，信号只能让任务失败。
+- **harness 凭证**：`~/.codex/auth.json`（经链接）与登录钥匙串（claude-sdk）可以被 worker 读取、替换或损坏。
+- **mds**：`<DARWIN_USER_CACHE_DIR>/mds/` 中的普通文件在 harness 运行期间可被改写；节点在 harness 前后校验并重置。
+- **偏好设置**：经 cfprefsd 的偏好设置写入拦不住。
+- **不隔离的会话**：supervisor 唤醒会话（MCP 仍本地读取 raindown-home）与 pr-merge（节点内执行）不施加隔离，也不能设为 `required`。
+- **native**：Codex 进程本身、MCP 服务器与经审批越出沙箱的命令不受 profile 约束；授权弹窗一律交给用户审批。
+
+它**不防**已经拿到内核或用户凭证（登录密码、sudo）的攻击者，也不限制 worker 的外网访问与 GitHub 身份（与用户共用）。
+
+### 鉴权本身防什么
+
+无论隔离与否，本设计防的是：
 
 - 远程调用方只能拿到绑定 token：remote token 在本机端口完全不可用，`node:` token 只能走节点协议；
 - 绑定 token 泄露后，持有者只能在绑定身份的权限范围内操作，且可以随时撤销；
 - 本机 AI 进程误把自己声明成 user 或中枢内部身份（MCP 层与中枢都会拒绝）。
 
-它**不防**本机同一用户下的恶意进程。需要更强的隔离时，应让 AI 进程以不同系统用户运行，
-使其读不到 `state/hub.token`。
+它**不防**本机同一用户下、未被隔离的恶意进程（例如用户自己运行的其他程序）。

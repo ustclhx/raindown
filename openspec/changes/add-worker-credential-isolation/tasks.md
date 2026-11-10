@@ -64,7 +64,13 @@
     worker 内读 `hub.token` 失败（退出码 1）；`raindown_report` 与 `kb_search`（经中枢）正常；用户的主检出未被改动；
     `pnpm install` 正常；mds 无重置。三个施加组合（codex-orca、codex-exec × danger-full-access，claude-sdk × bash 沙箱关闭）探针均通过。
     发现：任务以上报 done 结束时，节点经 forceDone 先走完执行结束出口（基线仍被 hold），之后无人校验，基线残留——改为执行器在任务完成或取消时校验并删除。
-    未覆盖：claude-sdk 写类任务的真实运行（钥匙串登录、进程组结束）与真实 Orca 下的终端存活检查，随后续使用观察。
+    未覆盖：真实 Orca 下的终端存活检查，随后续使用观察。
+  - 补充验收（2026-11-11，PR #105 之后）：
+    - triage（codex-exec × read-only，native）真实任务 `t-20261110-162154-a87c67` 正常完成：读文件、运行命令正常，未出现 unisolated 事件；
+      Codex 看到 profile 拒绝 raindown-home 后主动没有执行读令牌的命令，命令级拒绝由 `codex sandbox` 实测覆盖（见 5.1）。
+    - reviewer（claude-sdk × bash 沙箱关闭，seatbelt）真实任务 `t-20261110-163254-0bb2e6`：Claude 在 seatbelt 内经钥匙串登录、正常调用模型；
+      Read `state/hub.token` 返回 `EPERM: operation not permitted`；取消后无残留进程，任务临时目录已清理。
+    - 已覆盖 claude-sdk 读类任务的真实运行（钥匙串登录、进程组结束）；claude-sdk 写类任务（独立 clone + 推送）仍待实际使用中观察。
 
 ## 5. harness 沙箱开启时的隔离
 
@@ -103,4 +109,8 @@
     `preferred` 未隔离时 `task.started.unisolated` 记缺什么；收件箱按 节点 × 执行器 × 沙箱设置 聚合，只在评估结果变化时提示。
     只等待在线的已隔离节点（长轮询、活动租约或最近活动在窗口内；中枢启动/唤醒后有宽限）；角色缓存在领取与长轮询派送前刷新，找不到角色时中枢卡住、节点不启动（fail closed）。
     恢复沿用 `task_retry`，不新增轮询。supervisor 唤醒会话与 pr-merge 设 `required` 时角色加载报错（doctor）。说明见 `docs/executors.md`「角色隔离要求」
-- [ ] 6.2 文档：`docs/hub-auth.md` 与 `docs/executors.md` 更新信任边界说明（隔离后与隔离前）、升级建议（dev 角色改为 required）、回滚方法；`raindown init` 的角色模板加入 `isolation` 注释
+- [x] 6.2 文档：`docs/hub-auth.md` 与 `docs/executors.md` 更新信任边界说明（隔离后与隔离前）、升级建议（dev 角色改为 required）、回滚方法；`raindown init` 的角色模板加入 `isolation` 注释
+  - 实现：`docs/hub-auth.md`「信任边界」分隔离前、隔离后（外层 seatbelt 与 native 各自保护与不保护什么）与仍然存在的边界；
+    `docs/executors.md` 新增「升级到隔离」（开关、doctor 确认、写类角色 required、需要 commit 用 danger-full-access、写入失败排查与 `extra_write`）
+    与「回滚隔离」（关开关重启、required 同时改回、seatbelt 中的旧终端、独立 clone 分支取回、`queued → blocked` 与 `isolation_layer: 'native'` 对旧版本的影响），两处互相链接；
+    `raindown init` 的角色模板以注释说明 `isolation`（实际取值保持缺省 preferred，测试锁定）。
