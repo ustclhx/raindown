@@ -71,6 +71,15 @@
         "pattern": "^(?:\\*|[A-Za-z0-9][A-Za-z0-9._:@-]{0,62}:\\*|[A-Za-z0-9][A-Za-z0-9._:@-]{0,63})$",
         "description": "操作者模式：精确值，或 `*`、`<前缀>:*` 形式的前缀通配"
       }
+    },
+    "isolation": {
+      "type": "string",
+      "enum": [
+        "required",
+        "preferred",
+        "off"
+      ],
+      "description": "隔离要求：required 只派给隔离已施加且自检通过的节点，否则任务 blocked(other)（isolation_unavailable）、不启动 harness；preferred（缺省）照常派送，未隔离时在任务与收件箱标明；off 不检查。supervisor 角色与 pr-merge 不支持 required"
     }
   },
   "required": [

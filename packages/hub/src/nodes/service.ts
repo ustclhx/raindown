@@ -4,6 +4,7 @@ import {
   type AcquireLeaseData,
   ackReplyRequest,
   acquireLeaseRequest,
+  assessIsolation,
   type BlockedRequest,
   type CompleteLeaseData,
   type CompleteLeaseRequest,
@@ -15,8 +16,12 @@ import {
   fail,
   INBOX_BODY_MAX,
   INBOX_TITLE_MAX,
+  ISOLATION_NOT_APPLICABLE_SETTINGS,
+  ISOLATION_UNAVAILABLE,
   type IsolationNoticeData,
   isolationNoticeRequest,
+  isolationStatusRows,
+  isolationUnavailableMessage,
   isSqliteBusy,
   type LeaseGrant,
   type LeaseSlots,
@@ -25,6 +30,7 @@ import {
   type NodeView,
   normalizeProbeReport,
   ok,
+  PROTOCOL_MESSAGE_MAX,
   probeRegressions,
   probeRunSummary,
   type RegisterNodeRequest,
@@ -33,6 +39,7 @@ import {
   type ReplyView,
   type ReportQuestion,
   type Result,
+  type RoleIsolationTarget,
   registerNodeRequest,
   renderPrEventInput,
   renewLeaseRequest,
@@ -40,6 +47,7 @@ import {
   sanitizeMessage,
   sanitizeTail,
   stripUntrustedReview,
+  type TaskContract,
   type TaskView,
   type WakeOrigin,
 } from '@raindown/core'
@@ -108,6 +116,23 @@ export interface NodeServiceOptions extends NodeProtocolConfig {
   }) => string | undefined
   /** 不影响请求结果的失败（例如任务分支上报写入失败）只记日志。 */
   logger?: Pick<HubLogger, 'warn'>
+  /**
+   * 角色隔离要求（worker-credential-isolation 6.1）。缺省不检查（等同所有角色 `isolation: off`）。
+   */
+  roleIsolation?: RoleIsolationSource
+}
+
+/**
+ * 派送时查任务的角色隔离要求（审查第一轮 M3：领取与长轮询唤醒前都先刷新）。`lookup` 是同步的（派送在同步代码里选任务），由调用方缓存角色配置；
+ * `refresh` 在每次领取请求开始时调用，刷新缓存（失败时沿用旧缓存）。
+ */
+export interface RoleIsolationSource {
+  /** 找不到角色时返回 undefined：该任务本轮不派送（fail closed）。 */
+  lookup(contract: TaskContract): RoleIsolationTarget | undefined
+  /** `force`：忽略缓存有效期立即重新读取（队列中有角色不在缓存里时）。 */
+  refresh?(opts?: { force?: boolean }): Promise<void>
+  /** 角色找不到时的原因（该角色文件的加载错误、读取失败）；没有可说明的原因时 undefined。 */
+  problem?(role: string): string | undefined
 }
 
 export interface AcquireOptions {
@@ -136,6 +161,10 @@ export interface NodeService {
   expireDue(opts?: { graceMs?: number }): number
   /** 当前挂起的 long-poll 数（测试与诊断）。 */
   waiting(): number
+  /**
+   * 中枢从睡眠中恢复（睡眠检测调用）：此后一个在线窗口内，节点的最近活动至少按恢复时刻计（审查第二轮 M-2）。
+   */
+  resumed(): void
   /** 结束全部等待（返回空结果）并取消订阅。 */
   close(): void
 }
@@ -484,8 +513,195 @@ export function createNodeService(o: NodeServiceOptions): NodeService {
     return false
   }
 
+  /** 节点上合同执行器 × 沙箱设置的隔离判定；旧节点不上报执行器信息时按未上报（none）。 */
+  function assessNode(node: NodeView | null, task: TaskView, target: RoleIsolationTarget) {
+    const info = node?.executors.find((e) => e.type === task.contract.executor)
+    return assessIsolation({
+      capabilities: info?.adapter_capabilities ?? {},
+      setting: target.setting,
+      probe: node?.isolation_probe ?? null,
+      executor: task.contract.executor,
+      now: clock.now(),
+    })
+  }
+
+  /**
+   * 可以等待的节点：最近活动（`last_seen_at`）在 `onlineWindowMs` 之内（审查第一轮 M2）。
+   * 离线的已隔离节点不能让 required 任务一直等下去。`last_seen_at` 为 null（重建后尚未活动）按离线。
+   */
+  const onlineWindowMs = Math.max(3 * o.leaseTtlS, 2 * o.leaseWaitMaxS) * 1000
+  /**
+   * 中枢启动（或睡眠唤醒）的时刻（审查第二轮 M-2）：此后一个窗口内，节点的最近活动按 max(last_seen_at, 该时刻) 计——
+   * 中枢停机或睡眠期间节点无法活动，不能据此判离线。
+   */
+  let graceStart = clock.now()
+  const isOnline = (n: NodeView) => {
+    // 正在长轮询或持有活动租约的节点一定在线。
+    if (waiters.some((w) => w.nodeId === n.node_id) || n.active_leases > 0) return true
+    const now = clock.now()
+    let seen = n.last_seen_at === null ? Number.NEGATIVE_INFINITY : Date.parse(n.last_seen_at)
+    if (now - graceStart <= onlineWindowMs) seen = Math.max(seen, graceStart)
+    return now - seen <= onlineWindowMs
+  }
+
+  /** 未隔离组合（节点 × 执行器 × 沙箱设置）最近一次提示的原因指纹；null 表示其后观察到已隔离（审查第一轮 M1）。 */
+  const unisolatedPrompts = new Map<string, string | null>()
+  const unisolatedKey = (nodeId: string, task: TaskView, target: RoleIsolationTarget) =>
+    `${nodeId}/${task.contract.executor}/${target.setting ?? 'unknown'}`
+  const fingerprintOf = (missing: readonly string[]) =>
+    createHash('sha256').update(missing.join('\n')).digest('hex').slice(0, 12)
+  /** 条目 id：`unisolated.<组合哈希>.<原因指纹>.<seq>`（审查第二轮 L-a：指纹从 id 解析，不解析可能被截断的正文）。 */
+  const UNISOLATED_ID_RE = /^unisolated\.[0-9a-f]{16}\.([0-9a-f]{12})\.\d+$/
+
+  /**
+   * 角色隔离要求（worker-credential-isolation 6.1）：
+   * - 没有配置角色隔离来源：不检查（等同 off）；
+   * - 来源中找不到该角色（调用方已强制刷新过）：本轮不派送（fail closed，审查第一轮 M3）；
+   * - off 或节点已隔离：照常派送；
+   * - preferred 且节点未隔离：照常派送，返回“未隔离”说明（写进 `task.started.unisolated`），
+   *   收件箱按 节点 × 执行器 × 沙箱设置 聚合提示（`notifyUnisolated`）；
+   * - required 且节点未隔离：另有满足能力、已隔离且在线的节点时留在队列里等它；没有时由中枢写
+   *   `task.blocked(other)`（`isolation_unavailable`，不经节点、不启动 harness），返回不派送。
+   */
+  function isolationDecision(
+    task: TaskView,
+    nodeId: string,
+  ):
+    | { grant: false }
+    | { grant: true; unisolated?: { note: string; key: string; missing: string[] } } {
+    if (!o.roleIsolation) return { grant: true }
+    const target = o.roleIsolation.lookup(task.contract)
+    if (!target) {
+      // 强制刷新后仍找不到角色（审查第二轮 M-1）：卡住并说明，修好角色后 task_retry。
+      const problem = o.roleIsolation.problem?.(task.contract.role)
+      blockUnavailable(
+        task,
+        [
+          `${ISOLATION_UNAVAILABLE}：无法确认角色 ${task.contract.role} 的隔离要求（config/roles/ 中未定义或文件有错，运行 raindown doctor）`,
+          ...(problem ? [`- ${problem}`] : []),
+          '修正角色配置后重试任务（task_retry）',
+        ].join('\n'),
+      )
+      return { grant: false }
+    }
+    if (target.requirement === 'off') return { grant: true }
+    const here = assessNode(ledger.getNode(nodeId), task, target)
+    const key = unisolatedKey(nodeId, task, target)
+    if (here.view.enforced) {
+      unisolatedPrompts.set(key, null)
+      return { grant: true }
+    }
+    if (target.requirement === 'preferred') {
+      // supervisor 唤醒会话与 pr-merge 按设计不隔离，不标注。
+      if (target.setting && ISOLATION_NOT_APPLICABLE_SETTINGS.includes(target.setting))
+        return { grant: true }
+      return {
+        grant: true,
+        unisolated: {
+          key,
+          missing: here.missing,
+          note: clipText(
+            `角色 ${target.role}（isolation: preferred）在节点 ${nodeId} 上未隔离运行（${task.contract.executor} × ${target.setting ?? '未知沙箱设置'}）：${here.missing.join('；')}`,
+            4000,
+          ),
+        },
+      }
+    }
+    const others = ledger
+      .listNodes()
+      .filter((n) => n.node_id !== nodeId && capabilitiesSatisfy(n.capabilities, task.contract))
+    const assessed = others.map((n) => ({ node: n, a: assessNode(n, task, target) }))
+    if (assessed.some((x) => x.a.view.enforced && isOnline(x.node))) return { grant: false }
+    const describe = (x: (typeof assessed)[number]) =>
+      x.a.view.enforced
+        ? `已隔离节点 ${x.node.node_id} 最近活动于 ${x.node.last_seen_at ?? '未知'}，当前离线`
+        : `节点 ${x.node.node_id}：${x.a.missing.join('；')}`
+    const details = [
+      `节点 ${nodeId}：${here.missing.join('；')}`,
+      ...assessed.slice(0, 10).map(describe),
+    ]
+    blockUnavailable(task, isolationUnavailableMessage(target, task.contract.executor, details))
+    return { grant: false }
+  }
+
+  /** 中枢把排队中的任务写成 `blocked(other)`（`isolation_unavailable`，不带租约、不委托）。 */
+  function blockUnavailable(task: TaskView, text: string) {
+    const message = clipText(text, PROTOCOL_MESSAGE_MAX)
+    const r = ledger.append(
+      {
+        task_id: task.id,
+        workspace: task.workspace,
+        type: 'task.blocked',
+        payload: { reason: 'other', message, lease_held: false, no_delegate: true },
+      },
+      { actor: 'hub' },
+    )
+    if (!r.ok) o.logger?.warn('隔离不可用的卡住写入失败', r.error.code)
+  }
+
+  /** 该组合最近一条“未隔离”条目的原因指纹（中枢重启后从收件箱恢复）。 */
+  function lastUnisolatedFingerprint(key: string): string | null {
+    const items = ledger
+      .listInboxItems({ source: 'isolation', limit: 10_000 })
+      .filter((i) => i.reason === 'unisolated' && i.source_ref === key)
+    // 按创建事件的 seq（short_id 是它的 base36）取最近一条。
+    const seqOf = (i: (typeof items)[number]) => Number.parseInt(i.short_id, 36)
+    const latest = items.reduce<(typeof items)[number] | undefined>(
+      (a, b) => (a === undefined || seqOf(b) > seqOf(a) ? b : a),
+      undefined,
+    )
+    return latest?.id.match(UNISOLATED_ID_RE)?.[1] ?? null
+  }
+
+  /**
+   * preferred 角色派到未隔离节点（审查第一轮 M1）：收件箱按 节点 × 执行器 × 沙箱设置 聚合，不是每个任务一条。
+   * 同一组合只在评估结果变化时新建一条 Digest：首次未隔离、其间观察到已隔离后又变为未隔离、或原因（指纹）变化。
+   * 正文列出原因与触发提示的任务 id。
+   */
+  function notifyUnisolated(task: TaskView, u: { key: string; missing: string[] }) {
+    const fingerprint = fingerprintOf(u.missing)
+    const previous = unisolatedPrompts.has(u.key)
+      ? unisolatedPrompts.get(u.key)
+      : lastUnisolatedFingerprint(u.key)
+    if (previous === fingerprint) {
+      unisolatedPrompts.set(u.key, fingerprint)
+      return
+    }
+    const keyHash = createHash('sha256').update(u.key).digest('hex').slice(0, 16)
+    const r = ledger.append(
+      {
+        type: 'inbox.item_created',
+        payload: {
+          item_id: `unisolated.${keyHash}.${fingerprint}.${ledger.seq()}`,
+          level: 'digest',
+          source: 'isolation',
+          source_ref: u.key,
+          reason: 'unisolated',
+          title: clipText(`${u.key.replaceAll('/', ' × ')} 未隔离运行`, INBOX_TITLE_MAX),
+          body: clipText(
+            [
+              `节点 × 执行器 × 沙箱设置 ${u.key.replaceAll('/', ' × ')} 上 isolation: preferred 的任务未隔离运行：`,
+              ...u.missing.map((m) => `- ${m}`),
+              `最近一个任务：${task.id}`,
+              '同一组合在原因变化或恢复隔离后再次未隔离时才会再次提示',
+            ].join('\n'),
+            INBOX_BODY_MAX,
+          ),
+          actions: [],
+        },
+      },
+      { actor: 'hub' },
+    )
+    if (r.ok || r.error.code === 'duplicate_item') unisolatedPrompts.set(u.key, fingerprint)
+    else o.logger?.warn('未隔离提示写入失败', r.error.code)
+  }
+
   /** 在同一事务写 `task.started` + `lease.granted`；被其他请求抢先时返回 null。 */
-  function grantTask(task: TaskView, nodeId: string): LeaseGrant | null {
+  function grantTask(
+    task: TaskView,
+    nodeId: string,
+    unisolated?: { note: string; key: string; missing: string[] },
+  ): LeaseGrant | null {
     // resume 只交给紧接着的这一次执行：task.started 会在投影里清空它（PR #16 审查第 1 条）。
     const resume = ledger.taskResume(task.id)
     const recovery = recoveryForTask(ledger, task)
@@ -502,7 +718,12 @@ export function createNodeService(o: NodeServiceOptions): NodeService {
         {
           ...base,
           type: 'task.started',
-          payload: { node_id: nodeId, lease_id: leaseId, attempt },
+          payload: {
+            node_id: nodeId,
+            lease_id: leaseId,
+            attempt,
+            ...(unisolated === undefined ? {} : { unisolated: unisolated.note }),
+          },
         },
         {
           ...base,
@@ -520,6 +741,7 @@ export function createNodeService(o: NodeServiceOptions): NodeService {
     )
     // 被其他请求抢先（理论上不会发生，见文件头）。
     if (!written.ok) return null
+    if (unisolated !== undefined) notifyUnisolated(task, unisolated)
     ledger.touchNode(nodeId)
     return {
       lease_id: leaseId,
@@ -579,9 +801,12 @@ export function createNodeService(o: NodeServiceOptions): NodeService {
     const general = !slots || slots.general > 0
     for (const task of ledger.queuedTasks()) {
       if (!capabilitiesSatisfy(capabilities, task.contract)) continue
+      const decision = isolationDecision(task, nodeId)
+      if (!decision.grant) continue
+      const { unisolated } = decision
       const hasReservedWaiter = waiters.some((w) => w !== self && w.nodeId === nodeId && w.slots)
       if (general && !hasReservedWaiter) {
-        const grant = grantTask(task, nodeId)
+        const grant = grantTask(task, nodeId, unisolated)
         if (grant) return grant
         continue
       }
@@ -591,12 +816,12 @@ export function createNodeService(o: NodeServiceOptions): NodeService {
       if (slot === 'general') {
         const other = reservedWaiterFor(task, wake, nodeId, self)
         if (other) {
-          const grant = grantTask(task, nodeId)
+          const grant = grantTask(task, nodeId, unisolated)
           if (grant) other.resolve(grant)
           continue
         }
       }
-      const grant = grantTask(task, nodeId)
+      const grant = grantTask(task, nodeId, unisolated)
       if (grant) return grant
     }
     return null
@@ -606,7 +831,7 @@ export function createNodeService(o: NodeServiceOptions): NodeService {
   function scheduleDrain() {
     if (draining || waiters.length === 0) return
     draining = true
-    queueMicrotask(() => {
+    const drain = () => {
       draining = false
       if (closed) return
       for (const w of [...waiters]) {
@@ -615,8 +840,41 @@ export function createNodeService(o: NodeServiceOptions): NodeService {
         const grant = tryGrant(w.nodeId, w.capabilities, w.slots, w)
         if (grant) w.resolve(grant)
       }
-    })
+    }
+    // 有角色隔离来源时先刷新角色缓存（审查第一轮 M3）：长轮询等待期间缓存可能已过期。
+    if (o.roleIsolation?.refresh) void refreshRoles().then(drain)
+    else queueMicrotask(drain)
   }
+
+  /**
+   * 刷新角色缓存；队列中有角色不在缓存里的任务时强制再读一次（新写入的角色）。仍找不到的任务本轮不派送。
+   * 失败时沿用上次结果。
+   */
+  async function refreshRoles() {
+    const source = o.roleIsolation
+    if (!source?.refresh) return
+    try {
+      await source.refresh()
+      // 只为新出现的缺失角色强制重读一次；同一缺失角色之后不再反复强制重读（审查第二轮 M-1），
+      // 这类任务在派送时被卡住，或在 TTL 刷新中找到角色后恢复。
+      const missing = new Set(
+        ledger
+          .queuedTasks()
+          .filter((t) => !source.lookup(t.contract))
+          .map((t) => t.contract.role),
+      )
+      for (const name of forcedMissing) if (!missing.has(name)) forcedMissing.delete(name)
+      if ([...missing].some((name) => !forcedMissing.has(name))) {
+        await source.refresh({ force: true })
+        for (const name of missing) forcedMissing.add(name)
+      }
+    } catch (err) {
+      o.logger?.warn('刷新角色隔离要求失败，沿用上次结果', String(err))
+    }
+  }
+
+  /** 已经为之强制重读过、仍然缺失的角色名。 */
+  const forcedMissing = new Set<string>()
 
   const unsubscribe = ledger.subscribe((event) => {
     if (WAKING.has(event.type)) scheduleDrain()
@@ -710,6 +968,12 @@ export function createNodeService(o: NodeServiceOptions): NodeService {
       )
       ledger.touchNode(req.data.node_id)
       const node = ledger.getNode(req.data.node_id)
+      // 重新注册时已隔离的组合：之后再次未隔离要重新提示（审查第一轮 M1）。
+      if (node) {
+        for (const row of isolationStatusRows(node, clock.now()))
+          if (row.enforced)
+            unisolatedPrompts.set(`${node.node_id}/${row.executor}/${row.setting}`, null)
+      }
       return node ? ok({ node }) : fail('failure', 'internal_error', '节点写入后不可见')
     },
 
@@ -758,6 +1022,7 @@ export function createNodeService(o: NodeServiceOptions): NodeService {
       if (!req.ok) return req
       const { node_id: nodeId, capabilities, slots } = req.data
       if (!ledger.touchNode(nodeId)) return notRegistered(nodeId)
+      if (o.roleIsolation?.refresh) await refreshRoles()
       // 唤醒绑定 token 按这次请求的调用方决定是否下发（等待者可能领到为别的请求挑出的任务）。
       const mayIssue = opts.actor === 'user' || opts.actor === `node:${nodeId}`
       const withWakeToken = (g: LeaseGrant | null): LeaseGrant | null => {
@@ -1122,6 +1387,9 @@ export function createNodeService(o: NodeServiceOptions): NodeService {
     },
 
     waiting: () => waiters.length,
+    resumed() {
+      graceStart = clock.now()
+    },
 
     close() {
       if (closed) return

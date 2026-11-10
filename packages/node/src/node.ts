@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path'
 import {
   type Activity,
   approvalFingerprint,
+  assessIsolation,
   BLOCKED_REQUEST_TEXT_MAX,
   type BlockedReason,
   type BlockedRequest,
@@ -17,7 +18,9 @@ import {
   type DeliveredReply,
   fail,
   HUB_TOKEN_ENV,
+  ISOLATION_UNAVAILABLE,
   type IsolationProbeReport,
+  isolationUnavailableMessage,
   LEASE_SLOT_KINDS,
   LEDGER_ID_RE,
   type LeaseGrant,
@@ -35,10 +38,12 @@ import {
   type ReportQuestion,
   type RepoSnapshot,
   type Result,
+  type Role,
   raindownPaths,
   readRaindownEnv,
   redactLines,
   resolveHubUrl,
+  roleIsolationTarget,
   type TaskContract,
   taskBranch,
   VERSION,
@@ -183,6 +188,13 @@ export interface StartNodeOptions {
    * mds 通知的定期重试（审查第四轮：开关关闭时行为严格不变）。
    */
   isolationActive?: boolean
+  /** 运行平台（隔离不可用时区分“平台不支持”与“开关关闭”）；缺省 `process.platform`，测试注入。 */
+  platform?: NodeJS.Platform
+  /**
+   * 领到租约时按名字读取角色配置（无进展阈值与隔离要求）；缺省读取 `config/roles/`。返回 null 表示没有合法的该角色。
+   * 测试注入以避免真实文件 I/O 与虚拟时钟交错。
+   */
+  loadRole?: (name: string) => Promise<Result<Role | null>>
 }
 
 export interface IsolationProbeNodeOptions
@@ -271,6 +283,11 @@ interface Env {
   retryMs: number
   /** 角色设定的无进展阈值（分钟），来自 `config/roles/`。 */
   roleNoProgressMinutes: NoProgressResolver | undefined
+  /**
+   * 角色 `isolation: required` 而本节点未施加隔离时的卡住消息（`isolation_unavailable`，worker-credential-isolation 6.1）；
+   * 给出时不启动 harness，直接以 `blocked(other)` 结束。领到租约时按本地角色配置、能力声明与最近一次探针计算。
+   */
+  isolationBlock?: string
   timeoutGraceMs: number
   deliverTimeoutMs: number
   deliverGiveUpMs: number
@@ -1337,6 +1354,11 @@ class LeaseRunner {
     if (this.released) return
     if (!executor) {
       outcome = fail('failure', 'unknown_executor', `节点没有执行器 ${grant.contract.executor}`)
+    } else if (env.isolationBlock !== undefined) {
+      // 节点侧兜底（6.1）：中枢与节点的判断依据可能短暂不一致，以节点为准；不满足时不启动 harness。
+      // supervisor 无法代为恢复隔离：不委托，直接交给用户。
+      this.noDelegateNext = true
+      outcome = ok({ outcome: 'blocked', reason: 'other', message: env.isolationBlock })
     } else if (!cwd.ok) {
       outcome = ok({
         outcome: 'failed',
@@ -1918,6 +1940,8 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
   }
   const runners = new Map<LeaseRunner, LeaseSlotKind>()
   const stopper = new AbortController()
+  /** 最近一次隔离探针结果；随注册上报，也用于启动 harness 前的隔离兜底（6.1）。旧中枢拒绝该字段后不再上报。 */
+  let latestProbe: IsolationProbeReport | undefined
   const slotWakes = new Set<() => void>()
   const acquireAborts = new Set<AbortController>()
   let cancelJump = () => {}
@@ -1942,23 +1966,72 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
       stopper.signal.addEventListener('abort', done, { once: true })
     })
 
-  /**
-   * 角色设定的无进展阈值：显式传入的 resolver 优先；否则每次领到租约时重新读取
-   * `config/roles/`（改了角色无需重启节点），读取失败时用默认值。
-   */
-  const roleResolver = async (): Promise<NoProgressResolver | undefined> => {
-    if (options.noProgressMinutes) return options.noProgressMinutes
+  const defaultLoadRole = async (name: string): Promise<Result<Role | null>> => {
     const loaded = await loadRoles(home)
-    if (!loaded.ok) return undefined
-    const minutes = new Map(loaded.data.roles.map((r) => [r.name, r.no_progress_minutes]))
-    return (contract) => minutes.get(contract.role)
+    return loaded.ok ? ok(loaded.data.roles.find((r) => r.name === name) ?? null) : loaded
+  }
+
+  /**
+   * 每次领到租约时重新读取 `config/roles/`（改了角色无需重启节点）：
+   * - 无进展阈值：显式传入的 resolver 优先，读取失败时用默认值；
+   * - 隔离要求（6.1）：角色 `isolation: required` 时按本地的能力声明与最近一次探针确认隔离已施加，
+   *   不满足时给出卡住消息（不启动 harness）。读取失败或找不到角色时同样卡住（fail closed）。
+   */
+  const roleContext = async (
+    contract: TaskContract,
+  ): Promise<{ resolver: NoProgressResolver | undefined; isolationBlock?: string }> => {
+    const loaded = await (options.loadRole ?? defaultLoadRole)(contract.role)
+    // 读不到角色时无法确认隔离要求：按 required 不满足处理，不启动 harness（审查第一轮 L1，fail closed）。
+    if (!loaded.ok || !loaded.data) {
+      const why = loaded.ok
+        ? `本节点 ${nodeId} 的 config/roles/ 中没有合法的角色 ${contract.role}（未定义或文件有错，运行 raindown doctor 查看）`
+        : `本节点 ${nodeId} 无法读取角色配置：${loaded.error.code} ${loaded.error.message}`
+      logger.warn(`任务 ${contract.role} 的角色配置不可用，不启动 harness`, why)
+      return {
+        resolver: options.noProgressMinutes,
+        isolationBlock: [
+          `${ISOLATION_UNAVAILABLE}：无法确认角色 ${contract.role} 的隔离要求，未启动 harness`,
+          `- ${why}`,
+          '修正角色配置后重试任务（task_retry）',
+        ].join('\n'),
+      }
+    }
+    const role = loaded.data
+    const resolver: NoProgressResolver =
+      options.noProgressMinutes ??
+      ((c: TaskContract) => (c.role === role.name ? role.no_progress_minutes : undefined))
+    const target = roleIsolationTarget(role, contract)
+    if (target?.requirement !== 'required') return { resolver }
+    const info = registry.info().find((e) => e.type === contract.executor)
+    const assessed = assessIsolation({
+      capabilities: info?.adapter_capabilities ?? {},
+      setting: target.setting,
+      probe: latestProbe ?? null,
+      executor: contract.executor,
+      now: clock.now(),
+      platform: options.platform ?? process.platform,
+    })
+    if (assessed.view.enforced) return { resolver }
+    return {
+      resolver,
+      isolationBlock: isolationUnavailableMessage(target, contract.executor, [
+        `本节点 ${nodeId}：${assessed.missing.join('；')}`,
+      ]),
+    }
   }
 
   const startRunner = async (grant: LeaseGrant, kind: LeaseSlotKind) => {
-    const resolver = await roleResolver()
+    const { resolver, isolationBlock } = await roleContext(grant.contract)
     // 读取角色期间节点被停止：不再启动，租约到期后由中枢按合同处理（与 stop 的语义一致）。
     if (stopper.signal.aborted) return
-    const runner = new LeaseRunner({ ...env, roleNoProgressMinutes: resolver }, grant)
+    const runner = new LeaseRunner(
+      {
+        ...env,
+        roleNoProgressMinutes: resolver,
+        ...(isolationBlock === undefined ? {} : { isolationBlock }),
+      },
+      grant,
+    )
     runners.set(runner, kind)
     void runner.finished.finally(() => {
       runners.delete(runner)
@@ -1966,8 +2039,6 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
     })
   }
 
-  /** 最近一次隔离探针结果；随注册上报。旧中枢拒绝该字段后不再上报。 */
-  let latestProbe: IsolationProbeReport | undefined
   let probeFieldRejected = false
   const register = () =>
     client.register({

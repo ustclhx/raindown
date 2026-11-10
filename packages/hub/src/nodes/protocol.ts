@@ -22,7 +22,10 @@ export const SLEEP_CHECK_MS = 1_000
 
 export interface NodeProtocolOptions
   extends NodeProtocolConfig,
-    Pick<NodeServiceOptions, 'issueWakeToken' | 'issueTaskToken' | 'renewTaskToken' | 'logger'> {
+    Pick<
+      NodeServiceOptions,
+      'issueWakeToken' | 'issueTaskToken' | 'renewTaskToken' | 'logger' | 'roleIsolation'
+    > {
   ledger: LedgerStore
   clock?: HubClock
   onResume?: () => void
@@ -50,7 +53,10 @@ export function createNodeProtocol(o: NodeProtocolOptions): NodeProtocol {
         ledger: o.ledger,
         clock: { now: () => clock.now(), monotonic, setTimeout: clock.setTimeout.bind(clock) },
         ttlMs: o.leaseTtlS * 1000,
-        ...(o.onResume ? { onResume: o.onResume } : {}),
+        onResume: () => {
+          service.resumed()
+          o.onResume?.()
+        },
       })
     : null
   const cancels: Array<() => void> = []

@@ -238,6 +238,10 @@ export const eventPayloads = {
     node_id: nodeId,
     lease_id: leaseId,
     attempt: z.number().int().min(1).meta({ description: '第几次尝试，从 1 开始' }),
+    unisolated: z.string().min(1).max(4000).optional().meta({
+      description:
+        '角色 isolation: preferred 而这次派到的节点未施加隔离时，中枢记下的“未隔离”说明（缺什么）；已隔离或 off 时没有',
+    }),
   }),
   'task.attempt_ended': z.strictObject({
     attempt: z.number().int().min(1),
@@ -1015,7 +1019,8 @@ export const TASK_EVENT_RULES: Readonly<
   'task.reported': { from: ['running'], to: 'unchanged' },
   'task.report_consumed': { from: ['running', 'verifying', 'blocked'], to: 'unchanged' },
   'task.report_conflict': { from: ['running', 'verifying', 'blocked'], to: 'unchanged' },
-  'task.blocked': { from: ['running', 'verifying', 'blocked'], to: 'blocked' },
+  // queued → blocked：只由中枢写入，`isolation: required` 的任务没有可用的已隔离节点（worker-credential-isolation 6.1），不带租约。
+  'task.blocked': { from: ['queued', 'running', 'verifying', 'blocked'], to: 'blocked' },
   'task.out_of_band': {
     from: ['queued', 'running', 'verifying', 'blocked', 'done', 'failed', 'cancelled'],
     to: 'unchanged',

@@ -123,7 +123,8 @@ export type TaskAttemptEndReason = z.infer<typeof taskAttemptEndReason>
 
 /**
  * 状态转换表（task-ledger spec "状态机"）：
- * - queued → running
+ * - queued → running | blocked（blocked 仅用于中枢判定 `isolation: required` 的任务没有可用的已隔离节点，
+ *   `task.blocked(other)` 且消息以 `isolation_unavailable：` 开头，不带租约；worker-credential-isolation 6.1）
  * - running → verifying | done | failed | blocked
  * - verifying → done | failed | blocked
  * - blocked → queued | running | cancelled | failed | done（done 仅用于已存在 PR 判定）
@@ -135,7 +136,7 @@ export type TaskAttemptEndReason = z.infer<typeof taskAttemptEndReason>
  * （node-protocol spec "租约过期处理"），只能由 `task.requeued`（reason=lease_expired）触发。
  */
 export const TASK_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
-  queued: ['running', 'cancelled'],
+  queued: ['running', 'blocked', 'cancelled'],
   running: ['verifying', 'done', 'failed', 'blocked', 'cancelled', 'queued'],
   verifying: ['done', 'failed', 'blocked', 'cancelled', 'queued'],
   blocked: ['queued', 'running', 'cancelled', 'failed', 'done'],

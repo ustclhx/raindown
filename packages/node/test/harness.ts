@@ -154,7 +154,16 @@ export async function bench(
     waitS: 30,
     // 默认不读 config/roles/（真实文件 I/O 与虚拟时钟交错会让时间点不确定）；
     // 需要测角色文件时传 readRoles: true。
-    ...(readRoles ? {} : { noProgressMinutes: () => undefined }),
+    ...(readRoles
+      ? {}
+      : {
+          noProgressMinutes: () => undefined,
+          // 任何角色都存在且不要求隔离（节点兜底对未定义的角色 fail closed）。
+          loadRole: async (name: string) => ({
+            ok: true as const,
+            data: { name, executor: 'fake', prompt: '测试', isolation: 'off' as const },
+          }),
+        }),
     ...startOptions,
   })
   if (!started.ok) throw new Error(started.error.message)

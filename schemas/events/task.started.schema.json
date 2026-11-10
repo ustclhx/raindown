@@ -52,6 +52,12 @@
           "minimum": 1,
           "maximum": 9007199254740991,
           "description": "第几次尝试，从 1 开始"
+        },
+        "unisolated": {
+          "description": "角色 isolation: preferred 而这次派到的节点未施加隔离时，中枢记下的“未隔离”说明（缺什么）；已隔离或 off 时没有",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
         }
       },
       "required": [

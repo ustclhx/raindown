@@ -17,6 +17,7 @@ import {
   type InboxSource,
   inboxShortId,
   isAllowedHumanPrEvent,
+  isIsolationUnavailable,
   type LedgerEvent,
   type LedgerEventDraft,
   type ListTasksQuery,
@@ -1153,6 +1154,20 @@ function createStore(db: Database, opts: OpenLedgerOptions): LedgerStore {
         return ok(null)
       }
       case 'task.blocked': {
+        // queued → blocked 只用于中枢判定隔离不可用（worker-credential-isolation 6.1）：不持有租约、不委托 supervisor。
+        if (
+          task?.status === 'queued' &&
+          (draft.actor !== 'hub' ||
+            draft.payload.reason !== 'other' ||
+            draft.payload.lease_held === true ||
+            !isIsolationUnavailable(draft.payload.message))
+        ) {
+          return noLease(
+            'queued',
+            draft.type,
+            '排队中的任务只能由中枢以 isolation_unavailable 卡住',
+          )
+        }
         if (draft.payload.lease_held && !hasActiveLease(draft.task_id)) {
           return noLease(task?.status ?? null, draft.type, 'lease_held=true 要求任务仍有活动租约')
         }

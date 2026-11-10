@@ -51,6 +51,7 @@ import {
 } from '../ledger/tasks.ts'
 import { createExistingPrReactor, type ExistingPrLookup } from '../nodes/existing-pr.ts'
 import { createNodeProtocol, type NodeProtocol } from '../nodes/protocol.ts'
+import { roleIsolationFromHome } from '../nodes/role-isolation.ts'
 import { createPolicyRoutes } from '../policy/routes.ts'
 import { createPolicyService, type PolicyService } from '../policy/service.ts'
 import { verifyPolicyFromHome } from '../policy/verify.ts'
@@ -267,6 +268,7 @@ export async function runHub(input: RunHubOptions): Promise<Result<RunningHub>> 
         issueTaskToken: (grant) => taskTokens.issue(grant),
         renewTaskToken: (grant) => taskTokens.ensure(grant),
         onResume: () => scheduler?.resume(),
+        roleIsolation: roleIsolationFromHome(options.home, { now: () => clock.now() }),
         ...(options.logger ? { logger: options.logger } : {}),
       })
       // HTTP 路由、/ui 与中枢内渠道共用同一个收件箱操作实现（actOnInbox）。
