@@ -1098,17 +1098,19 @@ isolation:
 | Codex | 按任务的独立 `run/tasks/<任务>/codex-home/`，内部也是白名单（见下文）；`auth.json` 链接的目标**这一个文件** | codex-orca、codex-exec |
 | Claude Code | 按任务的 `run/tasks/<任务>/claude-config/`（`settings*.json`、`CLAUDE.md`、`commands/agents/skills/hooks/plugins/rules/output-styles`、`keybindings.json`、`managed-settings.json`、`.mcp.json` 除外） | claude-sdk |
 | 登录钥匙串 | 只有 `~/Library/Keychains/login.keychain-db` 与 `login.keychain-db.sb-*`（正则） | claude-sdk |
+| pnpm 12 锁目录 | `/private/tmp/pnpm-dir-locks-<uid>`、`pnpm-store-operation-locks-<uid>`、`pnpm-verify-deps-install-locks-<uid>` 及其内容（正则，uid 取节点进程的 `process.getuid()`）；与沙箱外的 pnpm 共用，残留风险见 design Risks | 全部 |
 | 设备 | `/dev/null`、`/dev/zero`、`/dev/tty`、`/dev/ptmx`、`/dev/ttys<N>`（固定正则）、`/dev/fd/`、`/dev/stdout`、`/dev/stderr`、`/dev/random`、`/dev/urandom`、`/dev/dtracehelper` | 全部 |
 | 追加 | `config/node.yaml` 的 `isolation.extra_write` | 全部 |
 
 **不再放行的共享位置（审查第一轮 M2）。** 以下位置的内容会被之后沙箱外的安装、运行直接使用，因此一律不放行：
-- `/private/tmp`、本用户 `TMPDIR` 及同级 `C/`；
+- `/private/tmp`（上表的 pnpm 12 锁目录除外：pnpm 12 把它们写死在 `/private/tmp` 下，不随 `TMPDIR` 变化）、本用户 `TMPDIR` 及同级 `C/`；
 - `~/.cache`、`~/Library/Caches`；
 - `~/.bun/install/cache`、`~/.npm/_cacache`、pnpm store。
 
 worker 的环境（codex-orca 终端命令的 `env` 赋值、codex-exec 子进程环境、claude-sdk 会话环境）改为指向本任务私有目录：
 - `TMPDIR` → `run/tasks/<任务>/tmp`；
-- `XDG_CACHE_HOME`、`BUN_INSTALL_CACHE_DIR`、`npm_config_cache`、`PNPM_STORE_DIR`、`npm_config_store_dir`、`PLAYWRIGHT_BROWSERS_PATH`、`COREPACK_HOME`、`PRE_COMMIT_HOME`、`GOCACHE`、`GOMODCACHE`、`PIP_CACHE_DIR`、`UV_CACHE_DIR` → `run/tasks/<任务>/cache/…`；
+- `XDG_CACHE_HOME`、`BUN_INSTALL_CACHE_DIR`、`npm_config_cache`、`PNPM_STORE_DIR`、`npm_config_store_dir`、`pnpm_config_store_dir`、`pnpm_config_cache_dir`、`PLAYWRIGHT_BROWSERS_PATH`、`COREPACK_HOME`、`PRE_COMMIT_HOME`、`GOCACHE`、`GOMODCACHE`、`PIP_CACHE_DIR`、`UV_CACHE_DIR` → `run/tasks/<任务>/cache/…`；
+- pnpm 12 忽略 `npm_config_store_dir` 与 `PNPM_STORE_DIR`、只认 `pnpm_config_*`（不设时 store 退回共享的 `/private/tmp/.pnpm-store`），两套变量都注入，旧变量留给更早的 pnpm；
 - `BUN_RUNTIME_TRANSPILER_CACHE_PATH=0`；Claude Code 的 `CLAUDE_CODE_TMPDIR` 也改到任务 `tmp/`。
 
 这些目录的清理时机：

@@ -19,6 +19,7 @@ import {
   keychainWriteRegex,
   normalizeExtraWrite,
   PERSISTENCE_PATHS,
+  pnpmLockWriteRegex,
   resolveGitLayout,
   WRITE_ALLOWLIST_DEVICE_DIRS,
   WRITE_ALLOWLIST_DEVICES,
@@ -160,6 +161,8 @@ export interface IsolationSpecInput {
   sealedClone?: string
   /** 是否放行登录钥匙串文件（Claude Code 刷新凭证，审查第一轮 M3）；缺省 false。 */
   allowKeychain?: boolean
+  /** 当前用户 uid（pnpm 12 锁目录名的一部分）；缺省为 `process.getuid()`，不可得时（非 POSIX）不放行锁目录。 */
+  uid?: number
 }
 
 /** 与节点写派工令牌时相同的路径段规则：不以 `.` 开头，因此排除 `.` 与 `..`。 */
@@ -439,6 +442,9 @@ export async function computeIsolationSpec(
     allowWriteLiterals.push(...WRITE_ALLOWLIST_DEVICES)
     allowWrite.push(...WRITE_ALLOWLIST_DEVICE_DIRS)
     if (input.allowKeychain) allowWriteRegex.push(keychainWriteRegex(realUserHome))
+    // pnpm 12 写死在 `/private/tmp` 下的锁目录（只这三个目录；受保护项的拒绝写在其后，仍然优先）。
+    const uid = input.uid ?? process.getuid?.()
+    if (uid !== undefined) allowWriteRegex.push(pnpmLockWriteRegex(uid))
     // 登记仓库的 git 目录整体只读；只有本任务独立 clone 的 `.git` 放行（配置、hooks、alternates 等写在最后拒绝）。
     const registeredGitDirs: string[] = []
     for (const r of input.registeredRepos ?? []) registeredGitDirs.push(await c(join(r, '.git')))

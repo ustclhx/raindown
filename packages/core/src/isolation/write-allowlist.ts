@@ -47,8 +47,12 @@ export function taskScratchEnv(home: string, taskId: string): Record<string, str
     BUN_INSTALL_CACHE_DIR: join(cache, 'bun'),
     BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0',
     npm_config_cache: join(cache, 'npm'),
+    // pnpm 12 只认 `pnpm_config_*`（忽略 `npm_config_store_dir` 与 `PNPM_STORE_DIR`，未设置时退回共享的 `/private/tmp/.pnpm-store`）；
+    // 旧变量保留给更早的 pnpm。`pnpm_config_cache_dir` 显式指定元数据缓存，不依赖 `XDG_CACHE_HOME` 的推导（pnpm 12.8.1 实测两者都生效）。
     PNPM_STORE_DIR: join(cache, 'pnpm-store'),
     npm_config_store_dir: join(cache, 'pnpm-store'),
+    pnpm_config_store_dir: join(cache, 'pnpm-store'),
+    pnpm_config_cache_dir: join(cache, 'pnpm'),
     PLAYWRIGHT_BROWSERS_PATH: join(cache, 'ms-playwright'),
     COREPACK_HOME: join(cache, 'corepack'),
     PRE_COMMIT_HOME: join(cache, 'pre-commit'),
@@ -69,6 +73,20 @@ export const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&
  */
 export const keychainWriteRegex = (realUserHome: string) =>
   `^${escapeRegex(join(realUserHome, 'Library', 'Keychains', 'login.keychain-db'))}(\\.sb-[^/]+)?$`
+
+/** pnpm 12 写死在 `/private/tmp` 下、不随 `TMPDIR` 变化的锁目录（`<名字>-locks-<uid>`）。 */
+export const PNPM_LOCK_DIR_NAMES = ['dir', 'store-operation', 'verify-deps-install'] as const
+
+/**
+ * pnpm 12 的锁目录（`/private/tmp/pnpm-(dir|store-operation|verify-deps-install)-locks-<uid>` 及其内容）：
+ * 不放行时 `pnpm install` 报 `ERR_PNPM_STORE_DIR_OPEN_OPERATION_LOCK`。只放行这三个目录，`/private/tmp` 其余位置仍拒绝。
+ * uid 只接受非负整数（来自 `process.getuid()`），不接受外部字符串。
+ * 残留风险：这些目录与沙箱外的 pnpm 共用，worker 可以在其中预埋文件或符号链接（锁竞争、经链接创建空文件），见 design Risks。
+ */
+export function pnpmLockWriteRegex(uid: number): string {
+  if (!Number.isSafeInteger(uid) || uid < 0) throw new Error(`uid 不合法：${JSON.stringify(uid)}`)
+  return `^/private/tmp/pnpm-(${PNPM_LOCK_DIR_NAMES.join('|')})-locks-${uid}(/|$)`
+}
 
 /**
  * 会在沙箱外被执行或加载的持久化位置（相对用户主目录）。
