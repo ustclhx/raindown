@@ -1373,7 +1373,11 @@ extends = ":workspace"            # read-only 角色为 ":read-only"
 - **只读例外的检查（审查第一轮 H2）**：每个 `"read"` 例外都必须是规范化后的真实路径、不是符号链接、是普通文件或目录；`CODEX_HOME/tmp` 必须是真实目录
   （不存在时节点创建为 0700 目录）。否则（例如 `tmp` 被换成指向 `state/` 的链接）不生成 profile、不启动，错误码 `codex_profile_unsafe_read`。
 - 写入不另设白名单：由 Codex 沙箱决定（`:workspace` 只放行工作区与临时目录，`:read-only` 全部拒绝）；写类角色工作目录 `.git` 中会在沙箱外被执行或加载的
-  hooks、config 等以 `"read"` 收回为只读（更具体的条目优先）。`.git/objects`、refs 等仍可写（commit 需要）。不存在的指针（例如 `commondir`）无法预先声明。
+  hooks、config 等以 `"read"` 收回为只读（更具体的条目优先）。`.git/objects`、refs 等仍可写（commit 需要）。
+  `.git/hooks/`、`.git/info/` 不存在时节点先建成空目录再声明（审查第二轮，否则 worker 可以新建它们）；文件类的指针（`config.worktree`、`commondir`、`gitdir`）
+  不能预先创建（会改变 git 的行为），不存在时无法声明。
+- **受保护路径位于可写工作目录之内**（工作目录是某个受保护路径的祖先，例如把用户主目录或 raindown-home 的上级当作工作目录）时，worker 可以改名其上级目录
+  绕过按路径的拒绝：workspace-write 下拒绝启动，错误码 `codex_profile_protected_in_workdir`（审查第二轮）。
   **已实测（2026-11-10，codex-cli 0.167.0）**：不加这些条目时 `:workspace` **允许**写 `.git/hooks` 与 `.git/config`（`git config core.fsmonitor …` 成功，
   随后的 `git status` 执行了它）；加上 `"<repo>/.git/hooks"="read"`、`"<repo>/.git/config"="read"` 后，写 hooks、追加 config、`git config` 全部
   `Operation not permitted`，`git status`、`add`、`commit`、`checkout -b` 正常。所以这两项条目是必需的，不是纵深防御。
@@ -1391,10 +1395,16 @@ profile 内容只来自节点与角色配置，worker 写不了：它不落盘�
 1. 该执行器 × 沙箱设置最近一次探针**以 native 运行且通过**，结果未过期（12 小时）；
 2. 这次启动用的 codex 与探针用的是**同一个可执行文件**：节点按 worker 的 PATH（codex-exec 为 spawn 的环境，codex-orca 为 worker 环境的 PATH）
    把 codex 解析为真实路径，按真实路径 + mtime + 大小 + inode 比较；启动命令改用这个绝对路径（codex-orca 的终端命令同样，不再依赖终端 shell 的 PATH）；
-3. 角色打开了网络时，探针也是以打开网络的 profile 运行的。
+3. 联网与不联网分组（审查第二轮 M2）：角色打开了网络时，看的是以打开网络的 profile 运行的那次探针，不联网的角色看不联网的那次。
 
 任何一项不满足都不启动（fail closed），任务以 `failed`、原因 `isolation_not_applied` 结束并写明哪一项；可执行文件变化（例如 Codex 升级）时节点同时请求立刻重新自检，
-通过后重试即可。没有配置探针（`SeatbeltOptions.nativeGate` 缺省）时 native 一律不启动。
+通过后重试即可；同一个不一致（例如 worker 与节点的 PATH 不同，重新自检后仍不同）只请求一次。探针运行期间记录的 codex 身份先暂存，
+到节点把这一轮报告交给闸门时才与报告一起生效。没有配置探针（`SeatbeltOptions.nativeGate` 缺省）时 native 一律不启动。
+
+**沙箱设置按本执行器推算（审查第二轮 M1）。** 执行器一律按 `{ ...角色, executor: <本执行器> }` 推算沙箱设置，与中枢派送、节点兜底的 `roleIsolationTarget`
+同一函数：角色的 `executor` 可能与合同不同（例如 claude-sdk 角色被合同派给 codex-exec，按 codex-exec 推算为 read-only 并施加 native）。
+纵深防御：角色 `isolation: required` 且节点判定已隔离时，节点把判定所依据的（沙箱设置、施加层、联网）经 `ExecutorContext.isolationExpected` 交给执行器，
+执行器实际要施加的与之不符就不启动 harness（`isolation_not_applied`）；codex-orca、codex-exec、claude-sdk 都核对。
 
 **启动参数。** 施加时不再传 `-s <mode>`，改传（官方要求 `default_permissions` 不与 `sandbox_mode` 混用）：
 
@@ -1426,13 +1436,15 @@ profile 内容只来自节点与角色配置，worker 写不了：它不落盘�
 
 1. 按节点的 PATH 把 codex 解析为绝对路径，运行 `<codex> --version`（不调用模型；按真实路径 + mtime 等身份缓存），版本低于 0.167.0、无法识别或找不到时失败，
    错误码 `native_codex_unsupported`，doctor 提示升级 Codex；
-2. CODEX_HOME 是该执行器实际使用的目录（与 worker 相同地 `prepareCodexHome`）；profile 用与 worker 启动相同的 `codexNativeProfileFromSpec` 从同一份隔离清单生成，
-   带上该执行器 × 沙箱设置下角色的网络设置（任一角色打开网络即以打开网络的 profile 运行）与 `sandbox_workspace_write.*` 配置；
-3. 以 `env CODEX_HOME=<执行器的 CODEX_HOME> <codex 绝对路径> sandbox [-c 角色配置…] -c 'permissions.<名>=<内联表>' -c 'default_permissions="<名>"' -- <bun> child.ts`
+2. CODEX_HOME 是探针自己的临时目录（`run/tasks/<探针任务>/codex-home/`），结构与执行器的一致（`prepareCodexHome`：config.toml、链接到同一来源的 auth.json；`tmp/`）。
+   探针**不改动**执行器真实的 CODEX_HOME（其中的 auth.json 链接正被运行中的 worker 使用，审查第二轮）。profile 用与 worker 启动相同的 `codexNativeProfileFromSpec`
+   从同一份隔离清单生成，带上该组的网络设置与角色的 `sandbox_workspace_write.*` 配置。施加 native 的执行器 × workspace-write 下有联网角色时，
+   另以打开网络的 profile 再探测一次（结果带 `network: true`），联网与不联网的角色分别判定（审查第二轮 M2）；codex 按与 worker 相同的 PATH（节点的 `executorEnv()`）解析；
+3. 以 `env CODEX_HOME=<探针的 CODEX_HOME> <codex 绝对路径> sandbox [-c 角色配置…] -c 'permissions.<名>=<内联表>' -c 'default_permissions="<名>"' -- <bun> child.ts`
    启动探针子进程（与 worker 相同用 `default_permissions` 选中 profile）；所用 codex 的身份与网络设置记入启动闸门；
 4. 探针工作目录放在 `/var/tmp` 下（`nativeTmpDir`），不在 `$TMPDIR` 或 `/tmp` 下：`:workspace` 本来就放行那两处，在那里可写证明不了工作目录可写；
-5. `write.shell_startup`（探针自建的模拟 home）与 `rename.protected_ancestor`（探针自建的改名目录）位于 raindown-home 内，探针的 profile 把这两个目录声明为 `"read"`，
-   否则它们被 raindown-home 的整体拒绝覆盖，证明不了 Codex 沙箱对工作区之外的写限制；
+5. `write.shell_startup`（探针自建的模拟 home）与 `rename.protected_ancestor`（探针自建的改名目录）放在 raindown-home 之外、与工作目录同级的临时目录中
+   （同在 `/var/tmp` 下，不在任何可写根内），不声明任何例外，测的是 `:workspace` 对工作区之外的真实写限制（审查第二轮）；
 6. `codex sandbox` 非零退出时该组合失败，原因提示“Codex 可能不支持 permissions profile 或拒绝了生成的 profile”。
 
 判定：与 seatbelt 相同的读拒绝项为必过项（`read.hub_token`、`read.ledger_db`、`read.other_task_token`），另加 `write.config`、
@@ -1442,13 +1454,16 @@ profile 内容只来自节点与角色配置，worker 写不了：它不落盘�
 `write.registered_git`（native 的写类角色直接在登记仓库中工作，由 git_hooks / git_config 覆盖）、`write.shared_tmp`（`:workspace` 放行 TMPDIR）、
 `connect.hub`（worker 经沙箱外的 MCP 访问中枢）。测试用假的 codex 脚本截获参数（`isolation-probe.test.ts`「native 探针」），不运行真实 codex。
 
-**网络打开的角色。** profile 不能按端口拒绝本机 TCP：角色打开了 `sandbox_workspace_write.network_access` 时，探针以打开网络的 profile 运行，
-Orca 端口已解析时 `connect.orca_port.*` 可连，探针不通过，`enforced` 为 false，doctor 提示“native 挡不住本机 TCP，按未施加处理”；闸门因此不放行这类启动。
+**网络打开的角色。** profile 不能按端口拒绝本机 TCP：联网组的探针以打开网络的 profile 运行，Orca 端口已解析时 `connect.orca_port.*` 可连，
+联网组不通过，联网角色按未施加处理（`required` 卡住、闸门不放行），doctor 另起一行“<执行器> × workspace-write（联网角色）”并提示原因；
+不联网的角色看自己那一组的结果，不受影响（审查第二轮 M2）。旧版中枢不认识探针结果的 `network` 字段，会把两组当作同一设置（取第一条，即不联网组），
+升级中枢后恢复区分。
 
 **局限。**
 - Codex 进程本身及其内置工具、MCP 服务器（任务绑定的 raindown MCP 是可信代码）、经审批越出沙箱的命令都不受 profile 约束；
 - 预置信任的项目里，worker 在运行期间新建的 `.codex/config.toml` 由 codex-orca 每次派工前的检查拦截（`blockProjectConfig`）；随机 profile 名使其无法向本次 profile 追加条目；
-- 写类角色工作目录 `.git` 中不存在的指针（`commondir` 等）无法预先收回为只读；
+- 写类角色工作目录 `.git` 中不存在的文件类指针（`commondir`、`gitdir`、`config.worktree`）无法预先收回为只读；
+- `core.hooksPath` 指向仓库中被跟踪的目录（例如 husky 的 `.husky/`）时，hook 在可写的工作目录中，worker 可以改写，用户或节点之后在沙箱外运行 git 时执行（design Risks）；
 - **未验证（需要用真实 codex 验收）**：`codex exec` / Codex TUI 只传 `-c default_permissions=…` 时是否使用该 profile；`-c` 传入的内联 profile 能否被正确解析；
   CODEX_HOME 整体拒绝、只放行 `tmp/` 时 `apply_patch` 等 arg0 别名是否正常。验收命令见下（`codex sandbox` 部分与 `.git` 收回只读已于 2026-11-10 在 codex-cli 0.167.0 上实测通过）。
 

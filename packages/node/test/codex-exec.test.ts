@@ -1093,7 +1093,7 @@ describe('native：Codex permissions profile（worker-credential-isolation 5.1�
   /** 探针通过、用的是同一个“codex”（测试中为 bun 本身）的闸门；网络打开的探针结果。 */
   const gate = () =>
     passingNativeGate('codex-exec', ['read-only', 'workspace-write'], process.execPath, {
-      network: true,
+      networks: [false, true],
     })
   const isolation = (
     s: ReturnType<typeof setup>,
@@ -1106,11 +1106,17 @@ describe('native：Codex permissions profile（worker-credential-isolation 5.1�
     env: {},
     ...(nativeGate ? { nativeGate } : {}),
   })
-  const withToken = async (s: ReturnType<typeof setup>) => ({
-    ...s.ctx,
-    hubUrl,
-    leaseTokenFile: await writeLeaseTokenFile(s.home, 't-test', 'l-1', 'lease-token'),
-  })
+  /** 工作目录不能是 raindown-home 的祖先（审查第二轮：受保护路径在可写工作目录内时 native 拒绝启动），另建 work/。 */
+  const withToken = async (s: ReturnType<typeof setup>) => {
+    const cwd = join(s.dir, 'work')
+    mkdirSync(cwd, { recursive: true })
+    return {
+      ...s.ctx,
+      cwd,
+      hubUrl,
+      leaseTokenFile: await writeLeaseTokenFile(s.home, 't-test', 'l-1', 'lease-token'),
+    }
+  }
   /** argv 中 `-c` 的值。 */
   const configs = (args: string[]) =>
     args.flatMap((a, i) => (args[i - 1] === '-c' && i > 0 ? [a] : []))
@@ -1289,7 +1295,7 @@ describe('native：Codex permissions profile（worker-credential-isolation 5.1�
       outcome: 'failed',
       result: { reason: 'isolation_not_applied' },
     })
-    expect(JSON.stringify(outcome)).toContain('network_access')
+    expect(JSON.stringify(outcome)).toContain('联网角色')
     expect(s.launched()).toBe(false)
   })
 
@@ -1333,5 +1339,78 @@ describe('native：Codex permissions profile（worker-credential-isolation 5.1�
     const tmp = join(readCodexHome(s2.home), 'tmp')
     expect(lstatSync(tmp).isDirectory()).toBe(true)
     expect(lstatSync(tmp).isSymbolicLink()).toBe(false)
+  })
+
+  test('审查第二轮 M1：角色的 executor 是 claude-sdk（没有 permissions.sandbox）而合同派给 codex-exec 时，按 codex-exec × read-only 施加 native', async () => {
+    const s = setup('send(resumed)', { executor: 'claude-sdk' })
+    const ctx = {
+      ...(await withToken(s)),
+      isolationExpected: { setting: 'read-only', layer: 'native', network: false },
+    }
+    const { outcome } = await collect(
+      s.run(ctx, { ...s.options, isolation: isolation(s), nativeProfileName: NAME }),
+    )
+    expect(outcome.outcome).toBe('done')
+    const args = s.report().args
+    expect(args).not.toContain('-s')
+    expect(configs(args)).toContain(`default_permissions="${NAME}"`)
+  })
+
+  test('审查第二轮 M1（纵深防御）：节点判定的隔离与执行器实际要施加的不一致时不启动', async () => {
+    const s = setup('send(resumed)', { permissions: { sandbox: 'read-only' } })
+    const ctx = {
+      ...(await withToken(s)),
+      isolationExpected: { setting: 'danger-full-access', layer: 'seatbelt', network: false },
+    }
+    const { outcome } = await collect(
+      s.run(ctx, { ...s.options, isolation: isolation(s), nativeProfileName: NAME }),
+    )
+    expect(outcome).toMatchObject({
+      outcome: 'failed',
+      result: { reason: 'isolation_not_applied' },
+    })
+    expect(JSON.stringify(outcome)).toContain('不一致')
+    expect(s.launched()).toBe(false)
+    // 开关关闭（实际不施加）而节点按已隔离判定：同样不启动。
+    const off = setup('send(resumed)', { permissions: { sandbox: 'read-only' } })
+    const { outcome: o2 } = await collect(
+      off.run(
+        {
+          ...(await withToken(off)),
+          isolationExpected: { setting: 'read-only', layer: 'native', network: false },
+        },
+        { ...off.options, isolation: isolation(off, false) },
+      ),
+    )
+    expect(o2).toMatchObject({ outcome: 'failed', result: { reason: 'isolation_not_applied' } })
+    expect(off.launched()).toBe(false)
+  })
+
+  test('审查第二轮：受保护路径位于可写工作目录之内（工作目录是 raindown-home 的祖先）时 workspace-write 不启动', async () => {
+    const s = setup('send(resumed)', { permissions: { sandbox: 'workspace-write' } })
+    // s.ctx.cwd 是测试目录本身，raindown-home 在它之下。
+    const ctx = { ...(await withToken(s)), cwd: s.dir }
+    const { outcome } = await collect(
+      s.run(ctx, { ...s.options, isolation: isolation(s), nativeProfileName: NAME }),
+    )
+    expect(outcome).toMatchObject({
+      outcome: 'failed',
+      result: { reason: 'codex_profile_protected_in_workdir' },
+    })
+    expect(s.launched()).toBe(false)
+  })
+
+  test('审查第二轮：写类角色工作目录的 .git 缺少 hooks/、info/ 时节点先建空目录再声明 read', async () => {
+    const s = setup('send(resumed)', { permissions: { sandbox: 'workspace-write' } })
+    const ctx = await withToken(s)
+    const git = join(ctx.cwd, '.git')
+    mkdirSync(join(git, 'objects'), { recursive: true })
+    writeFileSync(join(git, 'HEAD'), 'ref: refs/heads/main\n')
+    writeFileSync(join(git, 'config'), '[core]\n')
+    await collect(s.run(ctx, { ...s.options, isolation: isolation(s), nativeProfileName: NAME }))
+    const real = realpathSync(git)
+    for (const sub of ['hooks', 'info']) expect(lstatSync(join(real, sub)).isDirectory()).toBe(true)
+    const def = configs(s.report().args).find((v) => v.startsWith(`permissions.${NAME}=`)) as string
+    for (const p of ['hooks', 'info', 'config']) expect(def).toContain(`"${join(real, p)}"="read"`)
   })
 })

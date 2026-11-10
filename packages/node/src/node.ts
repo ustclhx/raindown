@@ -61,6 +61,7 @@ import {
   type ExecutorRegistry,
   type ExecutorRun,
   type InjectResult,
+  type IsolationExpectation,
   isIdleSignal,
   isResumedSignal,
   type StuckVerdict,
@@ -294,6 +295,8 @@ interface Env {
    * 给出时不启动 harness，直接以 `blocked(other)` 结束。领到租约时按本地角色配置、能力声明与最近一次探针计算。
    */
   isolationBlock?: string
+  /** required 判定所依据的隔离（交给执行器核对，PR #104 审查第二轮 M1）。 */
+  isolationExpected?: IsolationExpectation
   timeoutGraceMs: number
   deliverTimeoutMs: number
   deliverGiveUpMs: number
@@ -1459,6 +1462,7 @@ class LeaseRunner {
             }),
           },
           signal: this.abort.signal,
+          ...(env.isolationExpected ? { isolationExpected: env.isolationExpected } : {}),
           ...(grant.resume ? { resume: grant.resume } : {}),
           ...(grant.recovery ? { recovery: grant.recovery } : {}),
           ...(grant.inputs?.length ? { inputs: grant.inputs } : {}),
@@ -1990,7 +1994,11 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
    */
   const roleContext = async (
     contract: TaskContract,
-  ): Promise<{ resolver: NoProgressResolver | undefined; isolationBlock?: string }> => {
+  ): Promise<{
+    resolver: NoProgressResolver | undefined
+    isolationBlock?: string
+    isolationExpected?: IsolationExpectation
+  }> => {
     const loaded = await (options.loadRole ?? defaultLoadRole)(contract.role)
     // 读不到角色时无法确认隔离要求：按 required 不满足处理，不启动 harness（审查第一轮 L1，fail closed）。
     if (!loaded.ok || !loaded.data) {
@@ -2017,12 +2025,21 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
     const assessed = assessIsolation({
       capabilities: info?.adapter_capabilities ?? {},
       setting: target.setting,
+      network: target.network,
       probe: latestProbe ?? null,
       executor: contract.executor,
       now: clock.now(),
       platform: options.platform ?? process.platform,
     })
-    if (assessed.view.enforced) return { resolver }
+    if (assessed.view.enforced && target.setting !== undefined)
+      return {
+        resolver,
+        isolationExpected: {
+          setting: target.setting,
+          layer: assessed.view.layer,
+          network: target.network,
+        },
+      }
     return {
       resolver,
       isolationBlock: isolationUnavailableMessage(target, contract.executor, [
@@ -2032,7 +2049,7 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
   }
 
   const startRunner = async (grant: LeaseGrant, kind: LeaseSlotKind) => {
-    const { resolver, isolationBlock } = await roleContext(grant.contract)
+    const { resolver, isolationBlock, isolationExpected } = await roleContext(grant.contract)
     // 读取角色期间节点被停止：不再启动，租约到期后由中枢按合同处理（与 stop 的语义一致）。
     if (stopper.signal.aborted) return
     const runner = new LeaseRunner(
@@ -2040,6 +2057,7 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
         ...env,
         roleNoProgressMinutes: resolver,
         ...(isolationBlock === undefined ? {} : { isolationBlock }),
+        ...(isolationExpected === undefined ? {} : { isolationExpected }),
       },
       grant,
     )

@@ -93,6 +93,7 @@ async function start(
     hubUrl?: string
     nativeProfileName?: string
     codexBin?: string
+    isolationExpected?: { setting: string; layer: string; network: boolean }
   } = {},
 ) {
   h = extra.home ?? orcaHome()
@@ -134,6 +135,7 @@ async function start(
     ...(extra.inputs ? { inputs: extra.inputs } : {}),
     ...(extra.leaseTokenFile ? { leaseTokenFile: extra.leaseTokenFile } : {}),
     ...(extra.hubUrl ? { hubUrl: extra.hubUrl } : {}),
+    ...(extra.isolationExpected ? { isolationExpected: extra.isolationExpected } : {}),
     ...(extra.reportResumeReplyDropped
       ? { reportResumeReplyDropped: extra.reportResumeReplyDropped }
       : {}),
@@ -2608,6 +2610,45 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
     await ready(o2)
     expect(created(o2)[0]).toContain('approvals_reviewer=auto_review')
     await o2.run.cancel()
+  })
+
+  test('审查第二轮 M1：角色的 executor 是 claude-sdk、合同派给 codex-orca 时按 codex-orca 推算设置，施加 native', async () => {
+    const home = orcaHome()
+    writeFileSync(
+      join(home.home, 'config/roles/dev.yaml'),
+      'name: dev\nexecutor: claude-sdk\nprompt: dev.md\npermissions:\n  approval: on-request\n  sandbox: workspace-write\n',
+    )
+    const s = await start({}, (o) => o.show('working'), {
+      home,
+      leaseTokenFile: await token(home, 'l-1'),
+      hubUrl: HUB,
+      ...nativeOn(home),
+      isolationExpected: { setting: 'workspace-write', layer: 'native', network: false },
+    })
+    await ready(s)
+    expect(s.outcome()).toBeUndefined()
+    const [command] = created(s)
+    expect(command).toContain(`-c 'default_permissions="${NATIVE}"'`)
+    expect(command).not.toContain(' -s ')
+    await s.run.cancel()
+  })
+
+  test('审查第二轮 M1（纵深防御）：节点判定的隔离与实际要施加的不一致时不启动终端', async () => {
+    const home = orcaHome()
+    nativeRole(home)
+    const s = await start({}, (o) => o.show('working'), {
+      home,
+      leaseTokenFile: await token(home, 'l-1'),
+      hubUrl: HUB,
+      ...nativeOn(home),
+      isolationExpected: { setting: 'workspace-write', layer: 'native', network: true },
+    })
+    await ready(s)
+    expect(s.outcome()).toMatchObject({
+      ok: true,
+      data: { outcome: 'failed', result: { reason: 'isolation_not_applied' } },
+    })
+    expect(s.orca.ops('terminalCreate')).toEqual([])
   })
 
   test('审查第一轮 H1：没有通过的隔离自检（无闸门）时 fail closed，不启动终端', async () => {

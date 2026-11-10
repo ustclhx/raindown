@@ -443,6 +443,8 @@ export interface IsolationStatusRow {
   ran_at: string | null
   macos_version: string | null
   run?: IsolationProbeRun
+  /** native 的联网组（PR #104 审查第二轮 M2）：只给联网角色看的探针结果。 */
+  network?: boolean
 }
 
 /** 列出节点每个执行器 × 沙箱设置的隔离状态；执行器未上报 `credential_isolation` 时给出一行 `setting: '—'`。 */
@@ -473,6 +475,27 @@ export function isolationStatusRows(
       continue
     }
     for (const setting of Object.keys(declared.layers).sort()) {
+      // 联网组（native）另起一行：联网与不联网的角色各看各的结果。
+      const netRun = findProbeRun(report, e.type, setting, true)
+      if (netRun && report) {
+        const view = credentialIsolationFor(
+          e.adapter_capabilities,
+          setting as never,
+          { run: netRun, ran_at: report.ran_at },
+          now,
+        )
+        rows.push({
+          executor: e.type,
+          setting,
+          declared_layer: declared.layers[setting] ?? 'none',
+          enforced: view.enforced,
+          probe: probeRunPassed(netRun) ? 'passed' : 'failed',
+          ran_at: report.ran_at,
+          macos_version: report.macos_version,
+          run: netRun,
+          network: true,
+        })
+      }
       const run = findProbeRun(report, e.type, setting)
       const view = credentialIsolationFor(
         e.adapter_capabilities,
@@ -506,7 +529,7 @@ export function isolationStatusRows(
 export function describeIsolationStatus(row: IsolationStatusRow, indent = '    '): string[] {
   if (row.setting === '—') return [`${row.executor}：未上报凭证隔离能力（按 none 处理，未探测）`]
   const applied = row.enforced ? '已施加' : '未施加'
-  const head = `${row.executor} × ${row.setting}：声明 ${row.declared_layer}，${applied}`
+  const head = `${row.executor} × ${row.setting}${row.network ? '（联网角色）' : ''}：声明 ${row.declared_layer}，${applied}`
   switch (row.probe) {
     case 'not_applicable':
       return [`${head}；施加层为 none，不探测`]

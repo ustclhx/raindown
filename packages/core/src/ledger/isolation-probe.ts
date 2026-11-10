@@ -61,6 +61,10 @@ export const isolationProbeRun = z
       description:
         '受保护项全部被拒绝、允许项全部可用（跳过与未验证不计入），且至少一个受保护项确实被拒绝',
     }),
+    network: z.boolean().optional().meta({
+      description:
+        'native（Codex permissions profile）下是否以打开网络的 profile 运行（角色打开 sandbox_workspace_write.network_access）；缺省 false',
+    }),
     items: z.array(isolationProbeItem).max(64),
     error: z
       .object({ code: z.string().max(64), message: z.string().max(1000) })
@@ -172,6 +176,10 @@ export function findProbeRun(
   report: IsolationProbeReport | null | undefined,
   executor: string,
   setting: string,
+  /** 只找以（不）联网 profile 运行的结果（native 按网络分别探针，PR #104 审查第二轮 M2）；缺省 false。 */
+  network = false,
 ): IsolationProbeRun | undefined {
-  return report?.runs.find((r) => r.executor === executor && r.setting === setting)
+  return report?.runs.find(
+    (r) => r.executor === executor && r.setting === setting && (r.network === true) === network,
+  )
 }

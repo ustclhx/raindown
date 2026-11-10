@@ -167,6 +167,9 @@ seatbelt 的规则后者优先，允许项写得最窄（具体文件，而不�
   - **会话记录与本任务的 Codex 配置**：独立 CODEX_HOME（整体可写）与按任务的 Claude 配置目录中的会话记录可被改写（提示注入，不是命令执行）；独立 CODEX_HOME 中的 `config.toml`、`.env` 等也可被改写，但该目录只被本任务沙箱内的 Codex 读取，影响限于本任务且仍在沙箱内。
   - **mds**：`<DARWIN_USER_CACHE_DIR>/mds/` 与沙箱外所有使用 Security 框架的进程共用。经符号链接、目录、FIFO 让沙箱外进程写到 `mds/` 之外的途径由 `(deny file-write-create … (require-not (vnode-type REGULAR-FILE)))` 关闭（PR #101 审查第一轮）；残留的是 worker 在 harness 运行期间改写其中普通文件的内容（例如篡改数据库），沙箱外进程会读到，影响未完全排除。节点在每次启动 harness 前与全部已有基线比较、结束后按基线校验，有变化即重置并通知；codex-orca 终端在阻塞期间继续运行时基线保留到终端结束，期间其他任务启动前的比较同样覆盖它。沙箱外进程同时合法更新也会触发重置，重置也可能删除其他同时运行的任务或沙箱外进程正在写入的文件，macOS 会重建它们。基线只保存已知良好的哈希、重置后不刷新（审查第三轮：内容无法区分 macOS 重建与 worker 重写；与已知良好哈希相同或缺失算正常，内容不同就再次重置），篡改的内容因此不会被保留；节点级的已知良好快照 `state/mds-known-good.json`（审查第四轮）在每次记录新基线、节点启动时先比较并重置，覆盖没有基线的时间段，新基线复制它的哈希；harness 的任何退出路径都结束其进程组（codex-exec、claude-sdk；codex-orca 的终端由 Orca 关闭），但调用 `setsid` 的子进程仍可离开进程组、在 harness 结束后继续运行并改写 mds，这类改动由已知良好快照在下一次记录基线或节点启动时发现并重置（残余窗口为两次检查之间）；通知按（任务，文件名）每个基线只发一条，重复重置只计数，同一文件超过 5 次时另发一条“反复重置”的 Digest；终端已不存在的 hold 基线在节点启动或下次启动新终端时做最后一次校验并删除。
   - **Codex 项目配置**：预置信任后，Codex 会加载 clone 内的 `.codex/config.toml`。`notify`、`model_provider` 用命令行固定，`.codex/` 出现即停下，但 `model_providers` 表、`mcp_servers` 等覆盖不了的项，在出现到下一次检查之间可能生效；它们只在外层 seatbelt 内生效（审查第二轮 L2）。
+  - **native 下被跟踪的 hooks 目录**（PR #104 审查第二轮）：写类 native 角色直接在登记仓库（或 Orca worktree）中工作，profile 只把 `.git/hooks`、`.git/config` 等收回为只读；
+    `core.hooksPath` 指向被跟踪目录（例如 husky 的 `.husky/`）时，hook 在可写的工作目录中，worker 可以改写，之后在沙箱外运行 git 时被执行。
+    需要隔离的写类角色优先用外层 seatbelt（独立 clone）；或在角色说明中禁止改写 hooks 目录并在审查时检查。
   - **手动运行 git**：用户在任务 clone 中手动运行 git 时，git 会跟随 worker 预埋在 `.git` 中的符号链接写入（例如 `COMMIT_EDITMSG`、已有的 reflog）。
   → 写入文档；4.5 验收后按实际情况决定是否进一步收紧。
 - [写白名单误伤 harness 或工具链]

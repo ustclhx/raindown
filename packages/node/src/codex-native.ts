@@ -15,6 +15,7 @@ import {
   executorRunDir,
   fail,
   type IsolationSpec,
+  isWithin,
   ok,
   type Result,
   type Role,
@@ -49,11 +50,8 @@ export const CODEX_NATIVE_MIN_VERSION = '0.167.0'
 /** 施加 native 时从角色 `permissions.config` 中去掉的键：沙箱改由 permissions profile 决定，二者不混用。 */
 export const NATIVE_DROPPED_CONFIG_KEYS: readonly string[] = ['sandbox_mode']
 
-/** 角色是否打开了 workspace-write 的网络（`-c sandbox_workspace_write.network_access=true`）。 */
-export function roleNetworkEnabled(config: Readonly<Record<string, unknown>> | undefined): boolean {
-  const v = config?.['sandbox_workspace_write.network_access']
-  return v === true || (typeof v === 'string' && v.trim() === 'true')
-}
+/** 角色是否打开了 workspace-write 的网络（core 的 `roleNetworkEnabled`，保留导出）。 */
+export { roleNetworkEnabled } from '@raindown/core'
 
 /** 本次启动的 profile 名（随机后缀，见模块说明）。 */
 export const codexNativeProfileName = (suffix: string = randomBytes(6).toString('hex')) =>
@@ -102,9 +100,19 @@ async function gitReadOnly(cwd: string): Promise<string[]> {
   const layout = await resolveGitLayout(cwd)
   if (!layout) return []
   const out = new Set<string>()
-  for (const dir of new Set([layout.gitDir, layout.commonDir]))
+  for (const dir of new Set([layout.gitDir, layout.commonDir])) {
+    // 不存在的 `hooks/`、`info/` 由节点先建成空目录再声明 "read"（审查第二轮）：否则 worker 可以新建它们并写入 hook、
+    // `info/attributes` 等。只在 git 目录是真实目录时创建（不跟随链接）。文件类的指针（config.worktree、commondir、gitdir）
+    // 不能预先创建（会改变 git 的行为），不存在时不列出，见 docs 的局限。
+    const info = await lstat(dir).catch(() => undefined)
+    if (info?.isDirectory() && !info.isSymbolicLink())
+      for (const sub of ['hooks', 'info'])
+        await mkdir(join(dir, sub), { mode: 0o755 }).catch((err: NodeJS.ErrnoException) => {
+          if (err.code !== 'EEXIST') throw err
+        })
     for (const name of ['hooks', 'config', 'config.worktree', 'info', 'commondir', 'gitdir'])
       out.add(join(dir, name))
+  }
   if (layout.dotGitIsFile) out.add(layout.dotGit)
   const existing: string[] = []
   for (const p of out) {
@@ -176,6 +184,17 @@ export async function codexNativeProfileFromSpec(
       ...(input.networkEnabled ? { networkEnabled: true } : {}),
     })
     if (!profile.ok) return profile
+    // 受保护路径位于可写工作目录之内（工作目录是受保护路径的祖先）：worker 可以改名其上级目录绕过按路径的拒绝，拒绝启动（审查第二轮）。
+    if (input.cwd !== undefined && input.sandbox === 'workspace-write') {
+      const cwd = await canonicalPath(input.cwd)
+      const inside = profile.data.filesystem.find(([p, a]) => a === 'deny' && isWithin(cwd, p))
+      if (inside)
+        return fail(
+          'failure',
+          'codex_profile_protected_in_workdir',
+          `受保护路径 ${inside[0]} 位于可写的工作目录 ${cwd} 之内，native 无法保护它，拒绝启动`,
+        )
+    }
     return await checkReadExceptions(profile.data, codexTmp)
   } catch (err) {
     return fail(

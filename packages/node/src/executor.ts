@@ -25,6 +25,30 @@ import type { Precheck, PrecheckRequest } from './precheck.ts'
  * 其余卡住情形由节点统一判定：长时间无活动（no_progress）、进程意外退出（crashed）、超时（failed/timeout）。
  */
 
+/** 见 `ExecutorContext.isolationExpected`。 */
+export interface IsolationExpectation {
+  setting: string
+  layer: string
+  network: boolean
+}
+
+/**
+ * 执行器核对 `isolationExpected`：实际推出的沙箱设置、要施加的层与联网设置都一致才返回 undefined，否则返回拒绝启动的原因。
+ */
+export function isolationMismatch(
+  expected: IsolationExpectation | undefined,
+  actual: { setting: string | undefined; layer: string; network: boolean },
+): string | undefined {
+  if (!expected) return undefined
+  if (
+    actual.setting === expected.setting &&
+    actual.layer === expected.layer &&
+    actual.network === expected.network
+  )
+    return undefined
+  return `节点判定的隔离（${expected.setting} × ${expected.layer}${expected.network ? '，联网' : ''}）与执行器实际要施加的（${actual.setting ?? '未知'} × ${actual.layer}${actual.network ? '，联网' : ''}）不一致，不启动 harness`
+}
+
 export interface ExecutorContext {
   taskId: string
   /** 第几次尝试，从 1 开始。 */
@@ -40,6 +64,12 @@ export interface ExecutorContext {
   env?: NodeJS.ProcessEnv
   /** 取消信号：节点在续约响应中得知取消、超时、租约丢失或节点停止时触发。 */
   signal: AbortSignal
+  /**
+   * 节点侧 required 判定（6.1）所依据的隔离（PR #104 审查第二轮 M1，纵深防御）：按合同执行器 × 角色推出的沙箱设置、
+   * 判定为已施加的施加层与 native 的联网设置。给出时执行器实际要施加的层、设置与之不符就不启动 harness（`isolation_not_applied`）。
+   * 只在角色 `isolation: required` 且判定已隔离时给出。
+   */
+  isolationExpected?: IsolationExpectation
   /** 任务带着回复重新排队后的这一次执行：上一轮的会话 id 与回复（D6、D7）。 */
   resume?: TaskResume
   /** 同一任务上一次派工的结束与交付事实；适配器用 core 模板放在输入开头。 */

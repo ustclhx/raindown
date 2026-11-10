@@ -42,6 +42,7 @@ import {
   renderWorkerTaskPrompt,
   reviewerRoleProblem,
   reviewOutput,
+  roleSandboxSetting,
   SUPERVISOR_ACTOR,
   type SupervisorConfig,
   supervisorRoleProblem,
@@ -77,6 +78,7 @@ import {
   type ExecutorRun,
   type InjectResult,
   idleSignal,
+  isolationMismatch,
   resumedSignal,
   type StuckSnapshot,
   type StuckVerdict,
@@ -1154,10 +1156,25 @@ export function createClaudeSdkExecutor(options: ClaudeSdkExecutorOptions): Exec
         // （唤醒令牌在 state/wake/），不能整体拒绝，因此不包裹。
         let seatbelt: string[] | undefined
         let isolatedEnv: Record<string, string> | undefined
-        if (
-          !supervisor.data &&
-          seatbeltApplies(credentialIsolation, role.data, options.isolation)
-        ) {
+        // 沙箱设置按本执行器推算（与 required 判定同一函数，PR #104 审查第二轮 M1）。
+        const sdkRole = { ...role.data, executor: 'claude-sdk' as const }
+        const sdkSeatbelt =
+          !supervisor.data && seatbeltApplies(credentialIsolation, sdkRole, options.isolation)
+        const mismatch = isolationMismatch(ctx.isolationExpected, {
+          setting: roleSandboxSetting(sdkRole),
+          layer: sdkSeatbelt ? 'seatbelt' : 'none',
+          network: false,
+        })
+        if (mismatch) {
+          finish(
+            ok({
+              outcome: 'failed',
+              result: result(mismatch, { reason: 'isolation_not_applied' }),
+            }),
+          )
+          return
+        }
+        if (sdkSeatbelt && options.isolation) {
           // 写白名单（4.6、审查第一轮 M5）：Claude Code 改用按任务的配置目录，用户自己的 ~/.claude 与 ~/.claude.json 不可写。
           const configDir = await prepareClaudeConfigDir(
             options.home,

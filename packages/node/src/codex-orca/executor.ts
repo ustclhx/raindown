@@ -17,6 +17,8 @@ import {
   redactSecrets,
   renderRecoveryPrompt,
   renderTaskInputs,
+  roleCodexNetwork,
+  roleSandboxSetting,
   SUPERVISOR_ACTOR,
   type TaskContract,
   type TaskResult,
@@ -40,7 +42,6 @@ import {
   nativeApplies,
   nativeFailureMessage,
   prepareCodexNative,
-  roleNetworkEnabled,
 } from '../codex-native.ts'
 import { CHILD_ENV_DENYLIST, dualRaindownEnv, executorRoleEnv } from '../env.ts'
 import {
@@ -52,6 +53,7 @@ import {
   type ExecutorRun,
   type InjectResult,
   idleSignal,
+  isolationMismatch,
   resumedSignal,
 } from '../executor.ts'
 import {
@@ -1681,15 +1683,25 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
         const scope = codexOrcaInputs.parse(contract.inputs ?? {}).scope
 
         // 外层 seatbelt（4.2）：开关打开且角色沙箱设置为 danger-full-access / bypass 时施加。
-        const isolation = seatbeltApplies(credentialIsolation, role, options.isolation)
+        // 沙箱设置一律按本执行器推算（与 required 判定的 roleIsolationTarget 同一函数，PR #104 审查第二轮 M1）。
+        const orcaRole = { ...role, executor: 'codex-orca' as const }
+        const isolation = seatbeltApplies(credentialIsolation, orcaRole, options.isolation)
           ? options.isolation
           : undefined
         // 写类角色在本任务的独立 clone 中运行，Orca worktree 只作终端宿主（审查第一轮，第一步方案 (b)）。
         const sealedRole = isolation !== undefined && effectiveRoleKind(role) !== 'read'
         // native（tasks 5.1）：开关打开且角色沙箱设置为 workspace-write / read-only 时，以 Codex permissions profile 施加。
-        const nativeSandbox = nativeApplies(credentialIsolation, role, options.isolation)
+        const nativeSandbox = nativeApplies(credentialIsolation, orcaRole, options.isolation)
+        const network = roleCodexNetwork(orcaRole)
         /** 本次要求的施加层：重新挂接的终端必须以同一施加层启动。 */
         const requiredLayer = isolation ? 'seatbelt' : nativeSandbox ? 'native' : undefined
+        // 纵深防御：节点 required 判定所依据的隔离与这里实际要施加的不一致时不启动。
+        const mismatch = isolationMismatch(ctx.isolationExpected, {
+          setting: roleSandboxSetting(orcaRole),
+          layer: requiredLayer ?? 'none',
+          network,
+        })
+        if (mismatch) return failed('isolation_not_applied', mismatch)
 
         state = await readState()
         if (state && state.repo !== repo) state = undefined
@@ -1963,11 +1975,7 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
               pathEnv: actorEnv.data.PATH ?? process.env.PATH,
               ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
               ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
-              ...(roleNetworkEnabled(
-                codexOrcaPermissions.safeParse(role.permissions ?? {}).data?.config,
-              )
-                ? { networkEnabled: true }
-                : {}),
+              ...(network ? { networkEnabled: true } : {}),
               ...(options.nativeProfileName !== undefined
                 ? { profileName: options.nativeProfileName }
                 : {}),

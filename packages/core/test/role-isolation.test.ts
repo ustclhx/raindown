@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { join } from 'node:path'
 import { type DoctorReport, runDoctor } from '../src/doctor.ts'
 import { initRaindownHome } from '../src/init.ts'
+import { describeIsolationStatus, isolationStatusRows } from '../src/isolation/probe.ts'
 import {
   assessIsolation,
   ISOLATION_UNAVAILABLE,
@@ -192,6 +193,63 @@ describe('assessIsolation', () => {
       assess({ capabilities: nativeCaps, setting: 'read-only', probe: asSeatbelt }).view.enforced,
     ).toBe(false)
   })
+
+  test('PR #104 审查第二轮 M2：native 按联网分组判定，联网组不通过不影响不联网的角色', () => {
+    const items = (leak: boolean) =>
+      PROBE_NATIVE_REQUIRED_DENY_ITEMS.map((item) => ({
+        item,
+        expected: 'deny' as const,
+        actual: leak && item === 'read.hub_token' ? ('allow' as const) : ('deny' as const),
+        ok: !(leak && item === 'read.hub_token'),
+      }))
+    const run = (network: boolean, leak: boolean) => ({
+      executor: 'codex-exec',
+      setting: 'workspace-write',
+      declared_layer: 'native',
+      applied_layer: 'native',
+      ...(network ? { network: true } : {}),
+      passed: !leak,
+      items: items(leak),
+    })
+    const probe: IsolationProbeReport = {
+      ran_at: new Date(NOW - 60_000).toISOString(),
+      macos_version: '15.1',
+      runs: [run(false, false), run(true, true)],
+    }
+    const nativeCaps = {
+      credential_isolation: { layers: { 'workspace-write': 'native' }, enforced: true },
+    }
+    const quiet = assess({ capabilities: nativeCaps, setting: 'workspace-write', probe })
+    expect(quiet.view.enforced).toBe(true)
+    const net = assess({
+      capabilities: nativeCaps,
+      setting: 'workspace-write',
+      network: true,
+      probe,
+    })
+    expect(net.view.enforced).toBe(false)
+    // 只有不联网组的结果时，联网角色按未探测。
+    const only = assess({
+      capabilities: nativeCaps,
+      setting: 'workspace-write',
+      network: true,
+      probe: { ...probe, runs: [run(false, false)] },
+    })
+    expect(only.missing[0]).toContain('联网角色')
+    // doctor：联网组另起一行。
+    const rows = isolationStatusRows(
+      {
+        executors: [{ type: 'codex-exec', adapter_capabilities: nativeCaps }],
+        isolation_probe: probe,
+      },
+      NOW,
+    )
+    expect(rows.map((r) => [r.setting, r.network === true, r.probe])).toEqual([
+      ['workspace-write', true, 'failed'],
+      ['workspace-write', false, 'passed'],
+    ])
+    expect(describeIsolationStatus(rows[0] as never)[0]).toContain('（联网角色）')
+  })
 })
 
 describe('角色目标与卡住消息', () => {
@@ -201,7 +259,26 @@ describe('角色目标与卡住消息', () => {
         { name: 'dev', executor: 'codex-orca', permissions: { sandbox: 'danger-full-access' } },
         { executor: 'codex-exec' },
       ),
-    ).toEqual({ role: 'dev', requirement: 'preferred', setting: 'danger-full-access' })
+    ).toEqual({
+      role: 'dev',
+      requirement: 'preferred',
+      setting: 'danger-full-access',
+      network: false,
+    })
+    // native 的联网按合同执行器推算（PR #104 审查第二轮 M2）。
+    expect(
+      roleIsolationTarget(
+        {
+          name: 'w',
+          executor: 'codex-exec',
+          permissions: {
+            sandbox: 'workspace-write',
+            config: { 'sandbox_workspace_write.network_access': true },
+          },
+        },
+        { executor: 'codex-exec' },
+      )?.network,
+    ).toBe(true)
     expect(roleIsolationTarget(null, { executor: 'codex-exec' })).toBeUndefined()
   })
 

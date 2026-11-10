@@ -82,6 +82,11 @@
     `write.git_hooks` / `write.git_config` 预期拒绝并在 profile 中收回 `.git` 的 hooks、config 为只读、模拟 home 与改名目录声明为只读、工作目录不在 $TMPDIR，
     网络打开的角色按未施加）；M4 native 下固定 `approvals_reviewer=user`；用户 `~/.codex` 整体拒绝；codex-orca 设置 `escapesIsolation`；
     native 下全部卡住 `no_delegate`；关闭未隔离旧终端失败时 blocked 交给用户；docs 升级说明。
+  - PR #104 第二轮审查：M1 执行器一律按 `{ ...角色, executor: 本执行器 }` 推算沙箱设置（与 roleIsolationTarget 同一函数），节点把 required 判定依据
+    （设置、施加层、联网）经 `ExecutorContext.isolationExpected` 交给执行器核对；M2 native 按联网与不联网分别探测、记录与判定（探针结果的 `network` 字段，
+    required 判定与 doctor 同步）；闸门记录随报告生效、同一不一致只请求一次重新自检、探针按 worker 的 PATH 解析 codex；探针使用结构一致的临时 CODEX_HOME，
+    不改动执行器真实的；模拟 home 与改名目录移到 raindown-home 之外；受保护路径位于可写工作目录内时拒绝启动；`.git/hooks`、`info/` 不存在时先建；
+    `core.hooksPath` 风险写入 Risks。
   - claude-sdk 的 bash 沙箱：原生 `denyRead` 只覆盖 Bash，仍声明为 `none`（1.1 结论），需要隔离的角色关闭 bash 沙箱改走 seatbelt。
   - **未验证**（交给真实验收，命令见 `docs/executors.md`「`native`」）：`codex exec` / TUI 只传 `-c default_permissions` 时是否使用该 profile、
     CODEX_HOME 整体拒绝只放行 `tmp/` 时 arg0 别名（`apply_patch`）是否正常。

@@ -67,20 +67,29 @@ export interface NativeProbeGate {
 
 export class IsolationProbeGate implements NativeProbeGate {
   private report: IsolationProbeReport | undefined
-  private readonly records = new Map<string, NativeProbeRecord>()
-  private staleRequested = false
+  /** 已随报告生效的记录（执行器 | 设置 | 网络 → 探针用的 codex 身份）。 */
+  private records = new Map<string, string>()
+  /** 探针运行期间暂存的记录：到 `update` 时与报告一起生效（PR #104 审查第二轮）。 */
+  private pending = new Map<string, string>()
+  /** 已为之请求过重新自检的（执行器 | 设置 | 网络 | 启动的 codex 身份）：同一不一致只请求一次。 */
+  private readonly staleRequested = new Set<string>()
   /** 启动时发现 codex 可执行文件与探针不同：请节点重新运行探针（节点设置）。 */
   onStale: (() => void) | undefined
 
-  /** 探针的 native 启动包装记录本次使用的 codex（身份 key）与网络设置。 */
-  record(executor: string, setting: string, r: NativeProbeRecord): void {
-    this.records.set(`${executor}|${setting}`, r)
+  private static key(executor: string, setting: string, network: boolean): string {
+    return `${executor}|${setting}|${network ? 'net' : 'nonet'}`
   }
 
-  /** 节点在每次探针结束（含失败）后传入报告。 */
+  /** 探针的 native 启动包装记录本次使用的 codex（身份 key）与网络设置；在 `update` 之前不生效。 */
+  record(executor: string, setting: string, r: NativeProbeRecord): void {
+    this.pending.set(IsolationProbeGate.key(executor, setting, r.network), r.codex)
+  }
+
+  /** 节点在每次探针结束（含失败）后传入报告；本轮暂存的记录随之生效（替换上一轮的记录）。 */
   update(report: IsolationProbeReport): void {
     this.report = report
-    this.staleRequested = false
+    this.records = this.pending
+    this.pending = new Map()
   }
 
   check(
@@ -90,39 +99,33 @@ export class IsolationProbeGate implements NativeProbeGate {
     now: number = Date.now(),
   ): NativeGateResult {
     const report = this.report
-    if (!report)
-      return { ok: false, reason: `${executor} × ${setting} 还没有隔离自检结果（节点启动时运行）` }
-    const run = findProbeRun(report, executor, setting)
+    const label = `${executor} × ${setting}${launch.network ? '（联网角色）' : ''}`
+    if (!report) return { ok: false, reason: `${label} 还没有隔离自检结果（节点启动时运行）` }
+    const run = findProbeRun(report, executor, setting, launch.network)
     const ranAt = Date.parse(report.ran_at)
     if (run === undefined || run.applied_layer !== 'native')
-      return { ok: false, reason: `${executor} × ${setting} 最近一次隔离自检没有以 native 运行` }
+      return { ok: false, reason: `${label} 最近一次隔离自检没有以 native 运行` }
     if (!Number.isFinite(ranAt) || Math.abs(now - ranAt) > PROBE_MAX_AGE_MS)
-      return {
-        ok: false,
-        reason: `${executor} × ${setting} 的隔离自检结果已过期（${report.ran_at}）`,
-      }
+      return { ok: false, reason: `${label} 的隔离自检结果已过期（${report.ran_at}）` }
     if (!probeRunPassed(run))
       return {
         ok: false,
-        reason: `${executor} × ${setting} 最近一次隔离自检不通过${run.error ? `（${run.error.code}：${run.error.message}）` : '（失败项见 raindown doctor）'}`,
+        reason: `${label} 最近一次隔离自检不通过${run.error ? `（${run.error.code}：${run.error.message}）` : '（失败项见 raindown doctor）'}`,
       }
-    const rec = this.records.get(`${executor}|${setting}`)
-    if (!rec || rec.codex !== launch.codex) {
-      if (!this.staleRequested) {
-        this.staleRequested = true
+    const key = IsolationProbeGate.key(executor, setting, launch.network)
+    const rec = this.records.get(key)
+    if (rec !== launch.codex) {
+      const staleKey = `${key}|${launch.codex}`
+      const first = !this.staleRequested.has(staleKey)
+      if (first) {
+        this.staleRequested.add(staleKey)
         this.onStale?.()
       }
       return {
         ok: false,
-        reason: `本次启动的 codex 可执行文件（${launch.codex.split('|')[0]}）与隔离自检时不同或已变化（例如升级），已请求重新自检`,
+        reason: `本次启动的 codex 可执行文件（${launch.codex.split('|')[0]}）与隔离自检时不同或已变化（例如升级，或 worker 与节点的 PATH 不一致）${first ? '，已请求重新自检' : '；已请求过重新自检，仍不一致'}`,
       }
     }
-    if (launch.network && !rec.network)
-      return {
-        ok: false,
-        reason:
-          '角色打开了 sandbox_workspace_write.network_access，但隔离自检是以不联网的 profile 运行的',
-      }
     return { ok: true }
   }
 }

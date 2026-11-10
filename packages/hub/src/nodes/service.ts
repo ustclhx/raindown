@@ -519,6 +519,7 @@ export function createNodeService(o: NodeServiceOptions): NodeService {
     return assessIsolation({
       capabilities: info?.adapter_capabilities ?? {},
       setting: target.setting,
+      network: target.network,
       probe: node?.isolation_probe ?? null,
       executor: task.contract.executor,
       now: clock.now(),

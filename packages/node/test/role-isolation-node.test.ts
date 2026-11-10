@@ -51,7 +51,7 @@ const probe = (passed: boolean): IsolationProbeReport => ({
 /** 以 codex-exec 名义注册的 fake 执行器；记录 run 次数。 */
 function executor(declared: 'enforced' | 'declared_only' | 'legacy') {
   const base = createFakeExecutor()
-  const runs = { count: 0 }
+  const runs = { count: 0, expected: [] as unknown[] }
   const { credential_isolation: _drop, ...caps } = base.adapterCapabilities
   const e: ExecutorPlugin = {
     ...base,
@@ -68,6 +68,7 @@ function executor(declared: 'enforced' | 'declared_only' | 'legacy') {
           },
     run(contract, ctx) {
       runs.count++
+      runs.expected.push(ctx.isolationExpected)
       return base.run(contract, ctx)
     },
   }
@@ -115,6 +116,18 @@ async function start(o: {
 }
 
 describe('节点启动 harness 前确认隔离（required）', () => {
+  test('PR #104 审查第二轮 M1：判定已隔离时把 (设置, 施加层, 联网) 交给执行器核对；preferred 不给', async () => {
+    const req = await start({ isolation: 'required', probe: probe(true) })
+    await req.b.until(req.id, (t) => t.status !== 'queued' && t.status !== 'running')
+    expect(req.runs.count).toBe(1)
+    expect(req.runs.expected).toEqual([{ setting: SETTING, layer: 'seatbelt', network: false }])
+    await req.b.close()
+    current = undefined
+    const pref = await start({ isolation: 'preferred', probe: probe(true) })
+    await pref.b.until(pref.id, (t) => t.status !== 'queued' && t.status !== 'running')
+    expect(pref.runs.expected).toEqual([undefined])
+  })
+
   test('探针失败：不启动 harness，blocked(other) isolation_unavailable 并列出失败项', async () => {
     const { b, id, runs } = await start({ isolation: 'required', probe: probe(false) })
     const t = await b.until(id, (t) => t.status === 'blocked')

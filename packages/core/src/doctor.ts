@@ -667,7 +667,7 @@ export async function isolationProbeChecks(
     for (const row of isolationStatusRows(node, now)) {
       const [head, ...rest] = describeIsolationStatus(row, '       ')
       const message = [`隔离 ${node.node_id} ${head ?? ''}`, ...rest].join('\n')
-      const id = `isolation.${node.node_id}.${row.executor}${row.setting === '—' ? '' : `.${row.setting}`}`
+      const id = `isolation.${node.node_id}.${row.executor}${row.setting === '—' ? '' : `.${row.setting}`}${row.network ? '.network' : ''}`
       if (row.probe === 'failed')
         checks.push({
           id,

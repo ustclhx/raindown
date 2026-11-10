@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, readdirSync, realpathSync } from 'node:fs'
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { existsSync, mkdirSync, readdirSync, readlinkSync, realpathSync } from 'node:fs'
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -771,17 +771,25 @@ describe('native 探针（worker-credential-isolation 5.1）', () => {
     return { script, calls }
   }
 
-  test('与 worker 启动一致：codex 绝对路径、执行器的 CODEX_HOME、-c default_permissions、角色的网络与配置；native 专有的项', async () => {
+  test('与 worker 启动一致：codex 绝对路径、结构一致的临时 CODEX_HOME、-c default_permissions、联网与不联网分别探测；native 专有的项', async () => {
     const s = await setup()
     const fake = await fakeCodex(s.root)
-    // 用户的 Codex 目录中有 auth.json：CODEX_HOME 中的链接存在，read.codex_home_auth 才能实际尝试。
+    // 用户的 Codex 目录中有 auth.json：探针临时 CODEX_HOME 中的链接存在，read.codex_home_auth 才能实际尝试。
     await mkdir(join(s.userHome, '.codex'), { recursive: true })
     await writeFile(join(s.userHome, '.codex', 'auth.json'), `${MARKER}-auth\n`)
-    // workspace-write 的角色打开了网络：探针以打开网络的 profile 运行，并带上角色的 sandbox_workspace_write.* 配置。
+    // 执行器真实的 CODEX_HOME 已有指向别处的 auth.json 链接（运行中的 worker 在用）：探针不得改动它（审查第二轮）。
+    const realCodexHome = join(s.home, 'run', 'executors', 'codex-exec', 'codex-home')
+    await mkdir(realCodexHome, { recursive: true })
+    await symlink(join(s.root, 'worker-auth.json'), join(realCodexHome, 'auth.json'))
+    // workspace-write 的一个角色打开了网络、另一个没有：两组分别探测（审查第二轮 M2）。
     await mkdir(join(s.home, 'config', 'roles'), { recursive: true })
     await writeFile(
       join(s.home, 'config', 'roles', 'netter.yaml'),
       'name: netter\nexecutor: codex-exec\nprompt: p.md\npermissions:\n  sandbox: workspace-write\n  config:\n    sandbox_workspace_write.network_access: true\n',
+    )
+    await writeFile(
+      join(s.home, 'config', 'roles', 'quiet.yaml'),
+      'name: quiet\nexecutor: codex-exec\nprompt: p.md\npermissions:\n  sandbox: workspace-write\n',
     )
     await writeFile(join(s.home, 'config', 'roles', 'p.md'), 'x\n')
     const gate = new IsolationProbeGate()
@@ -795,19 +803,24 @@ describe('native 探针（worker-credential-isolation 5.1）', () => {
         gate,
       }),
     })
-    expect(report.runs.map((r) => [r.setting, r.applied_layer])).toEqual([
-      ['read-only', 'native'],
-      ['workspace-write', 'native'],
+    expect(report.runs.map((r) => [r.setting, r.applied_layer, r.network === true])).toEqual([
+      ['read-only', 'native', false],
+      ['workspace-write', 'native', false],
+      ['workspace-write', 'native', true],
     ])
+    expect(readlinkSync(join(realCodexHome, 'auth.json'))).toBe(join(s.root, 'worker-auth.json'))
     const calls = await fake.calls()
-    // 版本按可执行文件身份缓存：两个设置只检查一次。
+    // 版本按可执行文件身份缓存：只检查一次。
     expect(calls.filter((c) => c[1] === '--version')).toHaveLength(1)
     const sandboxes = calls.filter((c) => c[1] === 'sandbox')
-    expect(sandboxes).toHaveLength(2)
+    expect(sandboxes).toHaveLength(3)
     const home = realpathSync(s.home)
+    let networked = 0
     for (const c of sandboxes) {
-      // CODEX_HOME 与执行器实际使用的一致（codex-exec 的 read / write 目录）。
-      expect(c[0]).toMatch(/^CODEX_HOME=.*\/run\/executors\/codex-exec\/codex-(read-)?home$/)
+      // 探针自己的临时 CODEX_HOME（结构与执行器的一致），不是执行器真实的 CODEX_HOME。
+      expect(c[0]).toMatch(
+        /^CODEX_HOME=.*\/run\/tasks\/isolation-probe-self-[0-9a-f]+\/codex-home$/,
+      )
       const dash = c.indexOf('--')
       const flags = c.slice(2, dash)
       const def = flags.find((f) => f.startsWith('permissions.raindown-probe=')) as string
@@ -815,23 +828,23 @@ describe('native 探针（worker-credential-isolation 5.1）', () => {
       expect(flags).toContain('default_permissions="raindown-probe"')
       expect(flags).not.toContain('-P')
       expect(def).toContain(`"${home}"="deny"`)
-      // 用户的 Codex 目录整体拒绝。
       expect(def).toContain(`"${join(realpathSync(s.userHome), '.codex')}"="deny"`)
       expect(def).toMatch(/dispatch-tokens\/isolation-probe\.token"="read"/)
-      // 模拟 home 与改名目录声明为只读（不被 raindown-home 的整体拒绝覆盖）。
-      expect(def).toMatch(/run\/isolation-probe-[0-9a-f]+\/home"="read"/)
-      expect(def).toMatch(/rename-probe"="read"/)
+      // 模拟 home 与改名目录在 raindown-home 之外，不再声明 read 例外。
+      expect(def).not.toMatch(/isolation-probe-[0-9a-f]+\/home"="read"/)
+      expect(def).not.toMatch(/rename-probe"="read"/)
       expect(c[dash + 2]).toEndWith('child.ts')
-      const ws = /extends=":workspace"/.test(def)
-      if (ws) {
-        expect(flags).toContain('sandbox_workspace_write.network_access=true')
-        expect(def).toContain('network={enabled=true,')
-        // 写类：工作目录 .git 的 hooks、config 收回为只读。
+      if (/extends=":workspace"/.test(def)) {
         expect(def).toMatch(/\/\.git\/hooks"="read"/)
         expect(def).toMatch(/\/\.git\/config"="read"/)
+        if (def.includes('enabled=true')) {
+          networked++
+          expect(flags).toContain('sandbox_workspace_write.network_access=true')
+        } else expect(flags).not.toContain('sandbox_workspace_write.network_access=true')
       } else expect(def).not.toContain('enabled=true')
     }
-    const ws = report.runs.find((r) => r.setting === 'workspace-write')
+    expect(networked).toBe(1)
+    const ws = report.runs.find((r) => r.setting === 'workspace-write' && !r.network)
     const by = Object.fromEntries((ws?.items ?? []).map((i) => [i.item, i]))
     for (const id of [
       'write.own_profile',
@@ -841,25 +854,29 @@ describe('native 探针（worker-credential-isolation 5.1）', () => {
       'connect.hub',
     ])
       expect({ id, actual: by[id]?.actual }).toEqual({ id, actual: 'skipped' })
-    expect(by['write.own_profile']?.detail).toContain('native')
     for (const id of ['write.git_hooks', 'write.git_config', 'read.codex_home_auth'])
       expect({ id, expected: by[id]?.expected }).toEqual({ id, expected: 'deny' })
-    expect(by['read.codex_home_auth']?.target).toMatch(/codex-home\/auth\.json$/)
-    expect(by['write.git_config']?.target).toMatch(/\/\.git\/config$/)
+    expect(by['read.codex_home_auth']?.target).toMatch(
+      /run\/tasks\/isolation-probe-self-[0-9a-f]+\/codex-home\/auth\.json$/,
+    )
+    // 模拟 home 与改名目录在 raindown-home 之外（与工作目录同级）。
+    for (const id of ['write.shell_startup', 'rename.protected_ancestor'])
+      expect(by[id]?.target?.startsWith(home)).toBe(false)
+    expect(by['write.shell_startup']?.target).toMatch(
+      /raindown-isolation-probe-scratch-[^/]+\/home\/\.zshenv$/,
+    )
     // 假 codex 不施加沙箱：受保护项可读，探针如实不通过。
     expect(by['read.hub_token']?.actual).toBe('allow')
-    expect(by['read.codex_home_auth']?.actual).toBe('allow')
     expect(ws?.passed).toBe(false)
     const ro = report.runs.find((r) => r.setting === 'read-only')
     const roBy = Object.fromEntries((ro?.items ?? []).map((i) => [i.item, i]))
     expect(roBy['write.workdir']?.expected).toBe('deny')
     expect(by['write.workdir']?.expected).toBe('allow')
     expect(JSON.stringify(report)).not.toContain(MARKER)
-    // 闸门记录了探针用的 codex（身份）与网络设置：同一可执行文件 + 通过的报告才放行 worker。
+    // 闸门：探针记录在 update 之前不生效；联网与不联网分别核对。
     const id = resolveExecutable(fake.script, undefined)
     if (!id) throw new Error('fake codex')
-    gate.update(report)
-    expect(gate.check('codex-exec', 'read-only', { codex: id.key, network: false }).ok).toBe(false)
+    const now = Date.parse(report.ran_at)
     const passed = {
       ...report,
       runs: report.runs.map((r) => ({
@@ -874,22 +891,65 @@ describe('native 探针（worker-credential-isolation 5.1）', () => {
       })),
     }
     gate.update(passed)
-    const now = Date.parse(report.ran_at)
     expect(gate.check('codex-exec', 'read-only', { codex: id.key, network: false }, now)).toEqual({
       ok: true,
     })
-    expect(
-      gate.check('codex-exec', 'workspace-write', { codex: id.key, network: true }, now),
-    ).toEqual({ ok: true })
+    for (const network of [false, true])
+      expect(gate.check('codex-exec', 'workspace-write', { codex: id.key, network }, now)).toEqual({
+        ok: true,
+      })
     expect(gate.check('codex-exec', 'read-only', { codex: 'other', network: false }, now).ok).toBe(
       false,
     )
-    expect(gate.check('codex-exec', 'read-only', { codex: id.key, network: true }, now).ok).toBe(
-      false,
-    )
-    // 临时任务目录全部删除。
+    // 临时任务目录与 /var/tmp 下的探针目录全部删除。
     const tasks = runTasksDir(s.home)
     expect(existsSync(tasks) ? readdirSync(tasks) : []).toEqual([])
+    expect(readdirSync(s.tmp)).toEqual([])
+  })
+
+  test('闸门：探针运行中暂存的记录在报告生效前不起作用；同一不一致只请求一次重新自检', () => {
+    const gate = new IsolationProbeGate()
+    let stale = 0
+    gate.onStale = () => {
+      stale++
+    }
+    const now = Date.now()
+    const report = {
+      ran_at: new Date(now).toISOString(),
+      macos_version: null,
+      runs: [
+        {
+          executor: 'codex-exec',
+          setting: 'read-only',
+          declared_layer: 'native',
+          applied_layer: 'native',
+          passed: true,
+          items: PROBE_NATIVE_REQUIRED_DENY_ITEMS.map((item) => ({
+            item,
+            expected: 'deny' as const,
+            actual: 'deny' as const,
+            ok: true,
+          })),
+        },
+      ],
+    }
+    gate.record('codex-exec', 'read-only', { codex: 'A', network: false })
+    gate.update(report)
+    // 下一轮探针运行中记录了新身份 B：报告生效前仍按 A 核对。
+    gate.record('codex-exec', 'read-only', { codex: 'B', network: false })
+    expect(gate.check('codex-exec', 'read-only', { codex: 'A', network: false }, now).ok).toBe(true)
+    expect(gate.check('codex-exec', 'read-only', { codex: 'B', network: false }, now).ok).toBe(
+      false,
+    )
+    gate.update(report)
+    expect(gate.check('codex-exec', 'read-only', { codex: 'B', network: false }, now).ok).toBe(true)
+    // 同一不一致（例如 PATH 不同）只请求一次重新自检，重新自检后仍不一致也不再请求。
+    for (let i = 0; i < 3; i++)
+      gate.check('codex-exec', 'read-only', { codex: 'C', network: false }, now)
+    gate.update(report)
+    gate.check('codex-exec', 'read-only', { codex: 'C', network: false }, now)
+    // 身份 B 在报告生效前不一致请求过一次，C 一次。
+    expect(stale).toBe(2)
   })
 
   test('native 的探针工作目录缺省不在 $TMPDIR 下（nativeTmpDir，缺省 /var/tmp）', async () => {

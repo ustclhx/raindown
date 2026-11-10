@@ -16,6 +16,8 @@ import {
   renderRecoveryPrompt,
   renderTaskInputs,
   renderWorkerTaskPrompt,
+  roleCodexNetwork,
+  roleSandboxSetting,
   type TaskContract,
   type TaskCost,
   type TaskResult,
@@ -40,7 +42,6 @@ import {
   nativeApplies,
   nativeFailureMessage,
   prepareCodexNative,
-  roleNetworkEnabled,
 } from './codex-native.ts'
 import { questionMessage } from './codex-orca/classify.ts'
 import { resolveContext } from './codex-orca/spec.ts'
@@ -49,6 +50,7 @@ import {
   ActivityQueue,
   type ExecutorOutcome,
   type ExecutorPlugin,
+  isolationMismatch,
   resumedSignal,
 } from './executor.ts'
 import { killProcessGroup } from './process-group.ts'
@@ -354,7 +356,10 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
         const readRole = effectiveRoleKind(role.data) === 'read'
         // 外层 seatbelt（4.3）：开关打开且角色沙箱为 danger-full-access 时施加；失败时不启动 Codex。
         // 施加时使用独立的 CODEX_HOME（审查第一轮 H3），写类角色在本任务的独立 clone 中运行（第一步方案）。
-        const applies = seatbeltApplies(credentialIsolation, role.data, options.isolation)
+        // 沙箱设置一律按本执行器推算（与 required 判定的 roleIsolationTarget 同一函数，PR #104 审查第二轮 M1）：
+        // 角色的 executor 可能不是 codex-exec（例如 claude-sdk 角色被合同派给 codex-exec）。
+        const execRole = { ...role.data, executor: 'codex-exec' as const }
+        const applies = seatbeltApplies(credentialIsolation, execRole, options.isolation)
         const dir = applies
           ? sealedCodexHome(options.home, ctx.taskId)
           : readRole
@@ -383,7 +388,18 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
         // 失败时不启动 Codex。profile 每次启动经 -c 传入（不写共享 CODEX_HOME 的 config.toml），不再传 -s。
         let native: string[] | undefined
         let codexPath: string | undefined
-        const nativeSandbox = nativeApplies(credentialIsolation, role.data, options.isolation)
+        const nativeSandbox = nativeApplies(credentialIsolation, execRole, options.isolation)
+        const network = roleCodexNetwork(execRole)
+        // 纵深防御：节点 required 判定所依据的隔离与这里实际要施加的不一致时不启动。
+        const mismatch = isolationMismatch(ctx.isolationExpected, {
+          setting: roleSandboxSetting(execRole),
+          layer: applies ? 'seatbelt' : nativeSandbox ? 'native' : 'none',
+          network,
+        })
+        if (mismatch) {
+          finish(ok({ outcome: 'failed', result: result(mismatch, 'isolation_not_applied') }))
+          return
+        }
         if (nativeSandbox && options.isolation) {
           const prepared = await prepareCodexNative(options.isolation, {
             home: options.home,
@@ -399,7 +415,7 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
             pathEnv: env.data.PATH ?? process.env.PATH,
             ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
             ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
-            ...(roleNetworkEnabled(perms.data.config) ? { networkEnabled: true } : {}),
+            ...(network ? { networkEnabled: true } : {}),
             ...(options.nativeProfileName !== undefined
               ? { profileName: options.nativeProfileName }
               : {}),

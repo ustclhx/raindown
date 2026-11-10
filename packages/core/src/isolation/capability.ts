@@ -86,6 +86,24 @@ export function roleSandboxInfo(
   }
 }
 
+/** 角色是否打开了 workspace-write 的网络（`permissions.config` 的 `sandbox_workspace_write.network_access=true`）。 */
+export function roleNetworkEnabled(config: Readonly<Record<string, unknown>> | undefined): boolean {
+  const v = config?.['sandbox_workspace_write.network_access']
+  return v === true || (typeof v === 'string' && v.trim() === 'true')
+}
+
+/**
+ * native 意义上的“联网”（PR #104 审查第二轮 M2）：Codex 执行器、沙箱设置为 workspace-write 且角色打开了网络。
+ * 探针、启动闸门、required 判定与 doctor 都按它把同一执行器 × 设置分成联网与不联网两组。read-only 下 profile 不联网，按 false。
+ */
+export function roleCodexNetwork(
+  role: Pick<Role, 'executor' | 'permissions'> & Partial<Pick<Role, 'kind'>>,
+): boolean {
+  if (role.executor !== 'codex-exec' && role.executor !== 'codex-orca') return false
+  if (roleSandboxSetting(role) !== 'workspace-write') return false
+  return roleNetworkEnabled(record(role.permissions?.config))
+}
+
 export function roleSandboxSetting(
   role: Pick<Role, 'executor' | 'permissions'> & Partial<Pick<Role, 'kind'>>,
 ): SandboxSetting | undefined {
