@@ -53,7 +53,10 @@ export function createNodeProtocol(o: NodeProtocolOptions): NodeProtocol {
         ledger: o.ledger,
         clock: { now: () => clock.now(), monotonic, setTimeout: clock.setTimeout.bind(clock) },
         ttlMs: o.leaseTtlS * 1000,
-        ...(o.onResume ? { onResume: o.onResume } : {}),
+        onResume: () => {
+          service.resumed()
+          o.onResume?.()
+        },
       })
     : null
   const cancels: Array<() => void> = []

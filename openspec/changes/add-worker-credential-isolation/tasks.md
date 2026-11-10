@@ -77,6 +77,6 @@
   - 实现：中枢派送时按角色要求筛选节点（`required` 只派给已隔离节点；没有时中枢直接写 `task.blocked(other)`，消息以 `isolation_unavailable：` 开头并列出缺什么，
     状态机新增仅限中枢的 `queued → blocked`）；节点领到租约后按本地角色配置、能力声明与最近一次探针再确认，不满足时不启动 harness（以节点为准）。
     `preferred` 未隔离时 `task.started.unisolated` 记缺什么；收件箱按 节点 × 执行器 × 沙箱设置 聚合，只在评估结果变化时提示。
-    只等待在线的已隔离节点；角色缓存在领取与长轮询派送前刷新，找不到角色时中枢不派、节点不启动（fail closed）。
+    只等待在线的已隔离节点（长轮询、活动租约或最近活动在窗口内；中枢启动/唤醒后有宽限）；角色缓存在领取与长轮询派送前刷新，找不到角色时中枢卡住、节点不启动（fail closed）。
     恢复沿用 `task_retry`，不新增轮询。supervisor 唤醒会话与 pr-merge 设 `required` 时角色加载报错（doctor）。说明见 `docs/executors.md`「角色隔离要求」
 - [ ] 6.2 文档：`docs/hub-auth.md` 与 `docs/executors.md` 更新信任边界说明（隔离后与隔离前）、升级建议（dev 角色改为 required）、回滚方法；`raindown init` 的角色模板加入 `isolation` 注释
