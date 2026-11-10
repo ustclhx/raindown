@@ -72,6 +72,7 @@
   - claude-sdk 使用按任务的 Claude Code 配置目录 `run/tasks/<任务>/claude-config/`（`CLAUDE_CONFIG_DIR`），其中 `settings*.json`、`commands|agents|skills|hooks|plugins|rules|output-styles`、`CLAUDE.md` 等不可写；另放行登录钥匙串文件 `login.keychain-db` 及其 `.sb-*` 临时文件（OAuth 刷新）。
   - 用户自己的 `~/.claude`、`~/.claude.json` 不可写：其中的 shell 快照、项目记忆、MCP 与 hooks 配置会被用户自己（沙箱外）的 Claude Code 加载或执行。
 - **设备文件**：`/dev/null`、`/dev/tty`、`/dev/ttys<N>`、`/dev/fd/` 等。
+- **pnpm 12 的锁目录**（4.5 实测）：`/private/tmp/pnpm-(dir|store-operation|verify-deps-install)-locks-<uid>` 及其内容（正则，uid 取 `process.getuid()`）。pnpm 12 把它们写死在 `/private/tmp` 下、不随 `TMPDIR` 变化；`/private/tmp` 其余位置仍拒绝。pnpm 12 只认 `pnpm_config_store_dir`、`pnpm_config_cache_dir`，因此环境中另外注入这两项。
 - **追加**：节点配置 `isolation.extra_write` 显式追加的目录。只接受绝对路径，比较时大小写折叠并做 NFD；不能与以下位置互相包含：受保护路径、持久化位置、登记仓库、`PATH` 中的目录、`~/Library/Application Support`、用户主目录。
 
 共享的临时与缓存目录（`/private/tmp`、`TMPDIR` 及其 `C/`、`~/.cache`、`~/Library/Caches`、`~/.bun/install/cache`、`~/.npm/_cacache`、pnpm store）**不放行**：其中的内容会被之后沙箱外的安装与运行直接使用（审查第一轮 M2）。
@@ -155,6 +156,7 @@ seatbelt 的规则后者优先，允许项写得最窄（具体文件，而不�
 - [写白名单内仍可被利用的位置（4.6 与审查第一轮后的残留）]
   - **auth.json**：worker 可以经链接改写用户的 `~/.codex/auth.json`（换成攻击者账号的凭证）。Codex 在进程内刷新凭证且刷新令牌会轮换，改由节点刷新目前不可行。
   - **登录钥匙串**：claude-sdk 下 worker 可以损坏或替换 `login.keychain-db`。
+  - **pnpm 锁目录**：`/private/tmp/pnpm-*-locks-<uid>` 与沙箱外的 pnpm 共用。锁文件名可由 store 路径推算（`store-operation-locks-<uid>/sha256(<storeDir>/v11).lock` 等），worker 可以在其中预埋文件、符号链接或硬链接，或把锁目录换成符号链接。pnpm 12.8.1 实测拒绝符号链接与非本人普通文件的锁、拒绝非真实目录的锁目录，不经链接写入或截断目标；后果只是沙箱外的 pnpm 等待或失败（拒绝服务），持续到删除 `/private/tmp/pnpm-*-locks-<uid>` 中的异常条目为止。不能借此写文件或执行代码，记为低风险并接受。
   - **偏好设置**：经 cfprefsd 的偏好设置写入拦不住，例如终端应用的启动命令（`user-preference-write` 实测无效）；拒绝 cfprefsd 的 mach-lookup 可能影响 `security`，未验证。
   - **会话记录**：独立 CODEX_HOME 与按任务的 Claude 配置目录中的会话记录可被改写（提示注入，不是命令执行）。
   - **Codex 项目配置**：预置信任后，Codex 会加载 clone 内的 `.codex/config.toml`。`notify`、`model_provider` 用命令行固定，`.codex/` 出现即停下，但 `model_providers` 表、`mcp_servers` 等覆盖不了的项，在出现到下一次检查之间可能生效；它们只在外层 seatbelt 内生效（审查第二轮 L2）。

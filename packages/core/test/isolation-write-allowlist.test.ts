@@ -12,6 +12,7 @@ import {
   type IsolationSpecInput,
   keychainWriteRegex,
   normalizeExtraWrite,
+  pnpmLockWriteRegex,
   renderSeatbeltProfile,
   resolveGitLayout,
   taskScratchEnv,
@@ -231,7 +232,8 @@ describe('computeIsolationSpec：写白名单', () => {
     expect(s.allow_write_literals).toEqual(
       expect.arrayContaining(['/dev/null', join(e.userHome, '.codex/auth.json')]),
     )
-    expect(s.allow_write_regex).toEqual([])
+    // 正则只有 pnpm 12 的锁目录（钥匙串未放行）。
+    expect(s.allow_write_regex).toEqual([pnpmLockWriteRegex(process.getuid?.() ?? 0)])
     expect(s.allow_write_inside_regex).toHaveLength(1)
     expect(s.allow_write_inside_regex[0]).toContain('\\.sqlite')
     // auth.json 链接本身拒绝写（M1）。
@@ -265,6 +267,34 @@ describe('computeIsolationSpec：写白名单', () => {
     expect(re.test(join(e.userHome, 'Library/Keychains/login.keychain-db.sb-1a2b-x'))).toBe(true)
     expect(re.test(join(e.userHome, 'Library/Keychains/other.keychain-db'))).toBe(false)
     expect(re.test(join(e.userHome, 'Library/Keychains/sub/login.keychain-db'))).toBe(false)
+  })
+
+  test('pnpm 12 锁目录（4.5 实测）：只放行三个 /private/tmp/pnpm-*-locks-<uid> 目录；uid 只接受非负整数', async () => {
+    const root = await tempRoot('raindown-allowlist-')
+    const e = await fakeEnv(root)
+    const cwd = join(root, 'work')
+    await mkdir(cwd)
+    const spec = await computeIsolationSpec(baseInput(e, cwd, { uid: 1234 }))
+    if (!spec.ok) throw new Error(spec.error.message)
+    expect(spec.data.allow_write_regex).toEqual([pnpmLockWriteRegex(1234)])
+    const re = new RegExp(pnpmLockWriteRegex(1234))
+    for (const name of ['dir', 'store-operation', 'verify-deps-install']) {
+      expect(re.test(`/private/tmp/pnpm-${name}-locks-1234`)).toBe(true)
+      expect(re.test(`/private/tmp/pnpm-${name}-locks-1234/lock-x`)).toBe(true)
+    }
+    for (const p of [
+      '/private/tmp/pnpm-store-operation-locks-12345',
+      '/private/tmp/pnpm-store-operation-locks-123',
+      '/private/tmp/pnpm-store-operation-locks-1234x/a',
+      '/private/tmp/pnpm-other-locks-1234',
+      '/private/tmp/.pnpm-store',
+      '/private/tmp/x/pnpm-dir-locks-1234',
+      '/tmp/pnpm-dir-locks-1234',
+    ])
+      expect({ p, ok: re.test(p) }).toEqual({ p, ok: false })
+    for (const bad of [-1, 1.5, Number.NaN]) expect(() => pnpmLockWriteRegex(bad)).toThrow()
+    const badSpec = await computeIsolationSpec(baseInput(e, cwd, { uid: -1 }))
+    expect(badSpec.ok).toBe(false)
   })
 
   test('harness 的放行与拒绝条目必须是相对路径；文件名正则不能含 / 或引号', async () => {
@@ -361,11 +391,18 @@ describe('computeIsolationSpec：写白名单', () => {
       'npm_config_cache',
       'PNPM_STORE_DIR',
       'npm_config_store_dir',
+      'pnpm_config_store_dir',
+      'pnpm_config_cache_dir',
       'PLAYWRIGHT_BROWSERS_PATH',
       'COREPACK_HOME',
       'PRE_COMMIT_HOME',
     ])
       expect(env[k]).toBeDefined()
+    // pnpm 12 只认 pnpm_config_*：store 与旧变量指向同一目录。
+    expect(env.pnpm_config_store_dir).toBe('/h/run/tasks/t-1/cache/pnpm-store')
+    expect(env.npm_config_store_dir).toBe(env.pnpm_config_store_dir)
+    expect(env.PNPM_STORE_DIR).toBe(env.pnpm_config_store_dir)
+    expect(env.pnpm_config_cache_dir).toBe('/h/run/tasks/t-1/cache/pnpm')
   })
 })
 
@@ -453,6 +490,36 @@ describe.skipIf(!onMac)('macOS 实测：写白名单', () => {
       expect({ cmd, status: sh(cmd).status }).not.toEqual({ cmd, status: 0 })
     expect(await readlink(link)).toBe(join(e.userHome, '.codex/auth.json'))
     expect(sh(`cat '${join(e.home, 'state/hub.token')}'`).status).not.toBe(0)
+  })
+
+  test('pnpm 12 锁目录内可写，/private/tmp 其余位置仍拒绝；受保护项仍优先', async () => {
+    const root = await tempRoot('raindown-allowlist-mac-')
+    const e = await fakeEnv(root)
+    const cwd = join(root, 'work')
+    await mkdir(cwd)
+    const uid = process.getuid?.() ?? 0
+    const { path } = await profileFor(root, baseInput(e, cwd, { uid }), 'pnpm')
+    const lockDir = `/private/tmp/pnpm-store-operation-locks-${uid}`
+    // 锁目录可能已由沙箱外的 pnpm 建立：只在其中写一个唯一命名的文件，测试后删除；目录若是本测试新建的也一并删除。
+    const createdDir = !existsSync(lockDir)
+    const inside = join(lockDir, `raindown-test-${process.pid}-${Date.now()}`)
+    const outside = `/private/tmp/raindown-pnpm-probe-${process.pid}-${Date.now()}`
+    try {
+      const r = run(path, `mkdir -p '${lockDir}' && echo ok > '${inside}'`, cwd)
+      expect({ status: r.status, err: r.stderr }).toEqual({ status: 0, err: '' })
+      expect(readFileSync(inside, 'utf8').trim()).toBe('ok')
+      expect(run(path, `echo PWNED > '${outside}'`, cwd).status).not.toBe(0)
+      expect(existsSync(outside)).toBe(false)
+      expect(
+        run(path, `echo PWNED > '/private/tmp/pnpm-other-locks-${uid}-${process.pid}'`, cwd).status,
+      ).not.toBe(0)
+      expect(run(path, `echo PWNED >> '${join(e.userHome, '.zshenv')}'`, cwd).status).not.toBe(0)
+    } finally {
+      await rm(inside, { force: true })
+      await rm(outside, { force: true })
+      await rm(`/private/tmp/pnpm-other-locks-${uid}-${process.pid}`, { force: true })
+      if (createdDir) await rm(lockDir, { recursive: true, force: true })
+    }
   })
 
   test('L5：job-creation、user-preference-write、lsopen、appleevent-send 规则可被本机 sandbox 解析，且不影响常用命令', async () => {
