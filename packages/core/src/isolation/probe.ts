@@ -53,6 +53,11 @@ export const probePlanItem = z.strictObject({
   unverified: z.string().max(500).optional(),
   /** 不尝试，直接记为失败（actual 为 error），例如 Orca 端口未解析：无法证明控制端口被拒绝。 */
   fail: z.string().max(500).optional(),
+  /**
+   * `read_via_symlink`：节点在沙箱外预先建好的、指向 `target` 的符号链接。给出时探针只经它读取，不在工作目录新建链接
+   * （只读角色的工作目录本就不可写，沙箱内建链接必然失败；4.5 真实节点发现）。
+   */
+  link: z.string().min(1).max(1024).optional(),
 })
 export type ProbePlanItem = z.infer<typeof probePlanItem>
 
@@ -378,6 +383,9 @@ const NATIVE_CODEX_WRITE_ITEMS: ReadonlySet<string> = new Set([
 
 /** native 下改为跳过的项（见 `ProbePlanInput.layer`）：只保留项名、种类与预期，不尝试。 */
 function nativeItem(i: ProbePlanItem): ProbePlanItem {
+  // Codex 的 `:workspace` 把可写根内的 `.git` 整体收为只读（实测 codex-cli 0.167.0：hooks、config、index.lock、objects
+  // 都拒绝写；只有 /tmp 这类本身就是可写根的位置例外），所以 native 下工作目录 `.git/objects` 预期拒绝（5.1 真实节点发现）。
+  if (i.item === 'write.git_objects') return { ...i, expected: 'deny' }
   const skip = NATIVE_CODEX_WRITE_ITEMS.has(i.item)
     ? PROBE_NATIVE_CODEX_WRITE_SKIP
     : i.item === 'write.own_profile'

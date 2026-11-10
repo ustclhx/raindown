@@ -149,6 +149,28 @@ describe('探针清单（buildProbePlan）', () => {
     // 工作目录不是 git 仓库时清单没有 git 放行：objects 预期拒绝。
     expect(w['write.git_objects']?.expected).toBe('deny')
   })
+
+  test('native：工作目录 .git/objects 预期拒绝（Codex 把可写根内的 .git 收为只读，5.1 真实节点发现）', async () => {
+    const s = await spec({ access: 'write' })
+    const plan = buildProbePlan({
+      spec: { ...s.spec, allow_write_git: [`${s.cwd}/.git/objects`] },
+      home: s.home,
+      ageKeyFile: '/k',
+      otherTaskToken: '/o',
+      ownToken: '/s',
+      cwd: s.cwd,
+      hubUrl: 'http://127.0.0.1:7801',
+      orcaSockets: { status: 'none', reason: 'x' },
+      gitObjectsDir: `${s.cwd}/.git/objects`,
+      layer: 'native',
+    })
+    const by = Object.fromEntries(plan.items.map((i) => [i.item, i]))
+    expect(by['write.git_objects']).toMatchObject({
+      expected: 'deny',
+      target: `${s.cwd}/.git/objects`,
+    })
+    expect(by['write.git_objects']?.skip).toBeUndefined()
+  })
 })
 
 const run = (

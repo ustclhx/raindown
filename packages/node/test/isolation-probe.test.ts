@@ -397,6 +397,37 @@ describe('模拟已隔离（注入的文件系统接口拒绝受保护项）', (
     expect(probeRunPassed({ items })).toBe(false)
   })
 
+  test('预先建好的符号链接（只读工作目录）：只经它读取，不在工作目录新建或删除链接', async () => {
+    const touched: string[] = []
+    const sys = deniedSystem({
+      readOneByte: async (p) => {
+        // 预建链接指向 hub.token：经它读取被拒绝。
+        if (p === '/w/pre-link' || !p.startsWith('/w')) throw eperm()
+        return 1
+      },
+      symlink: async (_t, p) => {
+        touched.push(`symlink ${p}`)
+        throw eperm()
+      },
+      unlink: async (p) => {
+        touched.push(`unlink ${p}`)
+      },
+    })
+    const items = await runProbeItems(
+      {
+        ...plan,
+        items: plan.items
+          .filter((i) => i.item === 'read.hub_token_via_symlink')
+          .map((i) => ({ ...i, link: '/w/pre-link' })),
+      },
+      sys,
+    )
+    expect(items).toEqual([
+      expect.objectContaining({ item: 'read.hub_token_via_symlink', actual: 'deny', ok: true }),
+    ])
+    expect(touched).toEqual([])
+  })
+
   test('写探针意外成功时立即删除；符号链接用后删除', async () => {
     const created: string[] = []
     const removed: string[] = []

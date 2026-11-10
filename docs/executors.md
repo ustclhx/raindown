@@ -1373,14 +1373,18 @@ extends = ":workspace"            # read-only 角色为 ":read-only"
 - **只读例外的检查（审查第一轮 H2）**：每个 `"read"` 例外都必须是规范化后的真实路径、不是符号链接、是普通文件或目录；`CODEX_HOME/tmp` 必须是真实目录
   （不存在时节点创建为 0700 目录）。否则（例如 `tmp` 被换成指向 `state/` 的链接）不生成 profile、不启动，错误码 `codex_profile_unsafe_read`。
 - 写入不另设白名单：由 Codex 沙箱决定（`:workspace` 只放行工作区与临时目录，`:read-only` 全部拒绝）；写类角色工作目录 `.git` 中会在沙箱外被执行或加载的
-  hooks、config 等以 `"read"` 收回为只读（更具体的条目优先）。`.git/objects`、refs 等仍可写（commit 需要）。
+  hooks、config 等以 `"read"` 收回为只读（更具体的条目优先，纵深防御）。注意 Codex 自己的 `:workspace` 已把可写根内的 `.git` 整体收为只读
+  （见下方实测），所以 native 下的写类角色**不能在沙箱内 commit**：这是 Codex workspace-write 本来的行为，与 Raindown 无关；需要 commit 的写类角色
+  （例如 dev）应使用 danger-full-access + 外层 seatbelt。
   `.git/hooks/`、`.git/info/` 不存在时节点先建成空目录再声明（审查第二轮，否则 worker 可以新建它们）；文件类的指针（`config.worktree`、`commondir`、`gitdir`）
   不能预先创建（会改变 git 的行为），不存在时无法声明。
 - **受保护路径位于可写工作目录之内**（工作目录是某个受保护路径的祖先，例如把用户主目录或 raindown-home 的上级当作工作目录）时，worker 可以改名其上级目录
   绕过按路径的拒绝：workspace-write 下拒绝启动，错误码 `codex_profile_protected_in_workdir`（审查第二轮）。
-  **已实测（2026-11-10，codex-cli 0.167.0）**：不加这些条目时 `:workspace` **允许**写 `.git/hooks` 与 `.git/config`（`git config core.fsmonitor …` 成功，
-  随后的 `git status` 执行了它）；加上 `"<repo>/.git/hooks"="read"`、`"<repo>/.git/config"="read"` 后，写 hooks、追加 config、`git config` 全部
-  `Operation not permitted`，`git status`、`add`、`commit`、`checkout -b` 正常。所以这两项条目是必需的，不是纵深防御。
+  **已实测（2026-11-11 更正，codex-cli 0.167.0）**：在一般位置（例如 `/var/tmp`、用户目录下）的仓库里，`:workspace` 不加任何条目时
+  写 `.git/hooks`、`.git/config`（`git config`）、`.git/objects`、`.git/index.lock`（`git commit`）全部 `Operation not permitted`——Codex 把可写根内的
+  `.git` 整体收为只读。早先（2026-11-10）“`:workspace` 允许写 `.git`”的结论是在 `/private/tmp` 下的仓库里测的：`/tmp` 本身是 `:workspace` 的可写根，
+  例外。加上 `"read"` 条目后同样拒绝；`"read"` 条目的上级目录不能改名（`mv .git …`、`mv .git/hooks …` 拒绝）。
+  探针按此在 native 下把 `write.git_objects` 预期为拒绝。
 - 路径写成 TOML 基本字符串，严格转义反斜杠、引号与全部控制字符（换行、回车、NUL、DEL、C1 都写成 `\uXXXX`），不能改变内联表结构
   （`packages/core/test/isolation-codex-profile.test.ts` 的注入测试用 TOML 解析器还原比对）；不是绝对路径时返回 `codex_profile_invalid_path`。
 

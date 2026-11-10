@@ -139,6 +139,15 @@ async function attempt(item: ProbePlanItem, plan: ProbePlan, sys: ProbeSystem): 
         return fileOutcome(err)
       }
     case 'read_via_symlink': {
+      if (item.link) {
+        // 节点在沙箱外预先建好的链接（见 probePlanItem.link）：只读取，不删除（随探针工作目录一起清理）。
+        try {
+          await sys.readOneByte(item.link)
+          return { actual: 'allow' }
+        } catch (err) {
+          return fileOutcome(err)
+        }
+      }
       const link = probeTempPath(plan.workdir, `link-${sys.random()}`)
       try {
         await sys.symlink(target, link)
