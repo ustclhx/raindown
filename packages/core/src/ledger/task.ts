@@ -62,6 +62,30 @@ export const blockedReason = z.enum(BLOCKED_REASONS).meta({
     '卡住原因：awaiting_approval 等审批、question 提问、no_progress 无进展、crashed 崩溃、workdir_missing 工作目录或会话丢失、node_lost 节点掉线（租约过期）、other 其他',
 })
 
+/**
+ * 节点发现 macOS Security 框架的 `mds/` 被改动并已重置（worker-credential-isolation 4.5）：外层 seatbelt 下 harness 结束后、
+ * 或启动新 harness 前与已有基线比较时。只带文件名，不带内容。也经 `POST /v1/nodes/:id/isolation-notices` 上报（不依赖租约）。
+ */
+export const mdsResetSignal = z.strictObject({
+  id: z.string().min(1).max(128),
+  kind: z.literal('mds_reset'),
+  files: z
+    .array(z.string().min(1).max(255))
+    .min(1)
+    .max(100)
+    .meta({ description: '被删除的 mds/ 条目名（只有文件名）' }),
+  repeats: z
+    .record(z.string().min(1).max(255), z.number().int().min(1))
+    .optional()
+    .meta({ description: '各文件在同一基线下被重置的次数（审查第三轮：重复重置只计数）' }),
+  inbox: z.enum(['none', 'repeated']).optional().meta({
+    description:
+      'none：只写任务事件（重复重置的计数）；repeated：写“反复重置”的收件箱条目；缺省写普通的重置条目',
+  }),
+  message: z.string().max(16_384).optional(),
+})
+export type MdsResetSignal = z.infer<typeof mdsResetSignal>
+
 /** 适配器检测到的带外操作；id 在续约重试时保持不变，供中枢幂等写入。 */
 export const outOfBandSignal = z.discriminatedUnion('kind', [
   z.strictObject({
@@ -76,6 +100,7 @@ export const outOfBandSignal = z.discriminatedUnion('kind', [
     command: z.string().max(16_384).optional(),
     message: z.string().max(16_384).optional(),
   }),
+  mdsResetSignal,
 ])
 export type OutOfBandSignal = z.infer<typeof outOfBandSignal>
 

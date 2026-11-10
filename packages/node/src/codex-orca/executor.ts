@@ -47,11 +47,13 @@ import {
   idleSignal,
   resumedSignal,
 } from '../executor.ts'
+import { heldMdsBaselines, mdsBaselineHeld, setMdsBaselineHold, verifyMdsBaseline } from '../mds.ts'
 import { autoApprovedText, needsUserText } from '../precheck.ts'
 import { prepareSealedWorkdir, rollbackSealedClone, type SealedWorkdir } from '../sealed-workdir.ts'
 import {
   effectiveCredentialIsolation,
   prepareSeatbelt,
+  recordSeatbeltMdsBaseline,
   type SeatbeltOptions,
   seatbeltApplies,
   seatbeltFailureMessage,
@@ -501,6 +503,43 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
       credential_isolation: credentialIsolation,
     },
     classify: classifyCodexOrca,
+    /**
+     * 节点启动时：hold 住 mds 基线的任务（外层 seatbelt 内的终端曾在运行），终端已不存在时做最后一次校验、解除并删除基线
+     * （4.5，审查第二轮）。Orca 不可用（无法确认）时保留，之后的启动前比较仍覆盖它。
+     */
+    async prepare() {
+      for (const taskId of await heldMdsBaselines(options.home)) {
+        let alive: boolean | undefined
+        try {
+          const parsed = stateSchema.safeParse(
+            JSON.parse(
+              await readFile(join(taskStateDir(options.home, taskId), 'orca.json'), 'utf8'),
+            ),
+          )
+          const st = parsed.success ? parsed.data : undefined
+          if (!st?.handle || st.isolation_layer !== 'seatbelt') alive = false
+          else {
+            const list = await orca.terminalList({ worktreePath: hostOf(st) })
+            if (list.ok) {
+              const t = list.data.find((x) => x.handle === st.handle)
+              if (!t) alive = false
+              else {
+                const read = await orca.terminalRead({ handle: st.handle, limit: 1 })
+                if (read.ok) alive = read.data.status === 'running'
+              }
+            }
+          }
+        } catch {
+          alive = false
+        }
+        if (alive === false) {
+          await verifyMdsBaseline(options.home, taskId, { force: true }).catch(() => {})
+          logger?.info(
+            `任务 ${taskId} 的外层 seatbelt 终端已不存在：已对 mds 做最后一次校验并删除基线`,
+          )
+        }
+      }
+    },
     run(contract: TaskContract, ctx: ExecutorContext): ExecutorRun {
       const queue = new ActivityQueue()
       let settle: (r: Result<ExecutorOutcome>) => void = () => {}
@@ -569,6 +608,8 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
         void Promise.all([
           removeTaskScratch(options.home, ctx.taskId),
           removeSealedCodexHome(options.home, ctx.taskId),
+          // 任务完成或取消，终端随之结束：解除 mds 基线的 hold，节点在执行结束出口校验并重置（4.5，审查第一轮）。
+          setMdsBaselineHold(options.home, ctx.taskId, false).catch(() => {}),
         ]).finally(() => settle(r))
       }
       const result = (summary: string, extra: Partial<TaskResult> = {}): TaskResult => ({
@@ -606,6 +647,7 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
             const closed = await orca.terminalClose({ handle })
             if (!closed.ok)
               logger?.warn(`隔离检查失败后关闭终端 ${handle} 失败`, closed.error.message)
+            else await setMdsBaselineHold(options.home, ctx.taskId, false).catch(() => {})
           }
           finish(ok({ outcome: 'blocked', reason: 'other', message }))
         })()
@@ -1589,6 +1631,8 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
           // 回滚（开关已关闭）：关闭旧终端，把独立 clone 中的任务分支取回登记仓库后删除 clone，回到 Orca worktree。
           const old = state
           if (old.handle) await orca.terminalClose({ handle: old.handle })
+          // 终端已结束：解除 mds 基线的 hold，本次执行结束时校验（4.5，审查第一轮）。
+          await setMdsBaselineHold(options.home, ctx.taskId, false).catch(() => {})
           const rolled = await rollbackSealedClone(options.home, ctx.taskId, {
             ...(options.isolation?.gitEnv ? { env: options.isolation.gitEnv } : {}),
           })
@@ -1755,6 +1799,18 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
                 `已有 Codex 终端 ${old} 启动时没有施加外层 seatbelt（升级前或 isolation.enforce 打开前启动），不能重新挂接；${closed.ok ? '已关闭该终端，重试即以隔离方式重启' : '关闭失败，请先手动关闭旧终端后重试'}`,
               )
             } else {
+              if (isolation && st.isolation_layer === 'seatbelt') {
+                // 重新挂接仍在外层 seatbelt 内运行的终端：先与全部已有基线比较并重置，基线 hold 到终端结束（4.5，审查第一轮）。
+                const baseline = await recordSeatbeltMdsBaseline(
+                  isolation,
+                  options.home,
+                  ctx.taskId,
+                  { hold: true },
+                )
+                if (finished || stopping) return
+                if (!baseline.ok)
+                  return failed(baseline.error.code, seatbeltFailureMessage(baseline.error.message))
+              }
               handle = st.handle
               prevTail = tail
               status(`接着使用已有的终端 ${handle}`)
@@ -1771,6 +1827,15 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
             await saveState()
           }
           if (!(await requireWorkdir())) return
+          if (isolation && mdsBaselineHeld(options.home, ctx.taskId)) {
+            // 要启动新终端：上一个外层 seatbelt 内的终端已不存在（退出或已关闭）。对它 hold 的 mds 基线做最后一次校验并删除，
+            // 再为新终端记录基线（4.5，审查第二轮）。
+            await verifyMdsBaseline(options.home, ctx.taskId, { force: true }).catch(() => {})
+            const baseline = await recordSeatbeltMdsBaseline(isolation, options.home, ctx.taskId)
+            if (finished || stopping) return
+            if (!baseline.ok)
+              return failed(baseline.error.code, seatbeltFailureMessage(baseline.error.message))
+          }
           let seatbelt: string[] | undefined
           let scratchEnv: Record<string, string> | undefined
           if (sealedLaunch) {
@@ -1837,8 +1902,11 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
           // 新终端的首条输入已从 spec 读取恢复提示。
           if (recoveryText) replyState(recoveryId).done = true
           st.codex_home = isolated.data
-          if (seatbelt) st.isolation_layer = 'seatbelt'
-          else delete st.isolation_layer
+          if (seatbelt) {
+            st.isolation_layer = 'seatbelt'
+            // 终端在本次执行结束后可能继续运行（阻塞等待回复）：mds 基线保留到终端结束（4.5，审查第一轮）。
+            await setMdsBaselineHold(options.home, ctx.taskId, true).catch(() => {})
+          } else delete st.isolation_layer
           if (ctx.leaseTokenFile) st.lease_token_file = ctx.leaseTokenFile
           else delete st.lease_token_file
           if (term.data.ptyId) st.pty_id = term.data.ptyId

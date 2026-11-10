@@ -71,6 +71,7 @@ user token 降级时不能声明上述任何一个（不区分大小写，包括
 | `GET /v1/health` | ✓（不鉴权） | ✓ | ✓ | ✓ |
 | `POST /v1/nodes`（注册）、`POST /v1/leases`（领取） | ✓（本机节点） | 403 `scope_denied` | 仅 `node_id` 为自己 | 403 |
 | `POST /v1/leases/:id/renew`、`complete`、`ack-reply` | ✓（本机节点） | 403 `scope_denied` | ✓（凭 lease_token） | 403 |
+| `POST /v1/nodes/:id/isolation-notices`（mds 重置，worker-credential-isolation 4.5） | ✓（本机节点） | 403 `scope_denied` | ✓（`:id` 必须是本身份，且只给本节点领取过租约的任务） | 403 |
 | `GET /v1/tasks/:id` | ✓ | ✓ | 仅自己持有活动租约的任务 | 403 |
 | `POST /v1/policy/check` | ✓（人工调试） | 403 `scope_denied` | 仅自己持有未过期活动租约的任务 | 403 |
 | `POST /v1/tasks`（创建任务） | ✓（任意角色） | 仅 `creatable_by` 匹配的角色，否则 403 `role_not_allowed` | 403 `scope_denied` | 403 |

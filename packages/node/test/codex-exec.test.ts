@@ -924,6 +924,42 @@ describe('外层 seatbelt（worker-credential-isolation 4.3）', () => {
     expect(existsSync(join(s.home, 'state/tasks/t-test/isolation.sb'))).toBe(false)
   })
 
+  test('审查第四轮：施加外层 seatbelt 时 Codex 正常结束也结束整个进程组（后台子进程不比 harness 活得更久）；开关关闭时不变', async () => {
+    for (const enforce of [true, false]) {
+      const body = `
+const bg = spawn('/bin/sleep', ['30'], { stdio: 'ignore' })
+bg.unref()
+fs.writeFileSync(${JSON.stringify('PIDFILE')}, String(bg.pid))
+send(resumed)
+`
+      const s0 = setup('send(resumed)', dfa)
+      const pidFile = join(s0.dir, `bg-${enforce}.pid`)
+      const s = setup(body.replace('PIDFILE', pidFile), dfa)
+      const fake = fakeSandboxExec(s.dir)
+      const { outcome } = await collect(
+        s.run(
+          { ...s.ctx, hubUrl },
+          { ...s.options, isolation: isolation(s, fake.script, enforce) },
+        ),
+      )
+      expect(outcome.outcome).toBe('done')
+      const pid = Number(readFileSync(pidFile, 'utf8'))
+      const alive = () => {
+        try {
+          process.kill(pid, 0)
+          return true
+        } catch {
+          return false
+        }
+      }
+      if (enforce) await waitFor(() => !alive(), '后台子进程被结束')
+      else {
+        expect(alive()).toBe(true)
+        process.kill(pid, 'SIGKILL')
+      }
+    }
+  })
+
   test('开关打开、danger-full-access：子进程经 sandbox-exec -f <配置> codex … 启动，配置 0600', async () => {
     const s = setup('send(resumed)', dfa)
     const fake = fakeSandboxExec(s.dir)
@@ -940,8 +976,8 @@ describe('外层 seatbelt（worker-credential-isolation 4.3）', () => {
     expect(lstatSync(profile).mode & 0o777).toBe(0o600)
     const text = readFileSync(profile, 'utf8')
     expect(text).toContain('(version 1)\n(allow default)\n')
-    // 独立的 CODEX_HOME（审查第一轮 H3）：内部也是白名单，只放行运行状态；不与 workspace-write 共用的 codex-home。
-    // 每个任务一个独立的 CODEX_HOME（审查第二轮 M1）。
+    // 独立的 CODEX_HOME（审查第一轮 H3）：不与 workspace-write 共用的 codex-home；每个任务一个（审查第二轮 M1）。
+    // 4.5 实测后整体可写（用户 2026-11-10 决定），只有 auth.json 链接本身拒绝写。
     const sealedHome = join(realpathSync(s.home), 'run/tasks/t-test/codex-home')
     // 任务完成后删除。
     expect(existsSync(sealedHome)).toBe(false)
@@ -949,9 +985,11 @@ describe('外层 seatbelt（worker-credential-isolation 4.3）', () => {
     expect(text).toContain('(deny file-write*)\n')
     const writeBlock =
       text.split('(allow file-write*')[1]?.split('(allow network-outbound')[0] ?? ''
-    expect(writeBlock).not.toContain(`(subpath "${sealedHome}")`)
+    expect(writeBlock).toContain(`(subpath "${sealedHome}")`)
     for (const name of ['sessions', 'log', 'tmp'])
-      expect(text).toContain(`(subpath "${join(sealedHome, name)}")`)
+      expect(text).not.toContain(`(subpath "${join(sealedHome, name)}")`)
+    // 没有配置 darwinUserCacheDir：不放行 mds、不记录基线。
+    expect(text).not.toContain('/mds"')
     // 普通 CODEX_HOME（无外层 seatbelt 的设置共用）没有被创建或放行。
     expect(existsSync(execCodexHome(s.home))).toBe(false)
     // auth.json 链接本身拒绝写（M1）。

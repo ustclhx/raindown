@@ -1,0 +1,30 @@
+{
+  "$id": "https://raindown.local/schemas/protocol/nodes-isolation-notice.response.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "const": true
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "recorded": {
+          "type": "boolean",
+          "description": "false 表示同一信号 id 已记录过"
+        }
+      },
+      "required": [
+        "recorded"
+      ],
+      "additionalProperties": false,
+      "title": "POST /v1/nodes/:id/isolation-notices 响应"
+    }
+  },
+  "required": [
+    "ok",
+    "data"
+  ],
+  "additionalProperties": false
+}

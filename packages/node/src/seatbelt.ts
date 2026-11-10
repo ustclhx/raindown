@@ -1,5 +1,6 @@
 import {
   type CredentialIsolation,
+  canonicalPath,
   computeIsolationSpec,
   type Env,
   fail,
@@ -7,6 +8,7 @@ import {
   type IsolationLayer,
   type IsolationSpec,
   loadWorkspaces,
+  mdsDirOf,
   ok,
   type Result,
   type Role,
@@ -14,6 +16,7 @@ import {
   roleSandboxSetting,
 } from '@raindown/core'
 import { writeSeatbeltProfile } from './lease-token.ts'
+import { recordMdsBaseline } from './mds.ts'
 
 /**
  * 外层 seatbelt 的施加（add-worker-credential-isolation 4.1–4.4）。
@@ -55,6 +58,12 @@ export interface SeatbeltOptions {
   dissociate?: boolean
   /** 节点在沙箱外建立、回收独立 clone 时运行 git 的基础环境；缺省 process.env（测试注入临时 HOME）。 */
   gitEnv?: NodeJS.ProcessEnv
+  /**
+   * 本用户的 `DARWIN_USER_CACHE_DIR`（realpath，`/private/var/folders/` 下；节点启动时经 `resolveDarwinUserCacheDir` 解析，测试注入临时目录）。
+   * 给出时写白名单放行其中的 `mds/`（4.5 实测：Codex 校验登录需要），并在每次启动 harness 前记录 `mds/` 的基线、结束后校验重置（`mds.ts`）。
+   * 缺省（解析失败）不放行，doctor 提示。
+   */
+  darwinUserCacheDir?: string
 }
 
 /** 开关是否在本机生效：打开且运行在 macOS 上。 */
@@ -179,9 +188,41 @@ export async function prepareSeatbelt(
     registeredRepos: await registeredRepos(input.home),
     ...(input.sealedClone !== undefined ? { sealedClone: input.sealedClone } : {}),
     ...(input.allowKeychain ? { allowKeychain: true } : {}),
+    ...(o.darwinUserCacheDir !== undefined ? { darwinUserCacheDir: o.darwinUserCacheDir } : {}),
   })
   if (!spec.ok) return spec
+  const baseline = await recordSeatbeltMdsBaseline(o, input.home, input.taskId)
+  if (!baseline.ok) return baseline
   return writeSeatbeltLaunch(o, input.home, input.taskId, spec.data)
+}
+
+/**
+ * 启动（或重新挂接）施加外层 seatbelt 的 harness 前记录 `mds/` 的基线（`mds.ts`：先与全部已有基线比较并重置）；
+ * 没有配置 `darwinUserCacheDir` 时什么也不做。`hold`：codex-orca 的终端在执行结束后可能继续运行，基线保留到终端结束。
+ * 失败时返回错误，调用方不启动 harness（不能校验就不放行）。
+ */
+export async function recordSeatbeltMdsBaseline(
+  o: Pick<SeatbeltOptions, 'darwinUserCacheDir'>,
+  home: string,
+  taskId: string,
+  opts: { hold?: boolean } = {},
+): Promise<Result<null>> {
+  if (o.darwinUserCacheDir === undefined) return ok(null)
+  try {
+    await recordMdsBaseline(
+      home,
+      taskId,
+      await canonicalPath(mdsDirOf(o.darwinUserCacheDir)),
+      opts.hold ? { hold: true } : {},
+    )
+    return ok(null)
+  } catch (err) {
+    return fail(
+      'failure',
+      'isolation_mds_baseline_failed',
+      `无法记录 macOS Security 缓存（mds）的基线：${(err as Error).message}`,
+    )
+  }
 }
 
 /** 施加失败时给 worker 结果用的说明（带上原错误码与原因）。 */

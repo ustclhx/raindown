@@ -90,6 +90,7 @@ import {
   UNTRUSTED_CHECKOUT_ENV,
 } from './github.ts'
 import { autoApprovedText, needsUserText, type PrecheckRequest } from './precheck.ts'
+import { killProcessGroup } from './process-group.ts'
 import {
   cleanupStaleReviews,
   type PreparedReview,
@@ -396,7 +397,10 @@ export function seatbeltSpawner(
       env,
       signal,
       stdio: ['pipe', 'pipe', 'pipe'],
+      // 独立进程组（审查第四轮）：会话进程结束（含正常结束）时结束整个组，worker 留在后台的子进程不比会话活得更久。
+      detached: true,
     })
+    child.on('exit', () => killProcessGroup(child.pid))
     child.stderr.setEncoding('utf8').on('data', (data: string) => stderr?.(data))
     // 启动失败（ENOENT 等）时 ChildProcess 发出 'error'：总有一个监听者，不让节点进程因未处理的 'error' 崩溃；
     // 原因交给 stderr 回调，随退出错误中的 stderr 尾部（脱敏后）上报（审查第一轮 L2）。SDK 自己也会监听 'error'。

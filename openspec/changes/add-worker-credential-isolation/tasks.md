@@ -57,6 +57,9 @@
     仓库 setup（`bun install`）在冷的任务缓存下的耗时；husky 等写 `core.hooksPath` 的工具；工具写 `~/Library/Application Support` 等位置的失败（按 docs 排查追加）；
     经 cfprefsd 的偏好设置写入未拦住（Risks）。
 - [ ] 4.5 真实验收（征得用户同意后在本机执行）：dev 角色跑一个 product-res 任务，worker 内 `cat ~/raindown-home/state/hub.token`、写 `config/policies.yaml`、读其他任务令牌全部失败，`raindown_report` 与 `kb_search` 正常，任务正常完成
+  - 试运行发现（2026-11-10）：pnpm 12 的 store 与锁目录（PR #100）；Codex 在外层 seatbelt 内无法启动——独立 CODEX_HOME 内部白名单太窄、
+    Security 框架需要写 `<DARWIN_USER_CACHE_DIR>/mds/`。用户决定：CODEX_HOME 整体可写（只保留 `auth.json` 链接与目录改名的拒绝），
+    `mds/` 放行并由节点在 harness 前后校验与重置（design D2、Risks）；Codex `tmp/arg0` 硬链接别名被拒只打印 WARNING，保持现状。
 
 ## 5. harness 沙箱开启时的隔离
 

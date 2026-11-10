@@ -44,6 +44,7 @@ import {
   type ExecutorPlugin,
   resumedSignal,
 } from './executor.ts'
+import { killProcessGroup } from './process-group.ts'
 import { prepareSealedWorkdir, rollbackSealedClone } from './sealed-workdir.ts'
 import {
   effectiveCredentialIsolation,
@@ -482,8 +483,13 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
           child.on('error', (err) => {
             spawnError = err
           })
+          const spawned = child
           child.on('close', (code, signal) => {
             lines.close()
+            // 进程正常结束时同样结束整个进程组（审查第四轮）：worker 留在后台的子进程（nohup、&）不比 harness 活得更久。
+            // 调用 setsid 的子进程会离开进程组，由节点的 mds 已知良好快照兜底（design Risks）。
+            // 只在施加外层 seatbelt 时这样做：开关关闭时行为不变。
+            if (seatbelt.length > 0) killProcessGroup(spawned.pid)
             if (cancelled) {
               finish(ok({ outcome: 'cancelled' }))
               return

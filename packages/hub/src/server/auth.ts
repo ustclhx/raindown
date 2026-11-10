@@ -49,6 +49,7 @@ export interface HubAuthOptions {
 const NODE_ENDPOINTS: readonly EndpointName[] = [
   'policy-check',
   'nodes-register',
+  'nodes-isolation-notice',
   'leases-acquire',
   'leases-renew',
   'leases-complete',
@@ -106,10 +107,31 @@ async function checkNodeScope(
         return errorResponse(c, 'scope_denied', `节点身份 ${actor} 不能代表 ${String(bodyNode)}`)
       }
     }
+    // 隔离事实上报：路径中的节点必须是本身份。
+    if (hit.name === 'nodes-isolation-notice') {
+      const m = hit.match(c)
+      let pathNode: string | undefined
+      try {
+        pathNode = decodeURIComponent(m?.[1] ?? '')
+      } catch {
+        // 不合法的百分号编码：按身份不符拒绝（审查第二轮：不能是 500）。
+        pathNode = undefined
+      }
+      if (pathNode !== nodeId)
+        return errorResponse(c, 'scope_denied', `节点身份 ${actor} 只能以自己的节点 id 上报`)
+    }
     return null
   }
   const show = taskShow(c)
-  if (show?.[1]) return checkTaskScope(c, decodeURIComponent(show[1]), leaseHolders)
+  if (show?.[1]) {
+    let taskId: string
+    try {
+      taskId = decodeURIComponent(show[1])
+    } catch {
+      return errorResponse(c, 'invalid_arguments', '任务路径编码不合法')
+    }
+    return checkTaskScope(c, taskId, leaseHolders)
+  }
   return denied()
 }
 

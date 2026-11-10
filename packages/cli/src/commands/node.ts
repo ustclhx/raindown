@@ -10,6 +10,7 @@ import {
   ok,
   raindownPaths,
   renderTable,
+  resolveDarwinUserCacheDir,
   resolveRaindownHome,
   rotateLog,
 } from '@raindown/core'
@@ -60,6 +61,15 @@ export const nodeStartCommand = defineCommand({
       console.error(
         'config/node.yaml 的 isolation.enforce 已打开，但外层 seatbelt 只支持 macOS，本机不施加',
       )
+    if (seatbeltActive(isolation)) {
+      // macOS Security 框架的 mds/（4.5 实测：Codex 校验登录需要写）：解析失败时不放行，Codex 可能无法校验登录（doctor 提示）。
+      const cacheDir = await resolveDarwinUserCacheDir()
+      if (cacheDir.ok) isolation.darwinUserCacheDir = cacheDir.dir
+      else
+        console.error(
+          `无法解析 DARWIN_USER_CACHE_DIR，外层 seatbelt 不放行 mds：${cacheDir.reason}`,
+        )
+    }
     // fake 用于端到端测试；其余执行器调用本机的 Orca / Codex、Claude Agent SDK 与 gh。
     const started = await startNode({
       home,
@@ -71,11 +81,17 @@ export const nodeStartCommand = defineCommand({
         // 不调用模型，按确定性条件合并 PR（add-m1-supervisor D10）。
         createPrMergeExecutor({ home }),
       ],
+      // 外层 seatbelt 生效时才定期重试 mds 重置通知（开关关闭时不启动定时器）。
+      isolationActive: seatbeltActive(isolation),
       // 隔离自检探针：启动时、每 6 小时、macOS 版本变化时运行，结果随注册上报（worker-credential-isolation 3.1）。
       // 探针只判断受保护文件能否打开，不读取内容。
       isolationProbe: {
         resolveOrcaPorts: orcaPorts,
         extraWrite: nodeConfig.data.isolation.extra_write,
+        // 与 worker 相同的 mds 放行（4.5），探针配置与 worker 配置一致。
+        ...(isolation.darwinUserCacheDir !== undefined
+          ? { darwinUserCacheDir: isolation.darwinUserCacheDir }
+          : {}),
         ...(seatbeltActive(isolation)
           ? { launchWrapper: seatbeltProbeLaunchWrapper(isolation) }
           : {}),

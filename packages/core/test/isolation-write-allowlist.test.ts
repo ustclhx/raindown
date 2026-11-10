@@ -14,6 +14,7 @@ import {
   normalizeExtraWrite,
   pnpmLockWriteRegex,
   renderSeatbeltProfile,
+  resolveDarwinUserCacheDir,
   resolveGitLayout,
   taskScratchEnv,
 } from '../src/index.ts'
@@ -183,16 +184,8 @@ const baseInput = (
   access: 'write',
   leaseTokenFile: join(e.home, 'run/tasks/t-1/dispatch-tokens/l-1.token'),
   harnessPaths: [
-    {
-      path: e.codexHome,
-      access: 'write',
-      only: {
-        subpaths: ['sessions', 'log', 'tmp'],
-        files: ['history.jsonl'],
-        fileRegex: '[^/]+\\.sqlite(-wal|-shm)?',
-      },
-      denyWrite: ['auth.json'],
-    },
+    // 与 codex 适配器的 codexHarnessPaths 相同：独立 CODEX_HOME 整体可写，auth.json 链接本身拒绝写（4.5，用户 2026-11-10 决定）。
+    { path: e.codexHome, access: 'write', denyWrite: ['auth.json'] },
     { path: join(e.codexHome, 'auth.json'), access: 'write', literal: true },
   ],
   hubPort: 7477,
@@ -213,14 +206,12 @@ describe('computeIsolationSpec：写白名单', () => {
     expect(s.allow_write).toEqual(
       expect.arrayContaining([cwd, join(e.home, 'run/tasks/t-1'), '/dev/fd']),
     )
-    // 独立 CODEX_HOME 内部也是白名单（H3）：目录本身整体挖掉（它位于可写的本任务私有目录内，审查第二轮 M1），
-    // 之后只放行列出的运行状态。
-    expect(s.allow_write).not.toContain(e.codexHome)
-    expect(s.write_carve_outs).toContain(e.codexHome)
-    expect(s.allow_write_inside).toEqual(
-      expect.arrayContaining([join(e.codexHome, 'sessions'), join(e.codexHome, 'tmp')]),
-    )
-    expect(s.allow_write_inside_literals).toContain(join(e.codexHome, 'history.jsonl'))
+    // 独立 CODEX_HOME 整体可写（4.5 实测，用户 2026-11-10 决定）：只挖掉 auth.json 链接本身。
+    expect(s.allow_write).toContain(e.codexHome)
+    expect(s.write_carve_outs).not.toContain(e.codexHome)
+    expect(s.write_carve_outs).toContain(join(e.codexHome, 'auth.json'))
+    // 没有注入 DARWIN_USER_CACHE_DIR 时不放行 mds。
+    expect(s.allow_write.some((p) => p.endsWith('/mds'))).toBe(false)
     for (const shared of [
       '/private/tmp',
       await realpath(tmpdir()),
@@ -234,12 +225,6 @@ describe('computeIsolationSpec：写白名单', () => {
     )
     // 正则只有 pnpm 12 的锁目录（钥匙串未放行）。
     expect(s.allow_write_regex).toEqual([pnpmLockWriteRegex(process.getuid?.() ?? 0)])
-    expect(s.allow_write_inside_regex).toHaveLength(1)
-    expect(s.allow_write_inside_regex[0]).toContain('\\.sqlite')
-    // auth.json 链接本身拒绝写（M1）。
-    expect(s.write_carve_outs.some((p) => join(e.codexHome, 'auth.json').startsWith(`${p}/`))).toBe(
-      true,
-    )
     // 持久化位置的纵深防御（L1）：~/.codex 保留 auth.json 链接目标。
     const codex = s.deny_write_except.find((d) => d.path === join(e.userHome, '.codex'))
     expect(codex?.except).toEqual([join(e.userHome, '.codex/auth.json')])
@@ -297,26 +282,52 @@ describe('computeIsolationSpec：写白名单', () => {
     expect(badSpec.ok).toBe(false)
   })
 
-  test('harness 的放行与拒绝条目必须是相对路径；文件名正则不能含 / 或引号', async () => {
+  test('harness 的拒绝写条目必须是相对路径', async () => {
     const root = await tempRoot('raindown-allowlist-')
     const e = await fakeEnv(root)
     for (const rel of ['../x', '/abs', 'a/../b', '']) {
-      for (const h of [
-        { path: e.codexHome, access: 'write' as const, denyWrite: [rel] },
-        { path: e.codexHome, access: 'write' as const, only: { subpaths: [rel] } },
-      ]) {
-        const spec = await computeIsolationSpec(baseInput(e, root, { harnessPaths: [h] }))
-        expect(!spec.ok && spec.error.code).toBe('invalid_isolation_input')
-      }
-    }
-    for (const fileRegex of ['a/b', 'a"b']) {
-      const spec = await computeIsolationSpec(
-        baseInput(e, root, {
-          harnessPaths: [{ path: e.codexHome, access: 'write', only: { fileRegex } }],
-        }),
-      )
+      const h = { path: e.codexHome, access: 'write' as const, denyWrite: [rel] }
+      const spec = await computeIsolationSpec(baseInput(e, root, { harnessPaths: [h] }))
       expect(!spec.ok && spec.error.code).toBe('invalid_isolation_input')
     }
+  })
+
+  test('mds（4.5）：注入 DARWIN_USER_CACHE_DIR 时放行其 mds/ 子树，mds 目录节点本身拒绝写', async () => {
+    const root = await tempRoot('raindown-allowlist-')
+    const e = await fakeEnv(root)
+    const cacheDir = join(root, 'var-folders/C')
+    await mkdir(join(cacheDir, 'mds'), { recursive: true })
+    const spec = await computeIsolationSpec(
+      baseInput(e, root, { darwinUserCacheDir: cacheDir, cwd: join(e.home, 'run/tasks/t-1') }),
+    )
+    if (!spec.ok) throw new Error(spec.error.message)
+    const mds = join(cacheDir, 'mds')
+    expect(spec.data.allow_write).toContain(mds)
+    expect(spec.data.allow_write).not.toContain(cacheDir)
+    expect(spec.data.write_carve_out_literals).toContain(mds)
+    const profile = renderSeatbeltProfile(spec.data)
+    if (!profile.ok) throw new Error(profile.error.message)
+    expect(profile.data).toContain(`(subpath "${mds}")`)
+    expect(profile.data).toContain(`(literal "${mds}")`)
+  })
+
+  test('resolveDarwinUserCacheDir：realpath 后必须在 /private/var/folders/ 下；getconf 失败或输出异常时不放行', async () => {
+    const root = await tempRoot('raindown-cachedir-')
+    expect(await resolveDarwinUserCacheDir({ getconf: () => `${root}/\n` })).toMatchObject(
+      root.startsWith('/private/var/folders/') ? { ok: true, dir: root } : { ok: false },
+    )
+    for (const out of ['', 'relative/C', '/nonexistent-raindown/C/', '/etc/\u0001']) {
+      const r = await resolveDarwinUserCacheDir({ getconf: () => out })
+      expect({ out, ok: r.ok }).toEqual({ out, ok: false })
+    }
+    const thrown = await resolveDarwinUserCacheDir({
+      getconf: () => {
+        throw new Error('boom')
+      },
+    })
+    expect(thrown).toMatchObject({ ok: false })
+    // /private/tmp 下（存在、但不在 /private/var/folders/ 下）：拒绝。
+    expect((await resolveDarwinUserCacheDir({ getconf: () => '/' })).ok).toBe(false)
   })
 
   test('isolation.extra_write（L1）：大小写折叠与 NFD；拒绝持久化位置、登记仓库、PATH 目录、Application Support', async () => {
@@ -447,6 +458,11 @@ describe.skipIf(!onMac)('macOS 实测：写白名单', () => {
       join(e.codexHome, 'history.jsonl'),
       join(e.codexHome, 'state_5.sqlite'),
       join(e.codexHome, 'state_5.sqlite-wal'),
+      // 4.5 实测 Codex 启动时写的位置：独立 CODEX_HOME 整体可写。
+      join(e.codexHome, 'config.toml'),
+      join(e.codexHome, 'models_cache.json'),
+      join(e.codexHome, '.sqlite-maintenance.lock'),
+      join(e.codexHome, '.sandbox_migration'),
       join(e.userHome, 'Library/Keychains/login.keychain-db.sb-1234-abcd'),
     ]) {
       const r = sh(`echo ok > '${p}' && echo ok > /dev/null`)
@@ -468,10 +484,6 @@ describe.skipIf(!onMac)('macOS 实测：写白名单', () => {
       join(e.userHome, '.local/bin/x'),
       join(e.userHome, '.codex/config.toml'),
       join(e.userHome, 'Library/LaunchAgents/x.plist'),
-      join(e.codexHome, '.env'),
-      join(e.codexHome, 'config.toml'),
-      join(e.codexHome, 'models_cache.json'),
-      join(e.codexHome, 'shell_snapshots'),
       join(e.home, 'config/x.yaml'),
       join(e.home, 'run/tasks/t-1/dispatch-tokens/l-1.token'),
       join(root, 'outside'),
@@ -531,5 +543,111 @@ describe.skipIf(!onMac)('macOS 实测：写白名单', () => {
     for (const op of DENY_LAUNCH_OPERATIONS) expect(text).toContain(`(deny ${op})`)
     const r = run(path, 'echo ok > f && cat f && /usr/bin/true', cwd)
     expect({ status: r.status, out: r.stdout.trim() }).toEqual({ status: 0, out: 'ok' })
+  })
+
+  test('4.5：独立 CODEX_HOME 整体可写（含以写方式打开已存在的 installation_id）；auth.json 链接不能删除或替换，codex-home 不能改名', async () => {
+    const root = await tempRoot('raindown-allowlist-mac-')
+    const e = await fakeEnv(root)
+    const cwd = join(root, 'work')
+    await mkdir(cwd)
+    await writeFile(join(e.codexHome, 'installation_id'), 'fake-installation-id\n')
+    const { path } = await profileFor(root, baseInput(e, cwd), 'codex-home')
+    const sh = (cmd: string) => run(path, cmd, cwd)
+    // 以写方式打开已存在的文件（不截断）：Codex 对 installation_id 正是这样做的。
+    const open = sh(`exec 3<>'${join(e.codexHome, 'installation_id')}' && echo ok`)
+    expect({ status: open.status, err: open.stderr }).toEqual({ status: 0, err: '' })
+    for (const p of [
+      join(e.codexHome, 'thread-writer-locks/x'),
+      join(e.codexHome, 'tui-thread-reference-capabilities/x'),
+      join(e.codexHome, 'plugins/x'),
+      join(e.codexHome, 'shell_snapshots/x.sh'),
+      join(e.codexHome, 'skills/.system/x'),
+      join(e.codexHome, 'tmp/arg0/x'),
+      join(e.codexHome, 'config.toml'),
+      join(e.codexHome, 'new-dir/new-file'),
+    ]) {
+      const r = sh(`mkdir -p "$(dirname '${p}')" && echo ok > '${p}'`)
+      expect({ p, status: r.status, err: r.stderr }).toEqual({ p, status: 0, err: '' })
+    }
+    const link = join(e.codexHome, 'auth.json')
+    for (const cmd of [
+      `rm -f '${link}'`,
+      `ln -sfn /etc/hosts '${link}'`,
+      `mv '${link}' '${link}.bak'`,
+      `mv '${e.codexHome}' '${e.codexHome}.moved'`,
+      `rm -rf '${e.codexHome}'`,
+    ])
+      expect({ cmd, status: sh(cmd).status }).not.toEqual({ cmd, status: 0 })
+    expect(await readlink(link)).toBe(join(e.userHome, '.codex/auth.json'))
+    expect(existsSync(`${e.codexHome}.moved`)).toBe(false)
+    // 其他受保护项照旧拒绝。
+    for (const p of [
+      join(e.home, 'config/x.yaml'),
+      join(e.home, 'run/tasks/t-1/dispatch-tokens/l-1.token'),
+      join(e.userHome, '.codex/config.toml'),
+      join(e.userHome, '.zshenv'),
+    ]) {
+      expect({ p, status: sh(`echo PWNED >> '${p}'`).status }).not.toEqual({ p, status: 0 })
+      expect(existsSync(p) && readFileSync(p, 'utf8').includes('PWNED')).toBe(false)
+    }
+    expect(sh(`cat '${join(e.home, 'state/hub.token')}'`).status).not.toBe(0)
+  })
+
+  test('4.5：注入的 DARWIN_USER_CACHE_DIR 下 mds/ 可写（含以写方式打开已存在的数据库），mds 目录本身不能改名，C/ 其他位置拒绝', async () => {
+    const root = await tempRoot('raindown-allowlist-mac-')
+    const e = await fakeEnv(root)
+    const cwd = join(root, 'work')
+    await mkdir(cwd)
+    // 假的 DARWIN_USER_CACHE_DIR：<tmp>/C/mds/…，绝不碰真实的 /private/var/folders/*/C/mds。
+    const cacheDir = join(root, 'C')
+    const mds = join(cacheDir, 'mds')
+    await mkdir(mds, { recursive: true })
+    for (const f of ['mds.lock', 'mdsDirectory.db', 'mdsObject.db'])
+      await writeFile(join(mds, f), '')
+    const { path } = await profileFor(
+      root,
+      baseInput(e, cwd, { darwinUserCacheDir: cacheDir }),
+      'mds',
+    )
+    const sh = (cmd: string) => run(path, cmd, cwd)
+    for (const f of ['mds.lock', 'mdsDirectory.db', 'mdsObject.db']) {
+      const r = sh(`exec 3<>'${join(mds, f)}' && echo x >&3`)
+      expect({ f, status: r.status, err: r.stderr }).toEqual({ f, status: 0, err: '' })
+    }
+    for (const cmd of [
+      `echo ok > '${join(mds, 'new.db')}'`,
+      `rm -f '${join(mds, 'mds.lock')}' && echo ok > '${join(mds, 'mds.lock')}'`,
+    ]) {
+      const r = sh(cmd)
+      expect({ cmd, status: r.status, err: r.stderr }).toEqual({ cmd, status: 0, err: '' })
+    }
+    // 审查第一轮：mds 中只能新建普通文件——符号链接、目录、FIFO 都不能新建，也不能从可写位置改名移入。
+    const staging = join(e.home, 'run/tasks/t-1/tmp')
+    const target = join(root, 'outside-target')
+    for (const cmd of [
+      `mv '${mds}' '${mds}.moved'`,
+      `rm -rf '${mds}'`,
+      `echo PWNED > '${join(cacheDir, 'other')}'`,
+      `ln -s '${target}' '${join(mds, 'link.db')}'`,
+      `rm -f '${join(mds, 'mdsObject.db')}' && ln -s '${target}' '${join(mds, 'mdsObject.db')}'`,
+      `mkdir '${join(mds, 'subdir')}'`,
+      `mkfifo '${join(mds, 'fifo')}'`,
+      `ln -s '${target}' '${join(staging, 'l')}' && mv '${join(staging, 'l')}' '${join(mds, 'moved-link')}'`,
+      `mkdir '${join(staging, 'd')}' && mv '${join(staging, 'd')}' '${join(mds, 'moved-dir')}'`,
+    ])
+      expect({ cmd, status: sh(cmd).status }).not.toEqual({ cmd, status: 0 })
+    for (const name of ['link.db', 'subdir', 'fifo', 'moved-link', 'moved-dir'])
+      expect({ name, exists: existsSync(join(mds, name)) }).toEqual({ name, exists: false })
+    expect(existsSync(target)).toBe(false)
+    // 普通文件仍可新建、改名移入与替换。
+    const regular = sh(
+      `echo ok > '${join(staging, 'f')}' && mv '${join(staging, 'f')}' '${join(mds, 'moved-file.db')}' && echo ok > '${join(mds, 'mdsObject.db')}'`,
+    )
+    expect({ status: regular.status, err: regular.stderr }).toEqual({ status: 0, err: '' })
+    expect(existsSync(mds)).toBe(true)
+    expect(existsSync(join(cacheDir, 'other'))).toBe(false)
+    // 不注入时 mds 不在白名单内。
+    const off = await profileFor(root, baseInput(e, cwd), 'mds-off')
+    expect(run(off.path, `echo x > '${join(mds, 'mds.lock')}'`, cwd).status).not.toBe(0)
   })
 })

@@ -3566,6 +3566,63 @@
                 "kind"
               ],
               "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "mds_reset"
+                },
+                "files": {
+                  "minItems": 1,
+                  "maxItems": 100,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 255
+                  },
+                  "description": "被删除的 mds/ 条目名（只有文件名）"
+                },
+                "repeats": {
+                  "description": "各文件在同一基线下被重置的次数（审查第三轮：重复重置只计数）",
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 255
+                  },
+                  "additionalProperties": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  }
+                },
+                "inbox": {
+                  "description": "none：只写任务事件（重复重置的计数）；repeated：写“反复重置”的收件箱条目；缺省写普通的重置条目",
+                  "type": "string",
+                  "enum": [
+                    "none",
+                    "repeated"
+                  ]
+                },
+                "message": {
+                  "type": "string",
+                  "maxLength": 16384
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "files"
+              ],
+              "additionalProperties": false
             }
           ]
         }

@@ -318,6 +318,7 @@ describe('端点清单与 JSON Schema 导出', () => {
       'GET /v1/events',
       'POST /v1/nodes',
       'GET /v1/nodes',
+      'POST /v1/nodes/:id/isolation-notices',
       'POST /v1/leases',
       'POST /v1/leases/:id/renew',
       'POST /v1/leases/:id/complete',

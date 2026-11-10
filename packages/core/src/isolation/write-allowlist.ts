@@ -1,4 +1,5 @@
-import { lstat, open } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { lstat, open, realpath } from 'node:fs/promises'
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path'
 import { canonicalPath, isWithin, taskRunDir } from './paths.ts'
 
@@ -87,6 +88,57 @@ export function pnpmLockWriteRegex(uid: number): string {
   if (!Number.isSafeInteger(uid) || uid < 0) throw new Error(`uid 不合法：${JSON.stringify(uid)}`)
   return `^/private/tmp/pnpm-(${PNPM_LOCK_DIR_NAMES.join('|')})-locks-${uid}(/|$)`
 }
+
+/** macOS Security 框架在 `DARWIN_USER_CACHE_DIR` 下的数据库目录名。 */
+export const MDS_DIR_NAME = 'mds'
+export const mdsDirOf = (darwinUserCacheDir: string) => join(darwinUserCacheDir, MDS_DIR_NAME)
+
+/** `DARWIN_USER_CACHE_DIR` 必须位于这里（realpath 之后）。 */
+export const DARWIN_USER_CACHE_PREFIX = '/private/var/folders/'
+
+export type DarwinUserCacheDirResolution = { ok: true; dir: string } | { ok: false; reason: string }
+
+/**
+ * 解析本用户的 `DARWIN_USER_CACHE_DIR`（`getconf DARWIN_USER_CACHE_DIR`，4.5 实测：Codex 校验登录时 macOS Security 框架以写方式
+ * 打开其中 `mds/` 下的 `mds.lock`、`mdsDirectory.db`、`mdsObject.db`）。只做路径解析（realpath，`/var` → `/private/var`），
+ * 不读写其中的内容；结果必须是 `/private/var/folders/` 下的绝对路径，否则视为解析失败（调用方不放行 mds，doctor 提示）。
+ * `getconf` 可注入（测试不运行真实命令）。
+ */
+export async function resolveDarwinUserCacheDir(
+  o: { getconf?: () => Promise<string> | string } = {},
+): Promise<DarwinUserCacheDirResolution> {
+  let raw: string
+  try {
+    raw = (await (o.getconf ?? defaultGetconf)()).trim()
+  } catch (err) {
+    return { ok: false, reason: `getconf DARWIN_USER_CACHE_DIR 失败：${(err as Error).message}` }
+  }
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: 拒绝含控制字符的路径
+  if (!raw || !isAbsolute(raw) || /[\u0000-\u001f\u007f]/.test(raw))
+    return {
+      ok: false,
+      reason: `getconf DARWIN_USER_CACHE_DIR 的输出不是绝对路径：${JSON.stringify(raw)}`,
+    }
+  let dir: string
+  try {
+    dir = await realpath(raw)
+  } catch (err) {
+    return { ok: false, reason: `无法解析 ${raw}：${(err as Error).message}` }
+  }
+  if (!dir.startsWith(DARWIN_USER_CACHE_PREFIX) || dir.split('/').includes('..'))
+    return { ok: false, reason: `${dir} 不在 ${DARWIN_USER_CACHE_PREFIX} 下` }
+  return { ok: true, dir }
+}
+
+const defaultGetconf = () =>
+  new Promise<string>((resolve, reject) => {
+    execFile(
+      '/usr/bin/getconf',
+      ['DARWIN_USER_CACHE_DIR'],
+      { timeout: 5_000, encoding: 'utf8' },
+      (err, stdout) => (err ? reject(err) : resolve(stdout)),
+    )
+  })
 
 /**
  * 会在沙箱外被执行或加载的持久化位置（相对用户主目录）。

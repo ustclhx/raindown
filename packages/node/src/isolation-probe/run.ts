@@ -104,6 +104,8 @@ export interface IsolationProbeOptions {
   resolveOrcaPorts?: () => Promise<number[]> | number[]
   /** `config/node.yaml` 的 `isolation.extra_write`（与 worker 的隔离清单一致）。 */
   extraWrite?: readonly string[]
+  /** 本用户的 `DARWIN_USER_CACHE_DIR`（与 worker 的隔离清单一致：放行 mds，4.5）。探针不写其中任何文件。 */
+  darwinUserCacheDir?: string
   launchWrapper?: ProbeLaunchWrapper
   /** 子进程的可执行文件（缺省为当前运行时，即 bun）。 */
   execPath?: string
@@ -394,6 +396,7 @@ async function runOne(
       ...(o.resolveOrcaPorts ? { resolveOrcaPorts: o.resolveOrcaPorts } : {}),
       ...(o.env ? { env: o.env } : {}),
       ...(o.extraWrite ? { extraWrite: o.extraWrite } : {}),
+      ...(o.darwinUserCacheDir !== undefined ? { darwinUserCacheDir: o.darwinUserCacheDir } : {}),
       // 模拟登记仓库的 .git 整体只读；探针工作目录按独立 clone 计算（写类角色时其 .git 可写）。
       registeredRepos: [repo.repo],
       sealedClone: cwd,

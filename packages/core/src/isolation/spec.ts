@@ -14,9 +14,9 @@ import {
   taskRunDir,
 } from './paths.ts'
 import {
-  escapeRegex,
   gitWriteRules,
   keychainWriteRegex,
+  mdsDirOf,
   normalizeExtraWrite,
   PERSISTENCE_PATHS,
   pnpmLockWriteRegex,
@@ -52,11 +52,6 @@ export interface HarnessPath {
    * （例如 CODEX_HOME 的 `config.toml`、`rules/`，Claude 配置目录的 `settings.json`、`hooks/`）。
    */
   denyWrite?: readonly string[]
-  /**
-   * `access: write` 时目录内部也是白名单（审查第一轮 H3）：只放行这些相对子目录、相对文件，以及直接子项中文件名匹配
-   * `fileRegex` 的文件（正则只匹配一级文件名，不含 `/`）。给出时目录本身不作为整体放行。
-   */
-  only?: { subpaths?: readonly string[]; files?: readonly string[]; fileRegex?: string }
 }
 
 /**
@@ -89,19 +84,17 @@ export interface IsolationSpec {
   allow_write_literals: string[]
   /** 白名单内再拒绝写的子树（git 目录、harness 目录中的配置与扩展）。 */
   write_carve_outs: string[]
-  /** 白名单内再拒绝写的单个文件（linked worktree 的 `.git` 指针文件）。 */
+  /** 白名单内再拒绝写的单个文件或目录节点（linked worktree 的 `.git` 指针文件、`mds` 目录本身）。 */
   write_carve_out_literals: string[]
-  /** 写白名单（正则，已转义路径前缀）：登录钥匙串文件、harness 目录中按文件名放行的运行状态。 */
+  /** 写白名单（正则，已转义路径前缀）：登录钥匙串文件、pnpm 12 的锁目录。 */
   allow_write_regex: string[]
   /** 本任务独立 clone 的 `.git`（只给施加了外层 seatbelt 的写类角色）。 */
   allow_write_git: string[]
   /**
-   * 内部为白名单的 harness 目录（独立 CODEX_HOME）中放行的子目录、文件与文件名正则：目录本身在 `write_carve_outs` 中整体挖掉，
-   * 这些在挖掉之后再放行（审查第二轮 M1）。
+   * 其中只能新建普通文件的子树（`mds/`，审查第一轮）：拒绝在其中新建符号链接、目录、FIFO 等，
+   * 也拒绝把它们改名移入——沙箱外使用 Security 框架的进程不会经 worker 预埋的链接写到别处。
    */
-  allow_write_inside: string[]
-  allow_write_inside_literals: string[]
-  allow_write_inside_regex: string[]
+  regular_files_only: string[]
   /** 最后写拒绝、但保留其中个别文件（持久化位置的纵深防御；`~/.codex` 保留 auth.json 链接目标）。 */
   deny_write_except: Array<{ path: string; except: string[] }>
   /** 拒绝连接其中 unix 套接字的目录（文件规则拦不住 connect）。 */
@@ -163,6 +156,12 @@ export interface IsolationSpecInput {
   allowKeychain?: boolean
   /** 当前用户 uid（pnpm 12 锁目录名的一部分）；缺省为 `process.getuid()`，不可得时（非 POSIX）不放行锁目录。 */
   uid?: number
+  /**
+   * 本用户的 `DARWIN_USER_CACHE_DIR`（节点侧经 `resolveDarwinUserCacheDir` 解析并校验，测试注入临时目录）。
+   * 给出时放行其中的 `mds/` 子树（macOS Security 框架校验登录时以写方式打开其中的数据库，4.5 实测），
+   * `mds` 目录节点本身不可改名或删除；缺省不放行。
+   */
+  darwinUserCacheDir?: string
 }
 
 /** 与节点写派工令牌时相同的路径段规则：不以 `.` 开头，因此排除 `.` 与 `..`。 */
@@ -351,11 +350,8 @@ export async function computeIsolationSpec(
     const allowWriteLiterals: string[] = []
     const carveOuts: string[] = []
     const allowWriteRegex: string[] = []
-    // 只放行在 `only` 中列出的位置（审查第二轮 M1）：目录本身先整体挖掉（它可能位于本任务私有目录等更大的可写子树内），
-    // 再在 1b 阶段放行列出的子目录、文件与文件名正则。目录 p 已参与“允许项不在受保护目录内”的检查。
-    const allowWriteInside: string[] = []
-    const allowWriteInsideLiterals: string[] = []
-    const allowWriteInsideRegex: string[] = []
+    const carveOutLiterals: string[] = []
+    const regularFilesOnly: string[] = []
     const relOk = (rel: string) =>
       !isAbsolute(rel) && !rel.split('/').some((s) => s === '..' || s === '.' || s === '')
     for (const h of input.harnessPaths ?? []) {
@@ -363,24 +359,7 @@ export async function computeIsolationSpec(
       allowRead.push(p)
       if (h.access === 'write') {
         if (h.literal) allowWriteLiterals.push(p)
-        else if (h.only) {
-          for (const rel of [...(h.only.subpaths ?? []), ...(h.only.files ?? [])])
-            if (!relOk(rel))
-              return bad(
-                'invalid_isolation_input',
-                `harness 放行条目不是相对路径：${JSON.stringify(rel)}`,
-              )
-          carveOuts.push(p)
-          allowWriteInside.push(...(h.only.subpaths ?? []).map((rel) => join(p, rel)))
-          allowWriteInsideLiterals.push(...(h.only.files ?? []).map((rel) => join(p, rel)))
-          if (h.only.fileRegex !== undefined) {
-            // 只匹配一级文件名：除字符类 `[^/]` 外不能含 `/`；SBPL 正则字面量不能含双引号。
-            const re = h.only.fileRegex
-            if (re.includes('"') || re.replaceAll('[^/]', '').includes('/'))
-              return bad('invalid_isolation_input', 'harness 文件名正则不能含 / 或 "')
-            allowWriteInsideRegex.push(`^${escapeRegex(p)}/${h.only.fileRegex}$`)
-          }
-        } else allowWrite.push(p)
+        else allowWrite.push(p)
         // 不解析最后一级：条目可能是指向用户目录的链接，要拒绝的是替换链接本身（经链接写入目标时按目标路径判断，本来就不在白名单内）。
         for (const rel of h.denyWrite ?? []) {
           if (!relOk(rel))
@@ -445,6 +424,14 @@ export async function computeIsolationSpec(
     // pnpm 12 写死在 `/private/tmp` 下的锁目录（只这三个目录；受保护项的拒绝写在其后，仍然优先）。
     const uid = input.uid ?? process.getuid?.()
     if (uid !== undefined) allowWriteRegex.push(pnpmLockWriteRegex(uid))
+    // macOS Security 框架的 `mds/`（4.5 实测：Codex 校验登录时以写方式打开其中的 mds.lock 与数据库）。
+    // 目录节点本身写拒绝（不能改名、删除或换成符号链接）；内容由节点在 harness 结束后校验并重置（node 的 mds.ts）。
+    if (input.darwinUserCacheDir !== undefined) {
+      const mds = await c(mdsDirOf(input.darwinUserCacheDir))
+      allowWrite.push(mds)
+      carveOutLiterals.push(mds)
+      regularFilesOnly.push(mds)
+    }
     // 登记仓库的 git 目录整体只读；只有本任务独立 clone 的 `.git` 放行（配置、hooks、alternates 等写在最后拒绝）。
     const registeredGitDirs: string[] = []
     for (const r of input.registeredRepos ?? []) registeredGitDirs.push(await c(join(r, '.git')))
@@ -490,12 +477,10 @@ export async function computeIsolationSpec(
       allow_write: uniqueSorted(allowWrite),
       allow_write_literals: uniqueSorted(allowWriteLiterals),
       allow_write_regex: uniqueSorted(allowWriteRegex),
-      allow_write_inside: uniqueSorted(allowWriteInside),
-      allow_write_inside_literals: uniqueSorted(allowWriteInsideLiterals),
-      allow_write_inside_regex: uniqueSorted(allowWriteInsideRegex),
       write_carve_outs: minimal(carveOuts),
-      write_carve_out_literals: uniqueSorted(gitRules.carveOutLiterals),
+      write_carve_out_literals: uniqueSorted([...gitRules.carveOutLiterals, ...carveOutLiterals]),
       allow_write_git: uniqueSorted(gitRules.allow),
+      regular_files_only: uniqueSorted(regularFilesOnly),
       deny_write_except: denyWriteExcept.sort((a, b) => a.path.localeCompare(b.path)),
       deny_unix_sockets: [orcaDir],
       allow_unix_sockets: [],

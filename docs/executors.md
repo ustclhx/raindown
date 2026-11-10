@@ -1095,7 +1095,8 @@ isolation:
 | --- | --- | --- |
 | 工作目录 | 写类角色：**本任务的独立 clone** `run/tasks/<任务>/repo/`（见下文）；只读角色的工作目录以写拒绝表示 | 写类角色 |
 | 本任务私有目录 | `run/tasks/<任务>/`，其中含按任务私有的 `tmp/` 与 `cache/`；`dispatch-tokens/` 与派工令牌仍拒绝 | 全部 |
-| Codex | 按任务的独立 `run/tasks/<任务>/codex-home/`，内部也是白名单（见下文）；`auth.json` 链接的目标**这一个文件** | codex-orca、codex-exec |
+| Codex | 按任务的独立 `run/tasks/<任务>/codex-home/` **整体**（`auth.json` 链接本身除外，见下文）；`auth.json` 链接的目标**这一个文件** | codex-orca、codex-exec |
+| macOS Security 缓存 | `<DARWIN_USER_CACHE_DIR>/mds/` 子树，其中只能新建普通文件（`mds` 目录节点本身不能改名或删除）；harness 前后节点校验并重置，见下文「mds」 | 全部（解析成功时） |
 | Claude Code | 按任务的 `run/tasks/<任务>/claude-config/`（`settings*.json`、`CLAUDE.md`、`commands/agents/skills/hooks/plugins/rules/output-styles`、`keybindings.json`、`managed-settings.json`、`.mcp.json` 除外） | claude-sdk |
 | 登录钥匙串 | 只有 `~/Library/Keychains/login.keychain-db` 与 `login.keychain-db.sb-*`（正则） | claude-sdk |
 | pnpm 12 锁目录 | `/private/tmp/pnpm-dir-locks-<uid>`、`pnpm-store-operation-locks-<uid>`、`pnpm-verify-deps-install-locks-<uid>` 及其内容（正则，uid 取节点进程的 `process.getuid()`）；与沙箱外的 pnpm 共用，残留风险见 design Risks | 全部 |
@@ -1178,14 +1179,64 @@ worker 的环境（codex-orca 终端命令的 `env` 赋值、codex-exec 子进�
 - 与 workspace-write / read-only 的 CODEX_HOME 不共享：共享时，worker 写入的 `.env`、`config.toml` 会被之后没有外层 seatbelt 的 Codex 进程加载；
 - 也不在任务之间共享：共享时一个任务的 worker 能改写另一个任务的会话记录，后者恢复会话时被注入；
 - 同一任务恢复会话用同一目录，任务完成或取消时删除；
-- 它位于可写的本任务私有目录内，因此目录本身先整体挖掉，再只放行下面的运行状态；执行器级的 CODEX_HOME（`run/executors/<执行器>/`）对 worker 读写都拒绝。
-- 内部也是白名单：只放行以下运行状态；
-  - `sessions/`、`archived_sessions/`、`log/`、`cache/`、`tmp/`；
-  - 根目录的 `history.jsonl`、`version.json`、`internal_storage.json`；
-  - 文件名匹配 `*.sqlite`、`*.sqlite-wal`、`*.sqlite-shm`、`*.sqlite-journal` 的状态库。
-- `.env`、`config.toml`、`shell_snapshots/`、`prompts/`、`rules/`、`hooks.json`、`AGENTS*.md`、`skills/`、`plugins/`、`models_cache.json` 不可写。
-- `tmp/` 放行的理由：Codex 启动时在 `tmp/arg0/` 建 apply_patch 等工具的别名链接，拒绝会使这些工具不可用。这个目录只被同样受隔离的 Codex 使用，worker 改写其中的别名也只在沙箱内执行。
+- 执行器级的 CODEX_HOME（`run/executors/<执行器>/`）对 worker 读写都拒绝。
+- **整体可写**（4.5 实测后用户 2026-11-10 决定）。之前的内部白名单（只放行 `sessions/`、`log/`、`tmp/`、`*.sqlite*` 等）会让 Codex 0.167.0 的 TUI 启动即退出：
+  - 以写方式打开已存在的 `installation_id` 被拒 → `Error: Operation not permitted`，终端没有输出，节点报 crashed；
+  - 会话存储写 `thread-writer-locks/`、`tui-thread-reference-capabilities/` 被拒 → `thread-store internal error: Operation not permitted`；
+  - 另外还会写 `.sqlite-maintenance.lock`、`.sandbox_migration`、`config.toml`（TUI 状态，例如 `[tui] screen_reader_detection_done`）、`models_cache.json`、`plugins/`、`shell_snapshots/`、`skills/.system/`。
+- 整体可写的依据：这个目录只被本任务沙箱内的 Codex 读取（与未施加的设置、其他任务都不共享，任务完成或取消时删除），worker 写入的内容（包括 `config.toml`、`.env`、`rules/`）只影响本任务，而且仍在外层 seatbelt 内执行。节点每次启动 Codex 前仍会覆盖 `config.toml`、清除 `rules/`、`hooks.json`、`AGENTS*.md`、`skills/`、`plugins/`。
+- 仍然拒绝的只有两项：`auth.json` 链接本身（见下）；`codex-home` 目录本身不能改名或删除（它是 `auth.json` 拒绝项的祖先目录）。
+- `tmp/arg0/`：Codex 启动时在其中为 apply_patch 等工具建**硬链接**别名，外层 seatbelt 下仍被拒绝（不是可写目录的问题），Codex 会打印一行 WARNING，可以忽略，工具仍可用（4.5 实测）。
 - 之前未施加时的 Codex 会话记录在原来的 CODEX_HOME 中，开关打开后不能在新目录中恢复（会新建会话）。
+
+**mds（4.5 实测，用户 2026-11-10 决定方案 1：放行 + 节点校验与重置）。** Codex 校验登录（`account/read`，workspace routing discovery）时，
+macOS Security 框架要**以写方式打开** `$(getconf DARWIN_USER_CACHE_DIR)mds/` 下的 `mds.lock`、`mdsDirectory.db`、`mdsObject.db`
+（只放行 `mds.lock` 或 `mds.lock` 加 `mdsDirectory.db` 都不够；正常运行时内容不一定改变）。不放行时 Codex 报 `account/read failed during TUI bootstrap`。
+- 节点启动时用 `getconf DARWIN_USER_CACHE_DIR` 解析并 realpath（`/var` → `/private/var`），只接受 `/private/var/folders/` 下的绝对路径；
+  解析失败时不放行，节点启动日志与 `raindown doctor`（`isolation.mds`）给出警告。
+- 写白名单放行 `<DARWIN_USER_CACHE_DIR>/mds/` 子树，对所有施加外层 seatbelt 的执行器生效（Security 框架是通用依赖，claude-sdk 很可能同样需要）；
+  `mds` 目录节点本身写拒绝（不能改名、删除或换成符号链接），`DARWIN_USER_CACHE_DIR` 的其他位置仍拒绝。
+- **其中只能新建普通文件**（审查第一轮）：`(deny file-write-create (require-all (subpath <mds>) (require-not (vnode-type REGULAR-FILE))))`。
+  worker 不能在 `mds/` 中新建符号链接、目录或 FIFO，也不能把它们从别处改名移入（darwin 实测 `ln -s`、`mkdir`、`mkfifo`、`mv` 均被拒绝，普通文件照常新建、替换、移入）。
+  因此沙箱外使用 Security 框架的进程不会经 worker 预埋的链接写到 `mds/` 之外。
+- 节点每次启动（或 codex-orca 重新挂接）施加外层 seatbelt 的 harness 前：
+  1. 先把当前的 `mds/` 与**全部**已有基线（任何任务，含本任务）比较，不一致的条目立即重置，并为看到变化的基线所属任务记一条通知；
+  2. 再把 `mds/` 下各条目的类型与普通文件的 sha256 记到 worker 读写都被拒绝的 `state/tasks/<任务>/mds-baseline.json`（已有基线时保留较早的那份）。
+  超过 8 MB 的文件与非普通文件不读取内容，直接视为变化；普通文件以 `O_NOFOLLOW | O_NONBLOCK` 打开、分块计算哈希。
+- harness 每次结束（正常结束、崩溃、取消、阻塞都经过节点的统一出口）后比较：内容变化、新增的条目、非普通文件或过大的文件一律删除
+  （从不跟随链接，`mds/` 目录本身保留），macOS 会自动重建；然后删除基线。
+- codex-orca 的终端在执行结束后可能继续运行（阻塞等待回复）：它的基线标记为 hold，执行结束时不校验也不删除，直到终端结束
+  （任务完成、取消、回滚或隔离检查失败关闭终端）才解除并在那次执行结束时校验。期间其他任务（或本任务重新挂接）启动前的比较（上面第 1 步）同样覆盖它。
+- 节点启动时校验全部残留基线（进程被杀、租约丢失时留下的）并重置；没有 hold 的随后删除。codex-orca 随后检查 hold 的基线所属终端是否仍在运行
+  （Orca 的终端列表与读取），已不存在时做最后一次校验并删除；同一任务下次要启动新终端时也先这样处理旧的 hold 基线。Orca 不可用、无法确认时保留。
+- **节点级的已知良好快照**（审查第四轮）`state/mds-known-good.json`（worker 读写都被拒绝）：由第一次记录的基线建立。
+  每次记录新基线、节点启动时，先把当前的 mds 与它比较并重置差异；没有基线覆盖的时间段里发生的改动也能发现，
+  例如 worker 用 `setsid`、`nohup` 留下的子进程在基线结束之后写入。这类差异记在最近结束的基线所属任务名下。
+  新基线直接复制它的哈希，不取当前内容，比较之后、记录之前被写入的内容不会被当作已知良好。
+  它只在本 home 上已没有任何基线（运行中或 hold）、且一次校验没有任何差异时更新。合法的内容变化因此也会被重置（接受；超过 5 次时有“反复重置”提示）。
+- harness 的任何退出路径都结束其进程组（审查第四轮），施加外层 seatbelt 时：
+  - codex-exec：Codex 正常结束也向进程组发 SIGKILL；
+  - claude-sdk：会话进程在独立进程组中运行，退出时结束整个组；
+  - codex-orca：终端由 Orca 关闭，Raindown 拿不到其中的进程组。
+  调用 `setsid` 的子进程会离开进程组，仍可能留下来，由上面的已知良好快照兜底。
+- 基线只保存**已知良好**的哈希，重置后不刷新（审查第三轮：从内容上无法区分 macOS 重建与 worker 在重置之后抢先写入）：
+  - 重新出现的文件与基线哈希相同，或文件不存在（macOS 会重建），都算正常；
+  - 重新出现的文件内容不同，就再次重置；
+  - 新记录的基线对当前不存在的条目沿用其他基线中的已知良好哈希。
+  实机上多次真实 Codex 运行前后 mds 文件逐字节不变，合法的内容变化应当很少。
+- 通知去重（审查第三轮）：同一基线存续期间，每个（任务，文件名）只发一条会写收件箱的通知；之后的重复重置只计数。
+  基线结束时，计数以一条只写任务事件、不写收件箱的通知记下（`repeats`，`inbox: none`）。
+  同一文件在同一基线下被重置超过 5 次时，另发一条“反复重置”的 Digest 条目（每个基线一次），并继续重置。
+- 有删除时：
+  - 任务活动中记一条状态说明（只有文件名，逐个 JSON 引号转义）；
+  - 通知先写进 `state/mds-notices/`，再由节点在后台经 `POST /v1/nodes/:id/isolation-notices` 送达（不依赖租约：租约已结束、被放弃或通知属于其他任务时都能送达；
+    不等待送达结果，中枢不可达不会拖延执行结束；失败的保留，在下一次执行结束、节点启动或每 5 分钟的定期重试时再送）。中枢每个任务最多记录 50 条，超过的拒绝。中枢只接受该节点领取过租约的任务，写 `task.out_of_band`（`kind: mds_reset`，按信号 id 幂等）任务事件，
+    并写一条 Digest 级收件箱条目（来源 `isolation`，原因 `mds_reset`，文件名逐个 JSON 引号转义）。
+- 沙箱外的进程（同时运行的其他任务、用户自己的程序）合法更新这些文件也会触发重置，这是可接受的：重建无害。
+- 重置可能删除另一个同时运行的任务或沙箱外进程正在合法写入的文件；macOS 会重建它们。
+- 残留风险：`mds/` 与沙箱外所有使用 Security 框架的进程共用，worker 在 harness 运行期间可以改写其中**普通文件的内容**（例如篡改数据库），
+  沙箱外的进程会读到；“启动前比较 + 结束即校验重置”把暴露窗口缩短到 harness 运行期间，篡改的内容不会被保留下来（与已知良好哈希不同即重置）。
+  经链接、目录或 FIFO 写到 `mds/` 之外的途径已由上面的规则关闭。合法的内容变化（如果出现）会被反复重置并在超过 5 次时提示。
 
 **auth.json（审查第一轮 M1）。**
 - CODEX_HOME 中的 `auth.json` 链接本身拒绝写：不能删除，也不能换成指向别处的链接或普通文件。
@@ -1259,7 +1310,7 @@ isolation:
 **4.5 验收时按失败追加。** 白名单拒绝的写入在 worker 中表现为 `Operation not permitted`（`EPERM`）。排查步骤：
 1. 在 worker 输出或 harness 日志中找 `Operation not permitted` 的路径；也可以在本机用 `log stream --style compact --predicate 'sender == "Sandbox"'` 观察 `deny(1) file-write-create <路径>`。
 2. 路径是工具的缓存：优先用环境变量把它指到任务私有的 `cache/`（在 `taskScratchEnv` 中补充并加测试）；不行时再用 `extra_write` 追加具体子目录。
-3. 路径属于 harness 运行状态（独立 CODEX_HOME、Claude 配置目录之外）：修改适配器声明（`SEALED_CODEX_HOME_ALLOW`、`CLAUDE_CONFIG_DENY_WRITE`）并补测试，不要用 `extra_write` 绕过。
+3. 路径属于 harness 运行状态（独立 CODEX_HOME 已整体可写；Claude 配置目录中的拒绝项）：修改适配器声明（`codexHarnessPaths`、`CLAUDE_CONFIG_DENY_WRITE`）并补测试，不要用 `extra_write` 绕过。harness 依赖的系统位置（例如 Security 框架的 `mds/`）按「mds」的做法在 core 的写白名单中放行并由节点校验。
 4. 路径是 `.git/config`、hooks、登记仓库的 `.git`、shell 启动文件、`~/.gitconfig` 等：这正是白名单要拦住的写入，改用不写这些位置的做法。
 
 **项目配置（审查第二轮 L2）。** codex-orca 预置信任后，Codex 会加载 clone 内的 `.codex/config.toml`（worker 或 PR 可控）。
@@ -1270,7 +1321,8 @@ isolation:
 **节点往任务私有目录写文件（审查第二轮 L3）。** 任务私有目录对 worker 可写。节点往其中写文件（例如审查的 `pr.diff`、探针的临时文件）一律用 `writeFileNoFollow`：先以 `wx` 在同一目录写临时文件，再 rename 到目标，不跟随 worker 预埋的符号链接。新建目录则在创建后用 `lstat` 确认不是符号链接。
 
 **残留风险**（design Risks）：
-- 会话记录可以被改写：CODEX_HOME 与 Claude 配置目录中的会话记录可以被 worker 改写（提示注入，不是命令执行）。
+- 会话记录与本任务的 Codex 配置可以被改写：CODEX_HOME（整体可写）与 Claude 配置目录中的会话记录、Codex 的 `config.toml` 等可以被 worker 改写，只影响本任务、仍在沙箱内执行。
+- macOS Security 缓存 `mds/` 中普通文件的内容在 harness 运行期间可以被篡改：与沙箱外的进程共用，节点在 harness 启动前与结束后校验并重置（见「mds」）；经链接写到别处的途径已关闭。
 - 用户在 clone 中手动运行 git 会被利用：沙箱外的 git 会跟随 worker 预埋在 `.git` 中的符号链接写入，例如 `COMMIT_EDITMSG`，或已有的 reflog 文件。
 - 凭证文件可以被替换：`~/.codex/auth.json` 与登录钥匙串可以被 worker 替换或损坏。
 - 偏好设置可以被写入：经 cfprefsd 写入的偏好设置拦不住。
@@ -1307,6 +1359,11 @@ claude-sdk 多声明一个沙箱设置 `supervisor-session → none`。探针每
 探针每轮多 `write.shell_startup`、`write.git_hooks`、`write.registered_git`、`write.git_objects`、`write.shared_tmp` 五项，在 `run/isolation-probe-<hex>/` 下自建模拟 home 与模拟仓库，结束即删除
 （节点启动与每次探针前也清理残留）；未施加时这些项为“可写”，探针本来就不通过，结论不变。独立 clone、独立 CODEX_HOME、
 按任务的 Claude 配置目录与任务私有的临时、缓存目录只在开关打开时创建与使用。
+
+4.5 修复（CODEX_HOME 整体可写、mds 放行并校验重置）部署后，开关关闭时同样不改变启动方式：节点不运行 `getconf`、不记录 mds 基线；
+每次执行结束多一次检查 `state/tasks/<任务>/mds-baseline.json` 与 `state/mds-notices/`（不存在时什么也不做），节点启动时多一次残留基线扫描。
+中枢多一个接口 `POST /v1/nodes/:id/isolation-notices`（只接受 user 与对应的 `node:<id>`）。开关打开时节点启动多运行一次 `getconf DARWIN_USER_CACHE_DIR`，
+doctor 多一项 `isolation.mds`，探针配置与 worker 一样放行 mds（探针不写其中任何文件）。
 
 ## 隔离自检探针（worker-credential-isolation 3.1–3.2）
 

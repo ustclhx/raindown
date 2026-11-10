@@ -4,6 +4,7 @@ import {
   completeLeaseData,
   ENDPOINTS,
   fail,
+  isolationNoticeData,
   listNodesData,
   redactSecrets,
   registerNodeData,
@@ -32,6 +33,12 @@ export function createNodeRoutes({ service }: NodeRoutesDeps): Hono {
       service.registerNode(body.data, c.get('actor') ?? 'unknown'),
       registerNodeData,
     )
+  })
+
+  app.post(ENDPOINTS['nodes-isolation-notice'].path, async (c) => {
+    const body = await jsonBody(c, false)
+    if (!body.ok) return respond(c, body, isolationNoticeData)
+    return respond(c, service.isolationNotice(c.req.param('id'), body.data), isolationNoticeData)
   })
 
   app.get(ENDPOINTS['nodes-list'].path, (c) => respond(c, service.listNodes(), listNodesData))

@@ -23,17 +23,16 @@ exports[`SBPL 生成 快照：allow default + 默认写拒绝 + 写白名单 + �
 (allow network-outbound
   (remote ip "localhost:7477"))
 
-;; 1a. 白名单内再拒绝写：登记仓库的 git 目录与 .git 指针文件、harness 目录中会被加载或执行的配置
+;; 1a. 白名单内再拒绝写：登记仓库的 git 目录与 .git 指针文件、harness 目录中的凭证链接与配置、mds 目录节点本身
 (deny file-write*
   (subpath "/Users/u/repo/.git")
   (subpath "/Users/u/raindown-home/run/executors/codex-exec/codex-home/config.toml")
   (literal "/Users/u/work/.git"))
+(deny file-write-create
+  (require-all (subpath "/private/var/folders/xx/yy/C/mds") (require-not (vnode-type REGULAR-FILE))))
 ;; 1b. 本任务独立 clone 的 .git（写类角色）；config、hooks、alternates 等在下面再次拒绝。登记仓库的 .git 整体只读
 (allow file-write*
-  (subpath "/Users/u/clone/.git")
-  (subpath "/Users/u/raindown-home/run/tasks/t-1/codex-home/sessions")
-  (literal "/Users/u/raindown-home/run/tasks/t-1/codex-home/history.jsonl")
-  (regex #"^/Users/u/raindown-home/run/tasks/t-1/codex-home/[^/]+\\.sqlite$"))
+  (subpath "/Users/u/clone/.git"))
 
 ;; 2. 受保护资源：读写拒绝（以目录为单位，新增文件自动覆盖）；写在白名单之后，白名单不能重新放开
 (deny file-read*

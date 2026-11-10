@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, realpathSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   type ExecutorInfo,
+  type IsolationSpec,
   NO_ADAPTER_CAPABILITIES,
   type ProbePlan,
   probeRunPassed,
@@ -573,6 +574,37 @@ describe('探针联动（worker-credential-isolation 4.1–4.4）', () => {
     expect(launches.map((l) => l.executor).sort()).toEqual(['codex-exec', 'codex-orca'])
     for (const l of launches)
       expect(l.keeps.some((k) => k.endsWith(`/run/executors/${l.executor}`))).toBe(true)
+  })
+
+  test('探针与 worker 用同一个 darwinUserCacheDir（4.5，审查第一轮）：探针配置同样放行 mds 且只能新建普通文件', async () => {
+    const s = await setup()
+    // 注入的假目录；探针不写其中任何文件。
+    const cacheDir = join(s.home, '..', 'C')
+    mkdirSync(join(cacheDir, 'mds'), { recursive: true })
+    const specs: IsolationSpec[] = []
+    await runIsolationProbe({
+      ...probeOptions(s, [
+        {
+          type: 'codex-exec',
+          adapter_capabilities: {
+            ...NO_ADAPTER_CAPABILITIES,
+            credential_isolation: { layers: { 'danger-full-access': 'seatbelt' }, enforced: true },
+          },
+        },
+      ]),
+      darwinUserCacheDir: cacheDir,
+      launchWrapper: (_target, argv, launch) => {
+        specs.push(launch.spec)
+        return [...argv]
+      },
+    })
+    const mds = join(realpathSync(cacheDir), 'mds')
+    expect(specs.length).toBeGreaterThan(0)
+    for (const spec of specs) {
+      expect(spec.allow_write).toContain(mds)
+      expect(spec.regular_files_only).toEqual([mds])
+    }
+    expect(readdirSync(join(cacheDir, 'mds'))).toEqual([])
   })
 
   test('开关打开时的能力声明：native 未实现，声明为 none，不探测', () => {

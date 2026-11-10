@@ -356,6 +356,69 @@ describe('节点身份的权限范围', () => {
     expect(renewed.status).toBe(200)
   })
 
+  test('隔离事实上报（mds 重置，4.5）：只能以自己的节点 id、只给自己领取过租约的任务', async () => {
+    const { call, issue, leased } = await start()
+    const { secret } = await issue('node:n1')
+    const as = { token: secret }
+    const mine = await leased('n1', as)
+    const theirs = await leased('n3')
+    const body = (taskId: string, id: string) => ({
+      task_id: taskId,
+      signal: { id, kind: 'mds_reset', files: ['mdsDirectory.db'] },
+    })
+    // 路径中的节点不是本身份：拒绝。
+    const wrongPath = await call('/v1/nodes/n3/isolation-notices', {
+      ...as,
+      body: body(theirs.taskId, 'x-1'),
+    })
+    expect(wrongPath).toMatchObject({ status: 403, body: { error: { code: 'scope_denied' } } })
+    // 本节点没有领取过的任务：拒绝。
+    const notMine = await call('/v1/nodes/n1/isolation-notices', {
+      ...as,
+      body: body(theirs.taskId, 'x-2'),
+    })
+    expect(notMine.body).toMatchObject({ error: { code: 'scope_denied' } })
+    // 自己领取过租约的任务：记录一次，同一 id 重复上报不重复记录。
+    const first = await call('/v1/nodes/n1/isolation-notices', {
+      ...as,
+      body: body(mine.taskId, 'x-3'),
+    })
+    expect(first).toMatchObject({ status: 200, body: { data: { recorded: true } } })
+    const again = await call('/v1/nodes/n1/isolation-notices', {
+      ...as,
+      body: body(mine.taskId, 'x-3'),
+    })
+    expect(again).toMatchObject({ status: 200, body: { data: { recorded: false } } })
+    const events = (await call(`/v1/tasks/${mine.taskId}`, as)).body.data as {
+      events: Array<{ type: string; actor: string; payload: { kind?: string } }>
+    }
+    expect(events.events.filter((e) => e.type === 'task.out_of_band')).toMatchObject([
+      { actor: 'node:n1', payload: { kind: 'mds_reset' } },
+    ])
+    // 不合法的百分号编码：拒绝而不是 500（审查第二轮）。
+    for (const path of ['/v1/nodes/%E0%A4%A/isolation-notices', '/v1/tasks/%E0%A4%A']) {
+      const bad = await call(path, {
+        ...as,
+        ...(path.endsWith('notices') ? { body: body(mine.taskId, 'x-bad') } : {}),
+      })
+      expect({ path, status: bad.status }).toMatchObject({ path })
+      expect(bad.status === 400 || bad.status === 403).toBe(true)
+    }
+    // 每个任务最多 50 条（审查第二轮）：已记 1 条，再记 49 条后拒绝。
+    for (let i = 0; i < 49; i++) {
+      const r = await call('/v1/nodes/n1/isolation-notices', {
+        ...as,
+        body: body(mine.taskId, `cap-${i}`),
+      })
+      expect(r.status).toBe(200)
+    }
+    const over = await call('/v1/nodes/n1/isolation-notices', {
+      ...as,
+      body: body(mine.taskId, 'cap-over'),
+    })
+    expect(over.body).toMatchObject({ error: { code: 'isolation_notice_limit' } })
+  })
+
   test('本机节点：user token 不声明身份，注册与租约事件记为 node:<id>', async () => {
     const { leased, call } = await start()
     const { taskId } = await leased('local-1')

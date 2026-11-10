@@ -32,6 +32,9 @@ import {
   type ExecutorOutcome,
   type ExecutorPlugin,
   type ExecutorRun,
+  mdsBaselineHeld,
+  mdsBaselinePath,
+  recordMdsBaseline,
   type SeatbeltOptions,
   writeLeaseTokenFile,
 } from '../src/index.ts'
@@ -2359,6 +2362,75 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
       host_worktree: home.worktree,
     })
     await s.run.cancel()
+  })
+
+  test('mds（4.5，审查第一轮）：启动前记录基线并在终端运行期间 hold；任务取消（终端结束）时解除', async () => {
+    const home = orcaHome()
+    // 注入的假 DARWIN_USER_CACHE_DIR，绝不碰真实的 /private/var/folders/*/C/mds。
+    const cacheDir = join(home.root, 'C')
+    mkdirSync(join(cacheDir, 'mds'), { recursive: true })
+    writeFileSync(join(cacheDir, 'mds', 'mds.lock'), '')
+    // 上一个终端（已不存在）留下的 hold 基线与运行期间的改动：启动新终端前做最后一次校验（审查第二轮）。
+    await recordMdsBaseline(home.home, 't-orca-1', join(realpathSync(cacheDir), 'mds'), {
+      hold: true,
+    })
+    writeFileSync(join(cacheDir, 'mds', 'planted.db'), 'x')
+    const leaseTokenFile = await token(home, 'l-1')
+    const s = await start({}, (o) => o.show('working'), {
+      home,
+      leaseTokenFile,
+      hubUrl: HUB,
+      isolation: { ...on(home), darwinUserCacheDir: cacheDir },
+    })
+    await ready(s)
+    const profile = readFileSync(join(home.home, 'state/tasks/t-orca-1/isolation.sb'), 'utf8')
+    const mds = join(realpathSync(cacheDir), 'mds')
+    expect(profile).toContain(`(subpath ${JSON.stringify(mds)})`)
+    expect(profile).toContain('(require-not (vnode-type REGULAR-FILE))')
+    expect(existsSync(mdsBaselinePath(home.home, 't-orca-1'))).toBe(true)
+    expect(mdsBaselineHeld(home.home, 't-orca-1')).toBe(true)
+    expect(existsSync(join(cacheDir, 'mds', 'planted.db'))).toBe(false)
+    // 旧的 hold 基线已删除，新终端用新记录的基线（旧基线会带着 planted.db 的重置标记）。
+    const baseline = JSON.parse(readFileSync(mdsBaselinePath(home.home, 't-orca-1'), 'utf8'))
+    expect(Object.keys(baseline.entries)).toEqual(['mds.lock'])
+    await s.run.cancel()
+    await s.run.done
+    expect(mdsBaselineHeld(home.home, 't-orca-1')).toBe(false)
+  })
+
+  test('mds（审查第二轮）：节点启动时终端已不存在的 hold 基线做最后一次校验并删除；仍在运行的保留', async () => {
+    const home = orcaHome()
+    const cacheDir = join(home.root, 'C')
+    const mds = join(cacheDir, 'mds')
+    mkdirSync(mds, { recursive: true })
+    writeFileSync(join(mds, 'mds.lock'), '')
+    const fake = new FakeOrca(home.worktree)
+    const writeState = (taskId: string, handle?: string) => {
+      mkdirSync(join(home.home, 'state/tasks', taskId), { recursive: true })
+      writeFileSync(
+        join(home.home, 'state/tasks', taskId, 'orca.json'),
+        JSON.stringify({
+          repo: home.repo,
+          worktree_path: home.worktree,
+          branch: taskId,
+          base_branch: 'origin/main',
+          ...(handle ? { handle, isolation_layer: 'seatbelt' } : {}),
+          replies: {},
+        }),
+      )
+    }
+    for (const t of ['t-nostate', 't-gone', 't-alive'])
+      await recordMdsBaseline(home.home, t, mds, { hold: true })
+    writeState('t-gone', 'term_gone')
+    writeState('t-alive', fake.handle)
+    // 运行期间留下的改动：最后一次校验时重置。
+    writeFileSync(join(mds, 'planted.db'), 'x')
+    const executor = createCodexOrcaExecutor({ home: home.home, orca: fake })
+    await executor.prepare?.({ nodeId: 'n-1' })
+    expect(existsSync(mdsBaselinePath(home.home, 't-nostate'))).toBe(false)
+    expect(existsSync(mdsBaselinePath(home.home, 't-gone'))).toBe(false)
+    expect(mdsBaselineHeld(home.home, 't-alive')).toBe(true)
+    expect(existsSync(join(mds, 'planted.db'))).toBe(false)
   })
 
   test('开关打开但角色为 workspace-write（native 未实现）：命令不变', async () => {

@@ -75,6 +75,16 @@ import {
   removeSeatbeltProfile,
   writeLeaseTokenFile,
 } from './lease-token.ts'
+import {
+  deliverMdsNotices,
+  describeMdsVerification,
+  hasPendingMdsNotices,
+  type MdsVerification,
+  mdsBaselineHeld,
+  mdsBaselinePath,
+  sweepStaleMdsBaselines,
+  verifyMdsBaseline,
+} from './mds.ts'
 import { acquireNodeLock } from './node-lock.ts'
 import { createPolicyPrecheck, type Precheck, type PrecheckRequest } from './precheck.ts'
 import {
@@ -166,6 +176,13 @@ export interface StartNodeOptions {
    * 缺省不运行（测试不触碰真实的用户目录）；`raindown node start` 显式开启。
    */
   isolationProbe?: IsolationProbeNodeOptions
+  /** 待送达的 mds 重置通知的重试间隔；缺省 `MDS_NOTICE_RETRY_MS`（5 分钟）。 */
+  mdsNoticeRetryMs?: number
+  /**
+   * 外层 seatbelt 是否在本机生效（`isolation.enforce` 打开且在 macOS 上）。只有生效或启动时已有待送达的通知时才启动
+   * mds 通知的定期重试（审查第四轮：开关关闭时行为严格不变）。
+   */
+  isolationActive?: boolean
 }
 
 export interface IsolationProbeNodeOptions
@@ -800,6 +817,31 @@ class LeaseRunner {
    */
   private recentTail() {
     return redactLines(this.tail).slice(-STUCK_TAIL_LINES)
+  }
+
+  /**
+   * harness 结束后按启动前记录的基线校验并重置 macOS Security 缓存（`mds.ts`，worker-credential-isolation 4.5）。
+   * 只有施加了外层 seatbelt 且放行了 mds 的启动才有基线；codex-orca 的终端仍在运行时基线被 hold，这里不校验。
+   * 有变化时记一条任务活动；通知已写进 `state/mds-notices/`，随后经隔离事实接口送达（不依赖租约，审查第一轮）。不抛出。
+   */
+  private async checkMds(): Promise<void> {
+    let v: MdsVerification | undefined
+    try {
+      v = await verifyMdsBaseline(this.env.home, this.grant.task_id)
+    } catch (err) {
+      this.env.logger.warn('无法校验 macOS Security 缓存（mds）', (err as Error).message)
+      return
+    }
+    const text = v ? describeMdsVerification(v) : undefined
+    if (!v || !text) return
+    this.env.logger.warn(`任务 ${this.grant.task_id}：${text}`)
+    this.buffer.push({
+      ts: new Date(this.env.clock.now()).toISOString(),
+      kind: 'status',
+      text,
+      data: { mds_reset: { files: v.reset, failed: v.failed } },
+    })
+    if (this.buffer.length > ACTIVITY_BUFFER_MAX) this.buffer.shift()
   }
 
   private onActivity(a: Activity) {
@@ -1441,6 +1483,16 @@ class LeaseRunner {
         await this.tokenWrites
         if (wakeTokenFile) await removeWakeTokenFile(wakeTokenFile).catch(() => {})
         if (this.leaseTokenFile) await removeLeaseTokenFile(this.leaseTokenFile).catch(() => {})
+        // 外层 seatbelt 下 harness 结束（正常结束、崩溃、取消、阻塞都经过这里）：按启动前的基线校验并重置 mds（4.5）。
+        // 没有基线（开关关闭、未施加或未放行 mds）时不 await，不改变执行结束时的时序。
+        if (
+          existsSync(mdsBaselinePath(this.env.home, this.grant.task_id)) &&
+          !mdsBaselineHeld(this.env.home, this.grant.task_id)
+        )
+          await this.checkMds()
+        // 待送达的 mds 重置通知（本任务的，或其他任务启动前比较基线时记下的）：经隔离事实接口送达，不依赖本租约。
+        // 后台送达，不等待：中枢不可达时不拖延执行结束（审查第二轮）；失败的保留到下一次。
+        if (hasPendingMdsNotices(this.env.home)) void deliverPendingMdsNotices(this.env)
         // 外层 seatbelt 配置只在启动 harness 时读取（4.1），执行结束即删除。
         await removeSeatbeltProfile(this.env.home, this.grant.task_id).catch(() => {})
         // 任务私有目录变空时一并删除（审查目录由执行器在会话结束时清理）。
@@ -1696,6 +1748,46 @@ class LeaseRunner {
   }
 }
 
+/** 待送达的 mds 重置通知的重试间隔（审查第三轮）。 */
+export const MDS_NOTICE_RETRY_MS = 5 * 60_000
+
+/** 正在进行的送达（按 raindown-home）：同一时间只有一轮，避免多个执行槽并发重复发送。 */
+const mdsDeliveries = new Map<string, Promise<void>>()
+
+/**
+ * 送达 `state/mds-notices/` 中的通知（`POST /v1/nodes/:id/isolation-notices`）。不抛出。
+ * 已有一轮在进行时等它结束后再送一轮（期间新写入的通知不会漏掉）。
+ */
+function deliverPendingMdsNotices(env: {
+  home: string
+  nodeId: string
+  client: NodeHubClient
+  logger: Pick<Env['logger'], 'warn'>
+}): Promise<void> {
+  const prev = mdsDeliveries.get(env.home) ?? Promise.resolve()
+  const next = prev.then(() => deliverOnce(env))
+  mdsDeliveries.set(env.home, next)
+  void next.finally(() => {
+    if (mdsDeliveries.get(env.home) === next) mdsDeliveries.delete(env.home)
+  })
+  return next
+}
+
+async function deliverOnce(env: {
+  home: string
+  nodeId: string
+  client: NodeHubClient
+  logger: Pick<Env['logger'], 'warn'>
+}): Promise<void> {
+  const send = env.client.isolationNotice
+  if (!send) return
+  await deliverMdsNotices(
+    env.home,
+    (notice) => send.call(env.client, env.nodeId, notice),
+    (message) => env.logger.warn(message),
+  ).catch((err: Error) => env.logger.warn('无法送达 mds 重置通知', err.message))
+}
+
 /**
  * 启动节点。先取得节点单实例锁（`state/node.lock`）：启动清理（`state/wake/` 的 token 文件、执行器残留）
  * 只在确认没有并行节点时进行；锁在节点停止或启动失败时释放。
@@ -1762,6 +1854,12 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
   // CODEX_HOME 从 state/ 迁到 run/（worker-credential-isolation D2）；失败时保留旧位置继续使用。
   const codexHomes = await migrateCodexHomes(home, (message) => logger.warn(message))
   for (const dir of codexHomes.migrated) logger.info(`CODEX_HOME 已迁移到 ${dir}`)
+  // 上次运行残留的 mds 基线（进程被杀、租约丢失）：校验并重置，没有 hold 的随后删除（worker-credential-isolation 4.5）。
+  for (const task of await sweepStaleMdsBaselines(home).catch((err: Error) => {
+    logger.warn('无法校验残留的 mds 基线', err.message)
+    return [] as string[]
+  }))
+    logger.info(`已校验任务 ${task} 残留的 mds 基线`)
 
   const id =
     options.nodeId !== undefined ? ok(options.nodeId) : await loadOrCreateNodeId(home, host)
@@ -1790,6 +1888,9 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
     ...(options.fetch ? { fetch: options.fetch } : {}),
   })
   const retryMs = options.retryMs ?? 1_000
+  // 待送达的 mds 重置通知：启动时尝试送达一次（不阻塞启动；失败的留到下一次执行结束时）。
+  if (hasPendingMdsNotices(home))
+    void deliverPendingMdsNotices({ home, nodeId, client, logger }).catch(() => {})
   const env: Env = {
     home,
     nodeId,
@@ -2051,6 +2152,17 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
     cancelJump = clock.setTimeout(check, JUMP_CHECK_MS)
   }
 
+  // 待送达的 mds 重置通知定期重试（审查第三轮）：节点空闲时中枢恢复后也能送达。
+  const mdsRetryMs = options.mdsNoticeRetryMs ?? MDS_NOTICE_RETRY_MS
+  let cancelMdsRetry = () => {}
+  const retryMdsNotices = () => {
+    if (stopper.signal.aborted) return
+    if (hasPendingMdsNotices(home)) void deliverPendingMdsNotices({ home, nodeId, client, logger })
+    cancelMdsRetry = clock.setTimeout(retryMdsNotices, mdsRetryMs)
+  }
+  if (options.isolationActive || hasPendingMdsNotices(home))
+    cancelMdsRetry = clock.setTimeout(retryMdsNotices, mdsRetryMs)
+
   // 执行器的启动清理（例如移除审查任务残留的 worktree）在领取任务之前完成。
   const prepared = (async () => {
     for (const p of registry.list()) {
@@ -2082,6 +2194,7 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
         stopper.abort()
         for (const a of acquireAborts) a.abort()
         cancelJump()
+        cancelMdsRetry()
         cancelProbeTimers()
         // 等待进行中的探针结束（它会删除自己造的临时令牌与工作目录）。
         await probing

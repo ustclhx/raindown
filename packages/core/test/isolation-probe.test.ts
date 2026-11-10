@@ -388,8 +388,18 @@ describe('审查第一轮：开关与 Orca 端口的 doctor 提示', () => {
       const [linux] = await isolationSwitchChecks(home, 'linux')
       expect(linux).toMatchObject({ id: 'isolation.enforce', ok: false, severity: 'warning' })
       expect(linux?.message).toContain('不支持外层 seatbelt，未施加任何隔离')
-      const [mac] = await isolationSwitchChecks(home, 'darwin')
+      const resolved = async () => ({ ok: true as const, dir: '/private/var/folders/xx/yy/C' })
+      const [mac, mds] = await isolationSwitchChecks(home, 'darwin', undefined, resolved)
       expect(mac).toMatchObject({ id: 'isolation.enforce', ok: true })
+      // 4.5：DARWIN_USER_CACHE_DIR 解析成功时显示放行的 mds，失败时警告（不放行，Codex 可能无法校验登录）。
+      expect(mds).toMatchObject({ id: 'isolation.mds', ok: true })
+      expect(mds?.message).toContain('/private/var/folders/xx/yy/C/mds')
+      const [, failed] = await isolationSwitchChecks(home, 'darwin', undefined, async () => ({
+        ok: false as const,
+        reason: 'getconf 失败',
+      }))
+      expect(failed).toMatchObject({ id: 'isolation.mds', ok: false, severity: 'warning' })
+      expect(failed?.message).toContain('getconf 失败')
     } finally {
       rmSync(home, { recursive: true, force: true })
     }
@@ -404,7 +414,10 @@ describe('审查第一轮：开关与 Orca 端口的 doctor 提示', () => {
         join(home, 'config/node.yaml'),
         `isolation:\n  enforce: true\n  extra_write:\n    - ${join(userHome, 'Library/Developer')}\n`,
       )
-      const checks = await isolationSwitchChecks(home, 'darwin', userHome)
+      const checks = await isolationSwitchChecks(home, 'darwin', userHome, async () => ({
+        ok: false as const,
+        reason: '测试不运行 getconf',
+      }))
       expect(checks.find((c) => c.id === 'isolation.extra_write')).toMatchObject({ ok: true })
       expect(checks.find((c) => c.id === 'isolation.extra_write')?.message).toContain(
         join(userHome, 'Library/Developer'),
