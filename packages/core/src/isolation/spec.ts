@@ -90,6 +90,11 @@ export interface IsolationSpec {
   allow_write_regex: string[]
   /** 本任务独立 clone 的 `.git`（只给施加了外层 seatbelt 的写类角色）。 */
   allow_write_git: string[]
+  /**
+   * 其中只能新建普通文件的子树（`mds/`，审查第一轮）：拒绝在其中新建符号链接、目录、FIFO 等，
+   * 也拒绝把它们改名移入——沙箱外使用 Security 框架的进程不会经 worker 预埋的链接写到别处。
+   */
+  regular_files_only: string[]
   /** 最后写拒绝、但保留其中个别文件（持久化位置的纵深防御；`~/.codex` 保留 auth.json 链接目标）。 */
   deny_write_except: Array<{ path: string; except: string[] }>
   /** 拒绝连接其中 unix 套接字的目录（文件规则拦不住 connect）。 */
@@ -346,6 +351,7 @@ export async function computeIsolationSpec(
     const carveOuts: string[] = []
     const allowWriteRegex: string[] = []
     const carveOutLiterals: string[] = []
+    const regularFilesOnly: string[] = []
     const relOk = (rel: string) =>
       !isAbsolute(rel) && !rel.split('/').some((s) => s === '..' || s === '.' || s === '')
     for (const h of input.harnessPaths ?? []) {
@@ -424,6 +430,7 @@ export async function computeIsolationSpec(
       const mds = await c(mdsDirOf(input.darwinUserCacheDir))
       allowWrite.push(mds)
       carveOutLiterals.push(mds)
+      regularFilesOnly.push(mds)
     }
     // 登记仓库的 git 目录整体只读；只有本任务独立 clone 的 `.git` 放行（配置、hooks、alternates 等写在最后拒绝）。
     const registeredGitDirs: string[] = []
@@ -473,6 +480,7 @@ export async function computeIsolationSpec(
       write_carve_outs: minimal(carveOuts),
       write_carve_out_literals: uniqueSorted([...gitRules.carveOutLiterals, ...carveOutLiterals]),
       allow_write_git: uniqueSorted(gitRules.allow),
+      regular_files_only: uniqueSorted(regularFilesOnly),
       deny_write_except: denyWriteExcept.sort((a, b) => a.path.localeCompare(b.path)),
       deny_unix_sockets: [orcaDir],
       allow_unix_sockets: [],

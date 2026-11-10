@@ -56,6 +56,7 @@ import {
   approvalFingerprint,
   blockedReason,
   deliveredReply,
+  mdsResetSignal,
   outOfBandSignal,
   policyDecisionId,
   protocolBlockedDelegationShape,
@@ -775,6 +776,20 @@ export type NodeView = z.infer<typeof nodeView>
 
 export const registerNodeData = z.object({ node: nodeView }).meta({ title: 'POST /v1/nodes 响应' })
 export const listNodesData = z.object({ nodes: z.array(nodeView) }).meta({ title: 'GET /v1/nodes' })
+
+/**
+ * `POST /v1/nodes/:id/isolation-notices`：节点上报隔离相关的事实（worker-credential-isolation 4.5：mds 重置），不依赖活动租约——
+ * 租约已结束或被放弃、其他任务启动前比较基线、节点启动时清理残留基线时都经这里送达。中枢写 `task.out_of_band`（按信号 id 幂等），
+ * 收件箱反应器据此写 Digest 条目。只接受该节点曾经领取过租约的任务。
+ */
+export const isolationNoticeRequest = z
+  .strictObject({ task_id: taskId, signal: mdsResetSignal })
+  .meta({ title: 'POST /v1/nodes/:id/isolation-notices' })
+export type IsolationNoticeRequest = z.infer<typeof isolationNoticeRequest>
+export const isolationNoticeData = z
+  .object({ recorded: z.boolean().meta({ description: 'false 表示同一信号 id 已记录过' }) })
+  .meta({ title: 'POST /v1/nodes/:id/isolation-notices 响应' })
+export type IsolationNoticeData = z.infer<typeof isolationNoticeData>
 
 // ---------------------------------------------------------------------------
 // leases
@@ -1559,6 +1574,13 @@ export const ENDPOINTS = {
     response: registerNodeData,
   },
   'nodes-list': { method: 'GET', path: '/v1/nodes', auth: true, response: listNodesData },
+  'nodes-isolation-notice': {
+    method: 'POST',
+    path: '/v1/nodes/:id/isolation-notices',
+    auth: true,
+    request: isolationNoticeRequest,
+    response: isolationNoticeData,
+  },
   'leases-acquire': {
     method: 'POST',
     path: '/v1/leases',

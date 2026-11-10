@@ -621,12 +621,29 @@ describe.skipIf(!onMac)('macOS 实测：写白名单', () => {
       const r = sh(cmd)
       expect({ cmd, status: r.status, err: r.stderr }).toEqual({ cmd, status: 0, err: '' })
     }
+    // 审查第一轮：mds 中只能新建普通文件——符号链接、目录、FIFO 都不能新建，也不能从可写位置改名移入。
+    const staging = join(e.home, 'run/tasks/t-1/tmp')
+    const target = join(root, 'outside-target')
     for (const cmd of [
       `mv '${mds}' '${mds}.moved'`,
       `rm -rf '${mds}'`,
       `echo PWNED > '${join(cacheDir, 'other')}'`,
+      `ln -s '${target}' '${join(mds, 'link.db')}'`,
+      `rm -f '${join(mds, 'mdsObject.db')}' && ln -s '${target}' '${join(mds, 'mdsObject.db')}'`,
+      `mkdir '${join(mds, 'subdir')}'`,
+      `mkfifo '${join(mds, 'fifo')}'`,
+      `ln -s '${target}' '${join(staging, 'l')}' && mv '${join(staging, 'l')}' '${join(mds, 'moved-link')}'`,
+      `mkdir '${join(staging, 'd')}' && mv '${join(staging, 'd')}' '${join(mds, 'moved-dir')}'`,
     ])
       expect({ cmd, status: sh(cmd).status }).not.toEqual({ cmd, status: 0 })
+    for (const name of ['link.db', 'subdir', 'fifo', 'moved-link', 'moved-dir'])
+      expect({ name, exists: existsSync(join(mds, name)) }).toEqual({ name, exists: false })
+    expect(existsSync(target)).toBe(false)
+    // 普通文件仍可新建、改名移入与替换。
+    const regular = sh(
+      `echo ok > '${join(staging, 'f')}' && mv '${join(staging, 'f')}' '${join(mds, 'moved-file.db')}' && echo ok > '${join(mds, 'mdsObject.db')}'`,
+    )
+    expect({ status: regular.status, err: regular.stderr }).toEqual({ status: 0, err: '' })
     expect(existsSync(mds)).toBe(true)
     expect(existsSync(join(cacheDir, 'other'))).toBe(false)
     // 不注入时 mds 不在白名单内。

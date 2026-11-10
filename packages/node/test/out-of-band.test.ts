@@ -11,7 +11,12 @@ import {
   idleSignal,
   resumedSignal,
 } from '../src/executor.ts'
-import { mdsBaselinePath, recordMdsBaseline } from '../src/mds.ts'
+import {
+  hasPendingMdsNotices,
+  mdsBaselinePath,
+  queueMdsNotice,
+  recordMdsBaseline,
+} from '../src/mds.ts'
 import { type Bench, bench } from './harness.ts'
 
 let current: Bench | undefined
@@ -77,7 +82,7 @@ test('带外信号经节点续约上报，临时失败重试且中枢只记一�
   expect(b.types(id).filter((type) => type === 'task.unblocked')).toHaveLength(1)
 })
 
-test('mds（worker-credential-isolation 4.5）：harness 结束后节点按基线重置被改动的条目，经带外信号写任务事件', async () => {
+test('mds（worker-credential-isolation 4.5）：harness 结束后节点按基线重置被改动的条目，经隔离事实接口写任务事件（不依赖租约）', async () => {
   // 注入的假 DARWIN_USER_CACHE_DIR（<tmp>/C/mds），绝不碰真实的 /private/var/folders/*/C/mds。
   const root = await realpath(await mkdtemp(join(tmpdir(), 'raindown-node-mds-')))
   const mds = join(root, 'C', 'mds')
@@ -118,4 +123,21 @@ test('mds（worker-credential-isolation 4.5）：harness 结束后节点按基�
   } finally {
     await rm(root, { recursive: true, force: true })
   }
+})
+
+test('mds 重置通知在租约结束之后仍送达（审查第一轮）：已完成任务的待送达通知随下一次执行结束送达', async () => {
+  const b = await bench()
+  current = b
+  const first = await b.create()
+  await b.until(first, (task) => task.status === 'done')
+  // 模拟：上一次执行的租约已结束（或被放弃）后才记下的通知。
+  await queueMdsNotice(b.home, first, ['mdsDirectory.db'])
+  expect(hasPendingMdsNotices(b.home)).toBe(true)
+  const second = await b.create()
+  await b.until(second, (task) => task.status === 'done')
+  const events = b.events(first).filter((event) => event.type === 'task.out_of_band')
+  expect(events).toHaveLength(1)
+  expect(events[0]?.payload).toMatchObject({ kind: 'mds_reset', files: ['mdsDirectory.db'] })
+  expect(b.events(second).filter((event) => event.type === 'task.out_of_band')).toHaveLength(0)
+  expect(hasPendingMdsNotices(b.home)).toBe(false)
 })

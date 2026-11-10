@@ -15,6 +15,8 @@ import {
   fail,
   INBOX_BODY_MAX,
   INBOX_TITLE_MAX,
+  type IsolationNoticeData,
+  isolationNoticeRequest,
   isSqliteBusy,
   type LeaseGrant,
   type LeaseSlots,
@@ -120,6 +122,8 @@ export interface NodeService {
   renew(leaseId: string, body: unknown): Result<RenewLeaseData>
   complete(leaseId: string, body: unknown): Result<CompleteLeaseData>
   ackReply(leaseId: string, body: unknown): Result<AckReplyData>
+  /** 节点上报隔离事实（mds 重置，worker-credential-isolation 4.5），不依赖活动租约。 */
+  isolationNotice(nodeId: string, body: unknown): Result<IsolationNoticeData>
   /**
    * 处理全部已到期的活动租约，返回处理的数量。`graceMs`：中枢自身最近被卡住（事件循环得不到调度）的
    * 时长，到期不足这么久的租约这一轮先不处理——卡住期间节点的续约可能正排在后面等待处理。
@@ -702,6 +706,35 @@ export function createNodeService(o: NodeServiceOptions): NodeService {
       ledger.touchNode(req.data.node_id)
       const node = ledger.getNode(req.data.node_id)
       return node ? ok({ node }) : fail('failure', 'internal_error', '节点写入后不可见')
+    },
+
+    isolationNotice(nodeId, body) {
+      const req = parse(isolationNoticeRequest, body, '隔离事实上报')
+      if (!req.ok) return req
+      const task = ledger.getTask(req.data.task_id)
+      // 只接受该节点曾经领取过租约的任务：节点不能给其他节点的任务写事件。
+      const events = task ? ledger.taskEvents(task.id) : []
+      const held = events.some((e) => e.type === 'lease.granted' && e.payload.node_id === nodeId)
+      if (!task || !held)
+        return fail(
+          'failure',
+          'scope_denied',
+          `节点 ${nodeId} 没有领取过任务 ${req.data.task_id} 的租约`,
+        )
+      const signal = req.data.signal
+      if (events.some((e) => e.type === 'task.out_of_band' && e.payload.id === signal.id))
+        return ok({ recorded: false })
+      const written = ledger.append(
+        {
+          task_id: task.id,
+          workspace: task.workspace,
+          type: 'task.out_of_band',
+          payload: signal,
+        },
+        { actor: `node:${nodeId}` },
+      )
+      if (!written.ok) return written
+      return ok({ recorded: true })
     },
 
     listNodes() {

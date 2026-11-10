@@ -197,17 +197,24 @@ export async function prepareSeatbelt(
 }
 
 /**
- * 启动（或重新挂接）施加外层 seatbelt 的 harness 前记录 `mds/` 的基线（`mds.ts`）；没有配置 `darwinUserCacheDir` 时什么也不做。
+ * 启动（或重新挂接）施加外层 seatbelt 的 harness 前记录 `mds/` 的基线（`mds.ts`：先与全部已有基线比较并重置）；
+ * 没有配置 `darwinUserCacheDir` 时什么也不做。`hold`：codex-orca 的终端在执行结束后可能继续运行，基线保留到终端结束。
  * 失败时返回错误，调用方不启动 harness（不能校验就不放行）。
  */
 export async function recordSeatbeltMdsBaseline(
   o: Pick<SeatbeltOptions, 'darwinUserCacheDir'>,
   home: string,
   taskId: string,
+  opts: { hold?: boolean } = {},
 ): Promise<Result<null>> {
   if (o.darwinUserCacheDir === undefined) return ok(null)
   try {
-    await recordMdsBaseline(home, taskId, await canonicalPath(mdsDirOf(o.darwinUserCacheDir)))
+    await recordMdsBaseline(
+      home,
+      taskId,
+      await canonicalPath(mdsDirOf(o.darwinUserCacheDir)),
+      opts.hold ? { hold: true } : {},
+    )
     return ok(null)
   } catch (err) {
     return fail(

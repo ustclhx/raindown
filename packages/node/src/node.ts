@@ -76,9 +76,13 @@ import {
   writeLeaseTokenFile,
 } from './lease-token.ts'
 import {
+  deliverMdsNotices,
   describeMdsVerification,
+  hasPendingMdsNotices,
   type MdsVerification,
+  mdsBaselineHeld,
   mdsBaselinePath,
+  sweepStaleMdsBaselines,
   verifyMdsBaseline,
 } from './mds.ts'
 import { acquireNodeLock } from './node-lock.ts'
@@ -810,8 +814,8 @@ class LeaseRunner {
 
   /**
    * harness 结束后按启动前记录的基线校验并重置 macOS Security 缓存（`mds.ts`，worker-credential-isolation 4.5）。
-   * 只有施加了外层 seatbelt 且放行了 mds 的启动才有基线；有变化时记一条任务活动，并经带外信号让中枢写 Digest 收件箱条目
-   * （随之后的续约送达，只含文件名）。不抛出。
+   * 只有施加了外层 seatbelt 且放行了 mds 的启动才有基线；codex-orca 的终端仍在运行时基线被 hold，这里不校验。
+   * 有变化时记一条任务活动；通知已写进 `state/mds-notices/`，随后经隔离事实接口送达（不依赖租约，审查第一轮）。不抛出。
    */
   private async checkMds(): Promise<void> {
     let v: MdsVerification | undefined
@@ -831,13 +835,6 @@ class LeaseRunner {
       data: { mds_reset: { files: v.reset, failed: v.failed } },
     })
     if (this.buffer.length > ACTIVITY_BUFFER_MAX) this.buffer.shift()
-    const files = [...v.reset, ...v.failed]
-    if (files.length > 0 || v.dirReplaced)
-      this.outOfBand.push({
-        id: `mds-reset:${this.grant.lease_id}`.slice(0, 128),
-        kind: 'mds_reset',
-        files: (files.length > 0 ? files : ['mds']).slice(0, 100).map((f) => f.slice(0, 255)),
-      })
   }
 
   private onActivity(a: Activity) {
@@ -1481,7 +1478,13 @@ class LeaseRunner {
         if (this.leaseTokenFile) await removeLeaseTokenFile(this.leaseTokenFile).catch(() => {})
         // 外层 seatbelt 下 harness 结束（正常结束、崩溃、取消、阻塞都经过这里）：按启动前的基线校验并重置 mds（4.5）。
         // 没有基线（开关关闭、未施加或未放行 mds）时不 await，不改变执行结束时的时序。
-        if (existsSync(mdsBaselinePath(this.env.home, this.grant.task_id))) await this.checkMds()
+        if (
+          existsSync(mdsBaselinePath(this.env.home, this.grant.task_id)) &&
+          !mdsBaselineHeld(this.env.home, this.grant.task_id)
+        )
+          await this.checkMds()
+        // 待送达的 mds 重置通知（本任务的，或其他任务启动前比较基线时记下的）：经隔离事实接口送达，不依赖本租约。
+        if (hasPendingMdsNotices(this.env.home)) await deliverPendingMdsNotices(this.env)
         // 外层 seatbelt 配置只在启动 harness 时读取（4.1），执行结束即删除。
         await removeSeatbeltProfile(this.env.home, this.grant.task_id).catch(() => {})
         // 任务私有目录变空时一并删除（审查目录由执行器在会话结束时清理）。
@@ -1737,6 +1740,22 @@ class LeaseRunner {
   }
 }
 
+/** 送达 `state/mds-notices/` 中的通知（`POST /v1/nodes/:id/isolation-notices`）。不抛出。 */
+async function deliverPendingMdsNotices(env: {
+  home: string
+  nodeId: string
+  client: NodeHubClient
+  logger: Pick<Env['logger'], 'warn'>
+}): Promise<void> {
+  const send = env.client.isolationNotice
+  if (!send) return
+  await deliverMdsNotices(
+    env.home,
+    (notice) => send.call(env.client, env.nodeId, notice),
+    (message) => env.logger.warn(message),
+  ).catch((err: Error) => env.logger.warn('无法送达 mds 重置通知', err.message))
+}
+
 /**
  * 启动节点。先取得节点单实例锁（`state/node.lock`）：启动清理（`state/wake/` 的 token 文件、执行器残留）
  * 只在确认没有并行节点时进行；锁在节点停止或启动失败时释放。
@@ -1803,6 +1822,12 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
   // CODEX_HOME 从 state/ 迁到 run/（worker-credential-isolation D2）；失败时保留旧位置继续使用。
   const codexHomes = await migrateCodexHomes(home, (message) => logger.warn(message))
   for (const dir of codexHomes.migrated) logger.info(`CODEX_HOME 已迁移到 ${dir}`)
+  // 上次运行残留的 mds 基线（进程被杀、租约丢失）：校验并重置，没有 hold 的随后删除（worker-credential-isolation 4.5）。
+  for (const task of await sweepStaleMdsBaselines(home).catch((err: Error) => {
+    logger.warn('无法校验残留的 mds 基线', err.message)
+    return [] as string[]
+  }))
+    logger.info(`已校验任务 ${task} 残留的 mds 基线`)
 
   const id =
     options.nodeId !== undefined ? ok(options.nodeId) : await loadOrCreateNodeId(home, host)
@@ -1831,6 +1856,9 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
     ...(options.fetch ? { fetch: options.fetch } : {}),
   })
   const retryMs = options.retryMs ?? 1_000
+  // 待送达的 mds 重置通知：启动时尝试送达一次（不阻塞启动；失败的留到下一次执行结束时）。
+  if (hasPendingMdsNotices(home))
+    void deliverPendingMdsNotices({ home, nodeId, client, logger }).catch(() => {})
   const env: Env = {
     home,
     nodeId,

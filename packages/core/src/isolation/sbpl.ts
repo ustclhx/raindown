@@ -173,6 +173,14 @@ export function renderSeatbeltProfile(spec: IsolationSpec): Result<string> {
         ...subpaths(spec.write_carve_outs),
         ...literals(spec.write_carve_out_literals),
       ]),
+      // mds（4.5，审查第一轮）：只能新建普通文件，不能预埋符号链接、目录或 FIFO（含改名移入）。
+      ...rule(
+        'deny',
+        'file-write-create',
+        spec.regular_files_only.map(
+          (p) => `(require-all (subpath ${sbplString(p)}) (require-not (vnode-type REGULAR-FILE)))`,
+        ),
+      ),
       ';; 1b. 本任务独立 clone 的 .git（写类角色）；config、hooks、alternates 等在下面再次拒绝。登记仓库的 .git 整体只读',
       ...rule('allow', 'file-write*', subpaths(spec.allow_write_git)),
       '',

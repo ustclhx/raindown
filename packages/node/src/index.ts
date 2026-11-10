@@ -176,12 +176,21 @@ export {
   writeSeatbeltProfile,
 } from './lease-token.ts'
 export {
+  deliverMdsNotices,
   describeMdsVerification,
+  hasPendingMdsNotices,
   MDS_BASELINE_FILE,
+  MDS_MAX_HASH_BYTES,
+  type MdsNotice,
   type MdsVerification,
+  mdsBaselineHeld,
   mdsBaselinePath,
+  mdsNoticesDir,
+  queueMdsNotice,
   recordMdsBaseline,
+  setMdsBaselineHold,
   snapshotMds,
+  sweepStaleMdsBaselines,
   verifyMdsBaseline,
 } from './mds.ts'
 export {

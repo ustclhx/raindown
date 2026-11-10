@@ -28,6 +28,8 @@ exports[`SBPL 生成 快照：allow default + 默认写拒绝 + 写白名单 + �
   (subpath "/Users/u/repo/.git")
   (subpath "/Users/u/raindown-home/run/executors/codex-exec/codex-home/config.toml")
   (literal "/Users/u/work/.git"))
+(deny file-write-create
+  (require-all (subpath "/private/var/folders/xx/yy/C/mds") (require-not (vnode-type REGULAR-FILE))))
 ;; 1b. 本任务独立 clone 的 .git（写类角色）；config、hooks、alternates 等在下面再次拒绝。登记仓库的 .git 整体只读
 (allow file-write*
   (subpath "/Users/u/clone/.git"))

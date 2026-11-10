@@ -221,7 +221,7 @@ describe('mds 重置（worker-credential-isolation 4.5）', () => {
     const signal = {
       id: 'mds-reset:l-1',
       kind: 'mds_reset',
-      files: ['mdsDirectory.db', 'planted.db'],
+      files: ['mdsDirectory.db', 'planted.db', 'evil\n- 伪造的行'],
     }
     must(renew({ out_of_band: [signal] }))
     must(renew({ out_of_band: [signal] }))
@@ -240,7 +240,10 @@ describe('mds 重置（worker-credential-isolation 4.5）', () => {
       actions: [],
     })
     expect(items[0]?.body).toContain('mdsDirectory.db')
-    expect(items[0]?.body).toContain('planted.db')
+    expect(items[0]?.body).toContain('"planted.db"')
+    // worker 控制的文件名逐个 JSON 引号转义，不能伪造换行（审查第一轮）。
+    expect(items[0]?.body).toContain('"evil\\n- 伪造的行"')
+    expect(items[0]?.body).not.toContain('evil\n')
     expect(ledger.listInboxItems({ source: 'out_of_band' })).toHaveLength(0)
     reactor.reconcile()
     await reactor.idle()

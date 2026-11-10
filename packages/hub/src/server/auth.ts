@@ -49,6 +49,7 @@ export interface HubAuthOptions {
 const NODE_ENDPOINTS: readonly EndpointName[] = [
   'policy-check',
   'nodes-register',
+  'nodes-isolation-notice',
   'leases-acquire',
   'leases-renew',
   'leases-complete',
@@ -105,6 +106,12 @@ async function checkNodeScope(
       if (bodyNode !== undefined && bodyNode !== nodeId) {
         return errorResponse(c, 'scope_denied', `节点身份 ${actor} 不能代表 ${String(bodyNode)}`)
       }
+    }
+    // 隔离事实上报：路径中的节点必须是本身份。
+    if (hit.name === 'nodes-isolation-notice') {
+      const m = hit.match(c)
+      if (decodeURIComponent(m?.[1] ?? '') !== nodeId)
+        return errorResponse(c, 'scope_denied', `节点身份 ${actor} 只能以自己的节点 id 上报`)
     }
     return null
   }

@@ -1,14 +1,36 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { spawnSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
-import { lstat, mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  realpath,
+  rm,
+  symlink,
+  truncate,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { ok } from '@raindown/core'
 import {
+  deliverMdsNotices,
   describeMdsVerification,
+  hasPendingMdsNotices,
+  MDS_MAX_HASH_BYTES,
+  type MdsNotice,
+  mdsBaselineHeld,
   mdsBaselinePath,
+  mdsNoticesDir,
   prepareSeatbelt,
+  queueMdsNotice,
   recordMdsBaseline,
   recordSeatbeltMdsBaseline,
+  setMdsBaselineHold,
+  snapshotMds,
+  sweepStaleMdsBaselines,
   verifyMdsBaseline,
 } from '../src/index.ts'
 
@@ -83,8 +105,14 @@ describe('mds 基线与校验重置', () => {
     await recordMdsBaseline(e.home, 't-1', e.mds)
     await writeFile(join(e.mds, 'mdsObject.db'), 'OBJECT-tampered')
     await recordMdsBaseline(e.home, 't-1', e.mds)
+    // 第二次记录前先按已有基线比较（审查第一轮）：改动的条目已被重置；基线仍是较早的那份。
+    expect(existsSync(join(e.mds, 'mdsObject.db'))).toBe(false)
+    const b = JSON.parse(readFileSync(mdsBaselinePath(e.home, 't-1'), 'utf8'))
+    expect(Object.keys(b.entries)).toContain('mdsObject.db')
+    // macOS 重建后内容相同：不再视为变化。
+    await writeFile(join(e.mds, 'mdsObject.db'), 'OBJECT-v1')
     const v = await verifyMdsBaseline(e.home, 't-1')
-    expect(v?.reset).toEqual(['mdsObject.db'])
+    expect(v?.reset).toEqual([])
   })
 
   test('mds 目录被换成符号链接：不处理其中内容，报告目录被替换', async () => {
@@ -134,5 +162,122 @@ describe('mds 基线与校验重置', () => {
     if (!on.ok) throw new Error(on.error.message)
     expect(readFileSync(on.data.profilePath, 'utf8')).toContain(`(subpath "${e.mds}")`)
     expect(existsSync(mdsBaselinePath(e.home, 't-1'))).toBe(true)
+  })
+})
+
+/** 读出待送达的通知（只含任务 id 与文件名）。 */
+async function notices(home: string): Promise<Array<{ task: string; files: string[] }>> {
+  const dir = mdsNoticesDir(home)
+  if (!existsSync(dir)) return []
+  const out: Array<{ task: string; files: string[] }> = []
+  for (const name of (await readdir(dir)).filter((n) => n.endsWith('.json'))) {
+    const n = JSON.parse(readFileSync(join(dir, name), 'utf8')) as MdsNotice
+    out.push({ task: n.task_id, files: [...n.signal.files].sort() })
+  }
+  return out.sort((a, b) => a.task.localeCompare(b.task))
+}
+
+describe('审查第一轮', () => {
+  test('超大文件（稀疏）与 FIFO：不读取内容，直接视为变化并删除', async () => {
+    const e = await env()
+    await recordMdsBaseline(e.home, 't-1', e.mds)
+    // 稀疏的 4 GiB 文件：只截断扩展，不占磁盘；读取整个文件会拖垮节点。
+    await writeFile(join(e.mds, 'huge.db'), '')
+    await truncate(join(e.mds, 'huge.db'), 4 * 1024 * 1024 * 1024)
+    // 刚好超过上限的普通文件也不计算哈希。
+    await writeFile(join(e.mds, 'big.db'), Buffer.alloc(MDS_MAX_HASH_BYTES + 1))
+    if (process.platform === 'darwin' || process.platform === 'linux')
+      spawnSync('/usr/bin/mkfifo', [join(e.mds, 'fifo')])
+    const started = Date.now()
+    const snap = await snapshotMds(e.mds)
+    expect(Date.now() - started).toBeLessThan(5_000)
+    expect(snap['huge.db']).toEqual({ type: 'other' })
+    expect(snap['big.db']).toEqual({ type: 'other' })
+    if (existsSync(join(e.mds, 'fifo'))) expect(snap.fifo).toEqual({ type: 'other' })
+    const v = await verifyMdsBaseline(e.home, 't-1')
+    expect(v?.reset).toEqual(expect.arrayContaining(['big.db', 'huge.db']))
+    expect((await readdir(e.mds)).sort()).toEqual(['mds.lock', 'mdsDirectory.db', 'mdsObject.db'])
+  })
+
+  test('记录新基线前先与全部已有基线比较：不一致时先重置，并为基线所属任务记通知（含本任务的重新挂接）', async () => {
+    const e = await env()
+    await recordMdsBaseline(e.home, 't-a', e.mds, { hold: true })
+    // t-a 的终端在阻塞期间改动了 mds。
+    await writeFile(join(e.mds, 'mdsDirectory.db'), 'tampered-while-blocked')
+    await writeFile(join(e.mds, 'planted.db'), 'x')
+    // 另一个任务启动前：先比较、重置，再记录自己的基线。
+    await recordMdsBaseline(e.home, 't-b', e.mds)
+    expect((await readdir(e.mds)).sort()).toEqual(['mds.lock', 'mdsObject.db'])
+    expect(await notices(e.home)).toEqual([
+      { task: 't-a', files: ['mdsDirectory.db', 'planted.db'] },
+    ])
+    const b = JSON.parse(readFileSync(mdsBaselinePath(e.home, 't-b'), 'utf8'))
+    expect(Object.keys(b.entries).sort()).toEqual(['mds.lock', 'mdsObject.db'])
+    // 同一任务重新挂接：已有基线保留，但仍先比较。
+    await writeFile(join(e.mds, 'again.db'), 'x')
+    await recordMdsBaseline(e.home, 't-a', e.mds, { hold: true })
+    expect(existsSync(join(e.mds, 'again.db'))).toBe(false)
+    expect((await notices(e.home)).filter((n) => n.files.includes('again.db'))).toHaveLength(2)
+  })
+
+  test('hold：执行结束不校验、不删除基线；解除后校验并删除', async () => {
+    const e = await env()
+    await recordMdsBaseline(e.home, 't-1', e.mds)
+    await setMdsBaselineHold(e.home, 't-1', true)
+    expect(mdsBaselineHeld(e.home, 't-1')).toBe(true)
+    await writeFile(join(e.mds, 'mdsObject.db'), 'tampered')
+    expect(await verifyMdsBaseline(e.home, 't-1')).toMatchObject({ held: true })
+    expect(existsSync(mdsBaselinePath(e.home, 't-1'))).toBe(true)
+    expect(readFileSync(join(e.mds, 'mdsObject.db'), 'utf8')).toBe('tampered')
+    await setMdsBaselineHold(e.home, 't-1', false)
+    expect(mdsBaselineHeld(e.home, 't-1')).toBe(false)
+    expect((await verifyMdsBaseline(e.home, 't-1'))?.reset).toEqual(['mdsObject.db'])
+    expect(existsSync(mdsBaselinePath(e.home, 't-1'))).toBe(false)
+    expect(await notices(e.home)).toEqual([{ task: 't-1', files: ['mdsObject.db'] }])
+  })
+
+  test('节点启动：校验全部残留基线并重置；没有 hold 的删除，hold 的保留', async () => {
+    const e = await env()
+    await recordMdsBaseline(e.home, 't-1', e.mds)
+    await recordMdsBaseline(e.home, 't-2', e.mds, { hold: true })
+    await writeFile(join(e.mds, 'planted.db'), 'x')
+    expect((await sweepStaleMdsBaselines(e.home)).sort()).toEqual(['t-1', 't-2'])
+    expect(existsSync(join(e.mds, 'planted.db'))).toBe(false)
+    expect(existsSync(mdsBaselinePath(e.home, 't-1'))).toBe(false)
+    expect(existsSync(mdsBaselinePath(e.home, 't-2'))).toBe(true)
+    expect((await notices(e.home)).map((n) => n.task)).toContain('t-1')
+  })
+
+  test('送达通知：成功与不可重试的拒绝删除通知，可重试的错误保留；日志中的文件名逐个引号转义', async () => {
+    const e = await env()
+    await queueMdsNotice(e.home, 't-1', ['a.db'])
+    await queueMdsNotice(e.home, 't-2', ['evil\nname'])
+    expect(hasPendingMdsNotices(e.home)).toBe(true)
+    const logs: string[] = []
+    await deliverMdsNotices(
+      e.home,
+      async () => ({ ok: false, error: { kind: 'retryable', code: 'hub_unavailable' } }) as never,
+      (m) => logs.push(m),
+    )
+    expect((await notices(e.home)).length).toBe(2)
+    const sent: string[] = []
+    await deliverMdsNotices(
+      e.home,
+      async (n) => {
+        sent.push(n.task_id)
+        return n.task_id === 't-1'
+          ? ok({ recorded: true })
+          : ({ ok: false, error: { kind: 'failure', code: 'scope_denied' } } as never)
+      },
+      (m) => logs.push(m),
+    )
+    expect(sent.sort()).toEqual(['t-1', 't-2'])
+    expect(hasPendingMdsNotices(e.home)).toBe(false)
+    expect(logs.some((l) => l.includes('"evil\\nname"'))).toBe(true)
+    expect(logs.some((l) => l.includes('evil\nname'))).toBe(false)
+    // describeMdsVerification 同样转义。
+    expect(describeMdsVerification({ dir: e.mds, reset: ['x\ny'], failed: [] })).toContain(
+      '"x\\ny"',
+    )
   })
 })

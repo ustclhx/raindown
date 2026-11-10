@@ -17,6 +17,9 @@ import {
   HEADERS,
   HUB_TOKEN_ENV,
   HUB_UNAVAILABLE,
+  type IsolationNoticeData,
+  type IsolationNoticeRequest,
+  isolationNoticeData,
   type ListTasksData,
   listNodesData,
   listTasksData,
@@ -81,6 +84,11 @@ export interface NodeHubClient {
     leaseId: string,
     req: Partial<AckReplyRequest> & Pick<AckReplyRequest, 'lease_token' | 'reply_id'>,
   ): Promise<Result<AckReplyData>>
+  /** 隔离事实上报（mds 重置，worker-credential-isolation 4.5），不依赖租约。测试替身可以不实现（通知保留在节点）。 */
+  isolationNotice?(
+    nodeId: string,
+    req: IsolationNoticeRequest,
+  ): Promise<Result<IsolationNoticeData>>
   /** 策略预检；节点不得传 dry_run（中枢会拒绝），因此这里不提供该字段。 */
   policyCheck(
     req: Omit<PolicyCheckRequest, 'dry_run'>,
@@ -196,6 +204,13 @@ export function createNodeHubClient(o: NodeHubClientOptions): NodeHubClient {
       call('POST', leasePath(ENDPOINTS['leases-complete'].path, id), completeLeaseData, req),
     ackReply: (id, req) =>
       call('POST', leasePath(ENDPOINTS['leases-ack-reply'].path, id), ackReplyData, req),
+    isolationNotice: (nodeId, req) =>
+      call(
+        'POST',
+        leasePath(ENDPOINTS['nodes-isolation-notice'].path, nodeId),
+        isolationNoticeData,
+        req,
+      ),
     policyCheck: (req, opts = {}) =>
       call('POST', ENDPOINTS['policy-check'].path, policyCheckData, req, opts),
     showTask: (id) =>

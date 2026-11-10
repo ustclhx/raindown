@@ -266,14 +266,12 @@ export function createInboxReactor(o: InboxReactorOptions): InboxReactor {
           source_ref: task.id,
           source_seq: e.seq,
           reason: p.kind,
-          title: clipText(
-            `[${task.workspace}] 任务结束后重置了 macOS Security 缓存（mds）`,
-            INBOX_TITLE_MAX,
-          ),
+          title: clipText(`[${task.workspace}] 重置了 macOS Security 缓存（mds）`, INBOX_TITLE_MAX),
           body: clipText(
             [
-              `任务 ${task.id} 的 harness 在外层 seatbelt 内运行后，DARWIN_USER_CACHE_DIR/mds 下以下条目有变化或新增，节点已删除（macOS 会自动重建）：`,
-              ...p.files.map((f) => `- ${f}`),
+              `任务 ${task.id} 的 harness 在外层 seatbelt 内运行期间，DARWIN_USER_CACHE_DIR/mds 下以下条目有变化或新增，节点已在校验时删除（macOS 会自动重建）：`,
+              // 文件名由 worker 控制：逐个 JSON 引号转义，不能伪造换行或格式。
+              ...p.files.map((f) => `- ${JSON.stringify(f)}`),
               '沙箱外的进程同时合法更新这些文件也会触发重置，重建无害。',
             ].join('\n'),
             INBOX_BODY_MAX,

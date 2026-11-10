@@ -86,6 +86,10 @@ export const nodeStartCommand = defineCommand({
       isolationProbe: {
         resolveOrcaPorts: orcaPorts,
         extraWrite: nodeConfig.data.isolation.extra_write,
+        // 与 worker 相同的 mds 放行（4.5），探针配置与 worker 配置一致。
+        ...(isolation.darwinUserCacheDir !== undefined
+          ? { darwinUserCacheDir: isolation.darwinUserCacheDir }
+          : {}),
         ...(seatbeltActive(isolation)
           ? { launchWrapper: seatbeltProbeLaunchWrapper(isolation) }
           : {}),

@@ -32,6 +32,8 @@ import {
   type ExecutorOutcome,
   type ExecutorPlugin,
   type ExecutorRun,
+  mdsBaselineHeld,
+  mdsBaselinePath,
   type SeatbeltOptions,
   writeLeaseTokenFile,
 } from '../src/index.ts'
@@ -2359,6 +2361,31 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
       host_worktree: home.worktree,
     })
     await s.run.cancel()
+  })
+
+  test('mds（4.5，审查第一轮）：启动前记录基线并在终端运行期间 hold；任务取消（终端结束）时解除', async () => {
+    const home = orcaHome()
+    // 注入的假 DARWIN_USER_CACHE_DIR，绝不碰真实的 /private/var/folders/*/C/mds。
+    const cacheDir = join(home.root, 'C')
+    mkdirSync(join(cacheDir, 'mds'), { recursive: true })
+    writeFileSync(join(cacheDir, 'mds', 'mds.lock'), '')
+    const leaseTokenFile = await token(home, 'l-1')
+    const s = await start({}, (o) => o.show('working'), {
+      home,
+      leaseTokenFile,
+      hubUrl: HUB,
+      isolation: { ...on(home), darwinUserCacheDir: cacheDir },
+    })
+    await ready(s)
+    const profile = readFileSync(join(home.home, 'state/tasks/t-orca-1/isolation.sb'), 'utf8')
+    const mds = join(realpathSync(cacheDir), 'mds')
+    expect(profile).toContain(`(subpath ${JSON.stringify(mds)})`)
+    expect(profile).toContain('(require-not (vnode-type REGULAR-FILE))')
+    expect(existsSync(mdsBaselinePath(home.home, 't-orca-1'))).toBe(true)
+    expect(mdsBaselineHeld(home.home, 't-orca-1')).toBe(true)
+    await s.run.cancel()
+    await s.run.done
+    expect(mdsBaselineHeld(home.home, 't-orca-1')).toBe(false)
   })
 
   test('开关打开但角色为 workspace-write（native 未实现）：命令不变', async () => {
