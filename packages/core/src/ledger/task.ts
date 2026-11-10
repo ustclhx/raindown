@@ -74,6 +74,14 @@ export const mdsResetSignal = z.strictObject({
     .min(1)
     .max(100)
     .meta({ description: '被删除的 mds/ 条目名（只有文件名）' }),
+  repeats: z
+    .record(z.string().min(1).max(255), z.number().int().min(1))
+    .optional()
+    .meta({ description: '各文件在同一基线下被重置的次数（审查第三轮：重复重置只计数）' }),
+  inbox: z.enum(['none', 'repeated']).optional().meta({
+    description:
+      'none：只写任务事件（重复重置的计数）；repeated：写“反复重置”的收件箱条目；缺省写普通的重置条目',
+  }),
   message: z.string().max(16_384).optional(),
 })
 export type MdsResetSignal = z.infer<typeof mdsResetSignal>

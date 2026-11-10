@@ -20,6 +20,7 @@ import {
   describeMdsVerification,
   hasPendingMdsNotices,
   MDS_MAX_HASH_BYTES,
+  MDS_REPEAT_ESCALATE,
   type MdsNotice,
   mdsBaselineHeld,
   mdsBaselinePath,
@@ -165,16 +166,27 @@ describe('mds 基线与校验重置', () => {
   })
 })
 
-/** 读出待送达的通知（只含任务 id 与文件名）。 */
-async function notices(home: string): Promise<Array<{ task: string; files: string[] }>> {
+/** 读出待送达的通知（只含任务 id、文件名与收件箱类别）。缺省只列会写收件箱的（不含 inbox=none 的计数通知）。 */
+async function notices(
+  home: string,
+  o: { all?: boolean } = {},
+): Promise<Array<{ task: string; files: string[]; inbox?: string; repeats?: unknown }>> {
   const dir = mdsNoticesDir(home)
   if (!existsSync(dir)) return []
-  const out: Array<{ task: string; files: string[] }> = []
+  const out: Array<{ task: string; files: string[]; inbox?: string; repeats?: unknown }> = []
   for (const name of (await readdir(dir)).filter((n) => n.endsWith('.json'))) {
     const n = JSON.parse(readFileSync(join(dir, name), 'utf8')) as MdsNotice
-    out.push({ task: n.task_id, files: [...n.signal.files].sort() })
+    if (!o.all && n.signal.inbox === 'none') continue
+    out.push({
+      task: n.task_id,
+      files: [...n.signal.files].sort(),
+      ...(n.signal.inbox ? { inbox: n.signal.inbox } : {}),
+      ...(n.signal.repeats ? { repeats: n.signal.repeats } : {}),
+    })
   }
-  return out.sort((a, b) => a.task.localeCompare(b.task))
+  return out.sort(
+    (a, b) => a.task.localeCompare(b.task) || (a.inbox ?? '').localeCompare(b.inbox ?? ''),
+  )
 }
 
 describe('审查第一轮', () => {
@@ -212,12 +224,10 @@ describe('审查第一轮', () => {
       { task: 't-a', files: ['mdsDirectory.db', 'planted.db'] },
     ])
     const b = JSON.parse(readFileSync(mdsBaselinePath(e.home, 't-b'), 'utf8'))
-    // 新基线沿用重置标记（审查第二轮）：之后 macOS 重建这些条目时被采纳。
-    expect(b.entries).toMatchObject({
-      'mdsDirectory.db': { type: 'reset' },
-      'planted.db': { type: 'reset' },
-      'mdsObject.db': { type: 'file' },
-    })
+    // 新基线对刚被重置的条目沿用已知良好的哈希（审查第三轮）；基线外的新文件不记。
+    const a = JSON.parse(readFileSync(mdsBaselinePath(e.home, 't-a'), 'utf8'))
+    expect(b.entries['mdsDirectory.db']).toEqual(a.entries['mdsDirectory.db'])
+    expect(b.entries['planted.db']).toBeUndefined()
     // 同一任务重新挂接：已有基线保留，但仍先比较。
     await writeFile(join(e.mds, 'again.db'), 'x')
     await recordMdsBaseline(e.home, 't-a', e.mds, { hold: true })
@@ -287,53 +297,102 @@ describe('审查第一轮', () => {
   })
 })
 
-describe('审查第二轮：重置后刷新基线', () => {
-  test('hold 的基线 + 3 次模拟重建：只重置一次、只记一条通知；重建的文件被采纳', async () => {
+describe('审查第三轮：基线只保存已知良好的哈希，通知去重', () => {
+  test('审查者的序列：B 写 EVIL1，A 启动时重置，B 再写 EVIL2，B/A/C 结束：EVIL2 被重置，每个任务每个文件只有一条通知', async () => {
     const e = await env()
-    await recordMdsBaseline(e.home, 't-a', e.mds, { hold: true })
-    await writeFile(join(e.mds, 'mdsDirectory.db'), 'tampered-while-blocked')
-    for (let i = 1; i <= 3; i++) {
-      // macOS 在重置后重建（内容与原来不同），之后又有任务启动。
-      if (!existsSync(join(e.mds, 'mdsDirectory.db')))
-        await writeFile(join(e.mds, 'mdsDirectory.db'), `DIRECTORY-rebuilt-${i}`)
-      await recordMdsBaseline(e.home, `t-${i}`, e.mds)
-    }
-    // 第一次启动前重置；之后 macOS 重建的文件在每次比较时被采纳，不再重置。
-    expect(readFileSync(join(e.mds, 'mdsDirectory.db'), 'utf8')).toBe('DIRECTORY-rebuilt-2')
-    expect(await notices(e.home)).toEqual([{ task: 't-a', files: ['mdsDirectory.db'] }])
-    // 采纳后各基线记录的是重建后的内容：解除 hold 后结束校验没有变化。
-    await setMdsBaselineHold(e.home, 't-a', false)
-    expect((await verifyMdsBaseline(e.home, 't-a'))?.reset).toEqual([])
-    for (const t of ['t-1', 't-2', 't-3'])
-      expect((await verifyMdsBaseline(e.home, t))?.reset).toEqual([])
-    expect((await notices(e.home)).length).toBe(1)
-  })
-
-  test('启动时扫描（force + keep）同样刷新被保留的基线：之后的重建不再重置', async () => {
-    const e = await env()
-    await recordMdsBaseline(e.home, 't-a', e.mds, { hold: true })
-    await writeFile(join(e.mds, 'mdsObject.db'), 'tampered')
-    await sweepStaleMdsBaselines(e.home)
-    expect(existsSync(join(e.mds, 'mdsObject.db'))).toBe(false)
-    await writeFile(join(e.mds, 'mdsObject.db'), 'OBJECT-rebuilt')
-    await sweepStaleMdsBaselines(e.home)
-    await recordMdsBaseline(e.home, 't-b', e.mds)
-    expect(readFileSync(join(e.mds, 'mdsObject.db'), 'utf8')).toBe('OBJECT-rebuilt')
-    expect(await notices(e.home)).toEqual([{ task: 't-a', files: ['mdsObject.db'] }])
-  })
-
-  test('采纳只针对重建：采纳之后再被改动仍是变化，照样重置', async () => {
-    const e = await env()
-    await recordMdsBaseline(e.home, 't-a', e.mds, { hold: true })
-    await writeFile(join(e.mds, 'planted.db'), 'x')
-    await recordMdsBaseline(e.home, 't-b', e.mds)
-    expect(existsSync(join(e.mds, 'planted.db'))).toBe(false)
-    await writeFile(join(e.mds, 'planted.db'), 'rebuilt')
+    const file = join(e.mds, 'mdsDirectory.db')
+    await recordMdsBaseline(e.home, 't-b', e.mds, { hold: true })
     await recordMdsBaseline(e.home, 't-c', e.mds)
-    expect(existsSync(join(e.mds, 'planted.db'))).toBe(true)
-    await writeFile(join(e.mds, 'planted.db'), 'tampered-again')
+    await writeFile(file, 'EVIL1')
+    await recordMdsBaseline(e.home, 't-a', e.mds)
+    expect(existsSync(file)).toBe(false)
+    // 重置后、macOS 重建之前，worker 抢先写入：不会被采纳。
+    await writeFile(file, 'EVIL2')
+    await setMdsBaselineHold(e.home, 't-b', false)
+    for (const t of ['t-b', 't-a', 't-c']) await verifyMdsBaseline(e.home, t)
+    expect(existsSync(file) && readFileSync(file, 'utf8') === 'EVIL2').toBe(false)
+    const inbox = (await notices(e.home)).filter((n) => n.files.includes('mdsDirectory.db'))
+    // 每个任务最多一条会写收件箱的通知。
+    for (const t of ['t-a', 't-b', 't-c'])
+      expect(inbox.filter((n) => n.task === t).length).toBeLessThanOrEqual(1)
+    // A 启动时 B、C 的基线看到 EVIL1；A 的基线沿用已知良好哈希，EVIL2 在 B 结束时已被重置。
+    expect(inbox.map((n) => n.task).sort()).toEqual(['t-b', 't-c'])
+    // 重复的重置只计数，以只写任务事件的通知记下（t-b 被重置两次）。
+    const counts = (await notices(e.home, { all: true })).filter((n) => n.inbox === 'none')
+    expect(counts).toEqual([
+      { task: 't-b', files: ['mdsDirectory.db'], inbox: 'none', repeats: { 'mdsDirectory.db': 2 } },
+    ])
+  })
+
+  test('hold 的基线 + 3 次内容不同的重建：每次都重置，只有一条通知', async () => {
+    const e = await env()
+    const file = join(e.mds, 'mdsDirectory.db')
+    await recordMdsBaseline(e.home, 't-a', e.mds, { hold: true })
+    for (let i = 1; i <= 3; i++) {
+      await writeFile(file, `DIRECTORY-rebuilt-${i}`)
+      await recordMdsBaseline(e.home, `t-${i}`, e.mds)
+      expect({ i, exists: existsSync(file) }).toEqual({ i, exists: false })
+    }
+    // hold 的基线（t-a）只有一条通知；之后启动的任务的基线各自第一次看到变化时也各有一条。
+    expect((await notices(e.home)).filter((n) => n.task === 't-a')).toEqual([
+      { task: 't-a', files: ['mdsDirectory.db'] },
+    ])
+    for (const n of await notices(e.home)) expect(n.files).toEqual(['mdsDirectory.db'])
+    const a = JSON.parse(readFileSync(mdsBaselinePath(e.home, 't-a'), 'utf8'))
+    expect(a.resets).toEqual({ 'mdsDirectory.db': 3 })
+  })
+
+  test('内容与已知良好哈希相同的重建：不重置、不通知；缺失也不算变化', async () => {
+    const e = await env()
+    const file = join(e.mds, 'mdsDirectory.db')
+    await recordMdsBaseline(e.home, 't-a', e.mds, { hold: true })
+    await writeFile(file, 'tampered')
+    await recordMdsBaseline(e.home, 't-b', e.mds)
+    expect(existsSync(file)).toBe(false)
+    // 缺失期间启动的任务：不算变化。
+    await recordMdsBaseline(e.home, 't-c', e.mds)
+    // macOS 以原内容重建。
+    await writeFile(file, 'DIRECTORY-v1')
     await recordMdsBaseline(e.home, 't-d', e.mds)
-    expect(existsSync(join(e.mds, 'planted.db'))).toBe(false)
-    expect((await notices(e.home)).length).toBeGreaterThanOrEqual(2)
+    expect(readFileSync(file, 'utf8')).toBe('DIRECTORY-v1')
+    for (const t of ['t-b', 't-c', 't-d'])
+      expect((await verifyMdsBaseline(e.home, t))?.reset).toEqual([])
+    expect(await notices(e.home)).toEqual([{ task: 't-a', files: ['mdsDirectory.db'] }])
+  })
+
+  test('启动时扫描（force + keep）保持一致：内容不同的重建再次重置，只计数不重复通知', async () => {
+    const e = await env()
+    const file = join(e.mds, 'mdsObject.db')
+    await recordMdsBaseline(e.home, 't-a', e.mds, { hold: true })
+    await writeFile(file, 'tampered')
+    await sweepStaleMdsBaselines(e.home)
+    expect(existsSync(file)).toBe(false)
+    await writeFile(file, 'OBJECT-rebuilt-differently')
+    await sweepStaleMdsBaselines(e.home)
+    expect(existsSync(file)).toBe(false)
+    expect(await notices(e.home)).toEqual([{ task: 't-a', files: ['mdsObject.db'] }])
+    const a = JSON.parse(readFileSync(mdsBaselinePath(e.home, 't-a'), 'utf8'))
+    expect(a.resets).toEqual({ 'mdsObject.db': 2 })
+  })
+
+  test(`同一基线下同一文件重置超过 ${MDS_REPEAT_ESCALATE} 次：另发一条“反复重置”通知（只一次），并继续重置`, async () => {
+    const e = await env()
+    const file = join(e.mds, 'mdsObject.db')
+    await recordMdsBaseline(e.home, 't-a', e.mds, { hold: true })
+    for (let i = 1; i <= MDS_REPEAT_ESCALATE + 3; i++) {
+      await writeFile(file, `tampered-${i}`)
+      await recordMdsBaseline(e.home, `t-${i}`, e.mds)
+      expect(existsSync(file)).toBe(false)
+    }
+    const forA = (await notices(e.home)).filter((n) => n.task === 't-a')
+    expect(forA).toEqual([
+      { task: 't-a', files: ['mdsObject.db'] },
+      {
+        task: 't-a',
+        files: ['mdsObject.db'],
+        inbox: 'repeated',
+        repeats: { 'mdsObject.db': MDS_REPEAT_ESCALATE + 1 },
+      },
+    ])
   })
 })

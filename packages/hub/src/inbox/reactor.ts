@@ -249,8 +249,14 @@ export function createInboxReactor(o: InboxReactorOptions): InboxReactor {
     if (!task) return
     const p = e.payload
     if (p.kind === 'mds_reset') {
-      // 外层 seatbelt 下 harness 结束后 mds/ 被改动并已重置（worker-credential-isolation 4.5）：Digest 级通知，只列文件名。
-      if (ledger.getInboxItem(outOfBandItemId(e.seq))) return
+      // 外层 seatbelt 下 mds/ 被改动并已重置（worker-credential-isolation 4.5）：Digest 级通知，只列文件名。
+      // inbox=none 只是重复重置的计数（审查第三轮），只留在任务事件中，不写收件箱。
+      if (p.inbox === 'none' || ledger.getInboxItem(outOfBandItemId(e.seq))) return
+      const repeated = p.inbox === 'repeated'
+      // 文件名由 worker 控制：逐个 JSON 引号转义，不能伪造换行或格式。
+      const files = p.files.map(
+        (f) => `- ${JSON.stringify(f)}${p.repeats?.[f] ? `（${p.repeats[f]} 次）` : ''}`,
+      )
       write({
         type: 'inbox.item_created',
         task_id: task.id,
@@ -260,19 +266,27 @@ export function createInboxReactor(o: InboxReactorOptions): InboxReactor {
           level: resolveInboxLevel(config(), {
             source: 'isolation',
             workspace: task.workspace,
-            reason: p.kind,
+            reason: repeated ? 'mds_reset_repeated' : p.kind,
           }),
           source: 'isolation',
           source_ref: task.id,
           source_seq: e.seq,
-          reason: p.kind,
-          title: clipText(`[${task.workspace}] 重置了 macOS Security 缓存（mds）`, INBOX_TITLE_MAX),
+          reason: repeated ? 'mds_reset_repeated' : p.kind,
+          title: clipText(
+            repeated
+              ? `[${task.workspace}] macOS Security 缓存（mds）被反复重置`
+              : `[${task.workspace}] 重置了 macOS Security 缓存（mds）`,
+            INBOX_TITLE_MAX,
+          ),
           body: clipText(
             [
-              `任务 ${task.id} 的 harness 在外层 seatbelt 内运行期间，DARWIN_USER_CACHE_DIR/mds 下以下条目有变化或新增，节点已在校验时删除（macOS 会自动重建）：`,
-              // 文件名由 worker 控制：逐个 JSON 引号转义，不能伪造换行或格式。
-              ...p.files.map((f) => `- ${JSON.stringify(f)}`),
-              '沙箱外的进程同时合法更新这些文件也会触发重置，重建无害。',
+              repeated
+                ? `任务 ${task.id} 运行期间，DARWIN_USER_CACHE_DIR/mds 下以下条目反复出现与已知内容不同的版本，节点每次都已删除（仍在继续重置）：`
+                : `任务 ${task.id} 的 harness 在外层 seatbelt 内运行期间，DARWIN_USER_CACHE_DIR/mds 下以下条目有变化或新增，节点已在校验时删除（macOS 会自动重建）：`,
+              ...files,
+              repeated
+                ? '可能有进程（worker 或沙箱外的程序）在持续改写这些文件，请检查。'
+                : '沙箱外的进程同时合法更新这些文件也会触发重置，重建无害。同一文件之后的重复重置只计数，不再通知。',
             ].join('\n'),
             INBOX_BODY_MAX,
           ),

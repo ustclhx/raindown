@@ -252,4 +252,35 @@ describe('mds 重置（worker-credential-isolation 4.5）', () => {
     // 文件名列表不能为空。
     expect(renew({ out_of_band: [{ id: 'mds-x', kind: 'mds_reset', files: [] }] }).ok).toBe(false)
   })
+
+  test('审查第三轮：inbox=none 只写任务事件；inbox=repeated 写一条“反复重置”的 Digest 条目', async () => {
+    const { ledger, task, reactor, renew } = await setup()
+    must(
+      renew({
+        out_of_band: [
+          {
+            id: 'mds-count',
+            kind: 'mds_reset',
+            files: ['mdsObject.db'],
+            repeats: { 'mdsObject.db': 3 },
+            inbox: 'none',
+          },
+          {
+            id: 'mds-repeated',
+            kind: 'mds_reset',
+            files: ['mdsObject.db'],
+            repeats: { 'mdsObject.db': 6 },
+            inbox: 'repeated',
+          },
+        ],
+      }),
+    )
+    await reactor.idle()
+    expect(ledger.taskEvents(task.id).filter((e) => e.type === 'task.out_of_band')).toHaveLength(2)
+    const items = ledger.listInboxItems({ source: 'isolation' })
+    expect(items).toHaveLength(1)
+    expect(items[0]).toMatchObject({ level: 'digest', reason: 'mds_reset_repeated' })
+    expect(items[0]?.title).toContain('反复重置')
+    expect(items[0]?.body).toContain('"mdsObject.db"（6 次）')
+  })
 })

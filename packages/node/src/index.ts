@@ -181,6 +181,7 @@ export {
   hasPendingMdsNotices,
   MDS_BASELINE_FILE,
   MDS_MAX_HASH_BYTES,
+  MDS_REPEAT_ESCALATE,
   type MdsNotice,
   type MdsVerification,
   mdsBaselineHeld,

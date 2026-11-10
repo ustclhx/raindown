@@ -176,6 +176,8 @@ export interface StartNodeOptions {
    * 缺省不运行（测试不触碰真实的用户目录）；`raindown node start` 显式开启。
    */
   isolationProbe?: IsolationProbeNodeOptions
+  /** 待送达的 mds 重置通知的重试间隔；缺省 `MDS_NOTICE_RETRY_MS`（5 分钟）。 */
+  mdsNoticeRetryMs?: number
 }
 
 export interface IsolationProbeNodeOptions
@@ -1741,6 +1743,9 @@ class LeaseRunner {
   }
 }
 
+/** 待送达的 mds 重置通知的重试间隔（审查第三轮）。 */
+export const MDS_NOTICE_RETRY_MS = 5 * 60_000
+
 /** 正在进行的送达（按 raindown-home）：同一时间只有一轮，避免多个执行槽并发重复发送。 */
 const mdsDeliveries = new Map<string, Promise<void>>()
 
@@ -2142,6 +2147,16 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
     cancelJump = clock.setTimeout(check, JUMP_CHECK_MS)
   }
 
+  // 待送达的 mds 重置通知定期重试（审查第三轮）：节点空闲时中枢恢复后也能送达。
+  const mdsRetryMs = options.mdsNoticeRetryMs ?? MDS_NOTICE_RETRY_MS
+  let cancelMdsRetry = () => {}
+  const retryMdsNotices = () => {
+    if (stopper.signal.aborted) return
+    if (hasPendingMdsNotices(home)) void deliverPendingMdsNotices({ home, nodeId, client, logger })
+    cancelMdsRetry = clock.setTimeout(retryMdsNotices, mdsRetryMs)
+  }
+  cancelMdsRetry = clock.setTimeout(retryMdsNotices, mdsRetryMs)
+
   // 执行器的启动清理（例如移除审查任务残留的 worktree）在领取任务之前完成。
   const prepared = (async () => {
     for (const p of registry.list()) {
@@ -2173,6 +2188,7 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
         stopper.abort()
         for (const a of acquireAborts) a.abort()
         cancelJump()
+        cancelMdsRetry()
         cancelProbeTimers()
         // 等待进行中的探针结束（它会删除自己造的临时令牌与工作目录）。
         await probing

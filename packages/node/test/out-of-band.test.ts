@@ -175,3 +175,32 @@ test('中枢暂时不可达（审查第二轮）：执行照常结束，通知�
   expect(hasPendingMdsNotices(b.home)).toBe(true)
   expect(b.events(first).filter((event) => event.type === 'task.out_of_band')).toHaveLength(0)
 })
+
+test('审查第三轮：待送达的通知定期重试，节点空闲时中枢恢复后也能送达', async () => {
+  let down = true
+  const b = await bench({ mdsNoticeRetryMs: 60_000 }, 60, (url) => {
+    if (!url.includes('/isolation-notices') || !down) return undefined
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        error: { kind: 'retryable', code: 'hub_unavailable', message: '稍后重试' },
+      }),
+      { status: 503 },
+    )
+  })
+  current = b
+  const first = await b.create()
+  await b.until(first, (task) => task.status === 'done')
+  await queueMdsNotice(b.home, first, ['mdsDirectory.db'])
+  // 中枢恢复，之后不再有任务：只靠定期重试送达。
+  down = false
+  for (let i = 0; i < 5 && hasPendingMdsNotices(b.home); i++) {
+    await b.clock.advance(60_000)
+    await new Promise((r) => setTimeout(r, 20))
+  }
+  await waitFor(
+    () => b.events(first).some((event) => event.type === 'task.out_of_band'),
+    '定期重试送达',
+  )
+  expect(hasPendingMdsNotices(b.home)).toBe(false)
+})
