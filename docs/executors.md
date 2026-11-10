@@ -1374,6 +1374,9 @@ extends = ":workspace"            # read-only 角色为 ":read-only"
   （不存在时节点创建为 0700 目录）。否则（例如 `tmp` 被换成指向 `state/` 的链接）不生成 profile、不启动，错误码 `codex_profile_unsafe_read`。
 - 写入不另设白名单：由 Codex 沙箱决定（`:workspace` 只放行工作区与临时目录，`:read-only` 全部拒绝）；写类角色工作目录 `.git` 中会在沙箱外被执行或加载的
   hooks、config 等以 `"read"` 收回为只读（更具体的条目优先）。`.git/objects`、refs 等仍可写（commit 需要）。不存在的指针（例如 `commondir`）无法预先声明。
+  **已实测（2026-11-10，codex-cli 0.167.0）**：不加这些条目时 `:workspace` **允许**写 `.git/hooks` 与 `.git/config`（`git config core.fsmonitor …` 成功，
+  随后的 `git status` 执行了它）；加上 `"<repo>/.git/hooks"="read"`、`"<repo>/.git/config"="read"` 后，写 hooks、追加 config、`git config` 全部
+  `Operation not permitted`，`git status`、`add`、`commit`、`checkout -b` 正常。所以这两项条目是必需的，不是纵深防御。
 - 路径写成 TOML 基本字符串，严格转义反斜杠、引号与全部控制字符（换行、回车、NUL、DEL、C1 都写成 `\uXXXX`），不能改变内联表结构
   （`packages/core/test/isolation-codex-profile.test.ts` 的注入测试用 TOML 解析器还原比对）；不是绝对路径时返回 `codex_profile_invalid_path`。
 
@@ -1447,7 +1450,7 @@ Orca 端口已解析时 `connect.orca_port.*` 可连，探针不通过，`enforc
 - 预置信任的项目里，worker 在运行期间新建的 `.codex/config.toml` 由 codex-orca 每次派工前的检查拦截（`blockProjectConfig`）；随机 profile 名使其无法向本次 profile 追加条目；
 - 写类角色工作目录 `.git` 中不存在的指针（`commondir` 等）无法预先收回为只读；
 - **未验证（需要用真实 codex 验收）**：`codex exec` / Codex TUI 只传 `-c default_permissions=…` 时是否使用该 profile；`-c` 传入的内联 profile 能否被正确解析；
-  CODEX_HOME 整体拒绝、只放行 `tmp/` 时 `apply_patch` 等 arg0 别名是否正常；`:workspace` 下 `"read"` 能否把工作区内的 `.git/hooks`、`.git/config` 收回为只读。验收命令见下。
+  CODEX_HOME 整体拒绝、只放行 `tmp/` 时 `apply_patch` 等 arg0 别名是否正常。验收命令见下（`codex sandbox` 部分与 `.git` 收回只读已于 2026-11-10 在 codex-cli 0.167.0 上实测通过）。
 
 **验收命令（只用临时目录与临时 CODEX_HOME；`codex sandbox` 不调用模型，`codex exec` 与 TUI 会调用模型）。**
 
@@ -1466,7 +1469,7 @@ CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"'
 CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"' -- cat "$TOK"                  # 预期 FAKE-LEASE
 CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x > ok.txt'     # 预期成功
 CODEX_HOME=$CH codex sandbox -c "$RO" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x > ro.txt'     # 预期失败（read-only）
-# .git 收回为只读（审查第一轮 M3）：先看 :workspace 缺省是否保护 .git，再看 "read" 条目
+# .git 收回为只读（审查第一轮 M3；已实测：缺省可写，加 "read" 条目后拒绝写、git 日常操作正常）
 git -C "$R/work" init -q
 CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x > .git/hooks/post-checkout'   # 缺省行为，记录结果
 GW='permissions.raindown-verify={extends=":workspace",filesystem={"'$RH'"="deny","'$R/user-codex'"="deny","'$CH/tmp'"="read","'$TOK'"="read","'$R/work/.git/hooks'"="read","'$R/work/.git/config'"="read"},network={unix_sockets={}}}'
@@ -1664,6 +1667,10 @@ isolation: required   # required | preferred | off
 - **恢复**：沿用现有的重试机制，不另起轮询。节点恢复隔离（打开开关、探针转为通过并重新注册）后，用户或 supervisor
   对卡住的任务 `task_retry`，任务重新排队并按新的节点状态派送；仍不可满足时会再次卡住。没有任何具备该执行器能力的节点时，
   任务与以前一样留在队列等待（不卡住）。
+- **与 native 启动闸门的关系**（5.1）：`required` 的判定与 native 的启动闸门是两道独立、都 fail closed 的检查，互不绕过。
+  `required` 用 `credentialIsolationFor` / `probeRunPassed` 判断，按探针实际运行的施加层取必过项（native 为 `PROBE_NATIVE_REQUIRED_DENY_ITEMS`），
+  探针中 Orca 端口可达（网络打开的角色）同样算未隔离；判定通过后，执行器启动 native 的 Codex 前还要过闸门（同一 codex 可执行文件、角色网络设置与探针一致），
+  不通过时不启动 harness，以 `failed(isolation_not_applied)` 结束（`preferred` 与 `off` 的角色同样如此：native 已施加时不会降级为未隔离运行）。
 - **中枢与节点不一致时以节点为准**：中枢按节点注册上报的能力与探针结果判断；
   节点在领到租约后按本机的角色配置与最近一次探针再判断一次。中枢认为已隔离、节点认为未隔离时由节点卡住任务；
   反过来（例如中枢看到的探针已过期而节点刚跑完新的探针、尚未重新注册）中枢可能已把任务卡住，节点重新注册后重试即可。

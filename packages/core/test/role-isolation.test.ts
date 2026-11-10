@@ -10,7 +10,10 @@ import {
   roleIsolationTarget,
 } from '../src/isolation/requirement.ts'
 import type { IsolationProbeReport } from '../src/ledger/isolation-probe.ts'
-import { PROBE_REQUIRED_DENY_ITEMS } from '../src/ledger/isolation-probe.ts'
+import {
+  PROBE_NATIVE_REQUIRED_DENY_ITEMS,
+  PROBE_REQUIRED_DENY_ITEMS,
+} from '../src/ledger/isolation-probe.ts'
 import { loadRoles, roleIsolationOf, roleSchema } from '../src/roles.ts'
 import { doctorOptions } from './doctor-helpers.ts'
 import { tempHome, writeText } from './helpers.ts'
@@ -146,6 +149,48 @@ describe('assessIsolation', () => {
     expect(
       assess({ probe: report(true, new Date(NOW - 13 * 3600_000).toISOString()) }).missing[0],
     ).toContain('已过期')
+  })
+
+  test('native（5.1）：按 native 的必过项判定（seatbelt 专有项缺失不影响），读拒绝项失败则不算已隔离', () => {
+    const nativeReport = (leak: boolean): IsolationProbeReport => ({
+      ran_at: new Date(NOW - 60_000).toISOString(),
+      macos_version: '15.1',
+      runs: [
+        {
+          executor: 'codex-exec',
+          setting: 'read-only',
+          declared_layer: 'native',
+          applied_layer: 'native',
+          passed: !leak,
+          items: PROBE_NATIVE_REQUIRED_DENY_ITEMS.map((item) => ({
+            item,
+            expected: 'deny' as const,
+            actual: leak && item === 'read.hub_token' ? ('allow' as const) : ('deny' as const),
+            ok: !(leak && item === 'read.hub_token'),
+          })),
+        },
+      ],
+    })
+    const nativeCaps = {
+      credential_isolation: { layers: { 'read-only': 'native' }, enforced: true },
+    }
+    expect(
+      assess({ capabilities: nativeCaps, setting: 'read-only', probe: nativeReport(false) }),
+    ).toEqual({ view: { reported: true, layer: 'native', enforced: true }, missing: [] })
+    const leaky = assess({
+      capabilities: nativeCaps,
+      setting: 'read-only',
+      probe: nativeReport(true),
+    })
+    expect(leaky.view.enforced).toBe(false)
+    expect(leaky.missing.join('；')).toContain('read.hub_token')
+    // 同样的条目若按 seatbelt 运行，缺 seatbelt 的必过项，不算已隔离。
+    const asSeatbelt = nativeReport(false)
+    const r = asSeatbelt.runs[0]
+    if (r) r.applied_layer = 'seatbelt'
+    expect(
+      assess({ capabilities: nativeCaps, setting: 'read-only', probe: asSeatbelt }).view.enforced,
+    ).toBe(false)
   })
 })
 

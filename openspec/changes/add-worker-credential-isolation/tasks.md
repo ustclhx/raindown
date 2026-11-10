@@ -84,7 +84,9 @@
     native 下全部卡住 `no_delegate`；关闭未隔离旧终端失败时 blocked 交给用户；docs 升级说明。
   - claude-sdk 的 bash 沙箱：原生 `denyRead` 只覆盖 Bash，仍声明为 `none`（1.1 结论），需要隔离的角色关闭 bash 沙箱改走 seatbelt。
   - **未验证**（交给真实验收，命令见 `docs/executors.md`「`native`」）：`codex exec` / TUI 只传 `-c default_permissions` 时是否使用该 profile、
-    `-c` 内联 profile 能否被正确解析、CODEX_HOME 整体拒绝只放行 `tmp/` 时 arg0 别名（`apply_patch`）是否正常。
+    CODEX_HOME 整体拒绝只放行 `tmp/` 时 arg0 别名（`apply_patch`）是否正常。
+  - 已实测（supervisor，2026-11-10，codex-cli 0.167.0）：`codex sandbox` 的 `-c` 内联 profile 与 `-c default_permissions` 生效（hub.token、auth.json 链接与源文件拒绝，
+    令牌可读，workspace 可写、read-only 不可写）；`:workspace` 缺省允许写 `.git/hooks`、`.git/config`，加 `"read"` 条目后拒绝写，git 日常操作正常。
 - [ ] 5.2 （仅在用户同意独立用户方案后）实现 `separate_user` 施加层与安装/卸载命令。验证：安装命令的 dry-run 测试与真实验收
   - native 可靠，独立系统用户方案暂不需要，待用户决定。
 
