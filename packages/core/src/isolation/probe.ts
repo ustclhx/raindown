@@ -6,8 +6,8 @@ import {
   findProbeRun,
   type IsolationProbeReport,
   type IsolationProbeRun,
-  PROBE_REQUIRED_DENY_ITEMS,
   probeItemOk,
+  probeRequiredDenyItems,
   probeRunPassed,
 } from '../ledger/isolation-probe.ts'
 import { credentialIsolationFor } from './capability.ts'
@@ -117,7 +117,31 @@ export interface ProbePlanInput {
   gitCommondirFile?: string
   /** 共享的系统临时目录（`TMPDIR`）：拒绝（审查第一轮 M2，worker 改用按任务私有的临时目录）。 */
   sharedTmp?: string
+  /**
+   * 探针实际运行的施加层。`native`（Codex permissions profile，tasks 5.1）时：
+   * - 读拒绝项、`write.config`、`rename.protected_ancestor`、`write.shell_startup` 与 seatbelt 相同；
+   * - `write.own_profile` 跳过：profile 经命令行 `-c` 传入，没有可改写的配置文件；
+   * - `write.git_commondir`、`write.registered_git`、`write.shared_tmp` 跳过（见 `NATIVE_CODEX_WRITE_ITEMS`）；
+   *   `write.git_hooks`、新增的 `write.git_config` 预期拒绝，`write.git_objects` 按读写类别；新增 `read.codex_home_auth` 预期拒绝；
+   * - `connect.hub` 跳过：native 下 worker 经沙箱外的 Raindown MCP 访问中枢，沙箱内命令的网络按角色设置；
+   * - `write.workdir` 按读写类别（read-only 下工作目录不可写不算失败）。
+   */
+  layer?: string
+  /** native：探针工作目录 `.git/config`（以读写方式打开，预期拒绝：写类角色的 `.git/config` 在 profile 中收回为只读）。 */
+  gitConfigFile?: string
+  /** native：该执行器 CODEX_HOME 中的 `auth.json`（读取预期拒绝，Codex 进程本身不在沙箱内）。 */
+  codexHomeAuth?: string
 }
+
+/** native 下按 Codex 沙箱语义判定、不属于 Raindown 写白名单的写入项的跳过原因。 */
+export const PROBE_NATIVE_CODEX_WRITE_SKIP =
+  'native：能否写入由 Codex 沙箱语义决定（:workspace 放行工作区与临时目录，:read-only 全部拒绝），不属于 Raindown 的写白名单'
+/** native 下 `write.own_profile` 的跳过原因。 */
+export const PROBE_NATIVE_PROFILE_SKIP =
+  'native：permissions profile 每次启动经命令行 -c 传入，没有可改写的配置文件'
+/** native 下 `connect.hub` 的跳过原因。 */
+export const PROBE_NATIVE_HUB_SKIP =
+  'native：worker 经沙箱外的 Raindown MCP 访问中枢；沙箱内命令的网络按角色设置（缺省不联网）'
 
 const isWithinPath = (parent: string, child: string) =>
   child === parent || child.startsWith(parent.endsWith('/') ? parent : `${parent}/`)
@@ -318,7 +342,50 @@ export function buildProbePlan(input: ProbePlanInput): ProbePlan {
       target: `${input.hubUrl.replace(/\/+$/, '')}/v1/health`,
     },
   )
-  return { workdir: input.cwd, items, connect_timeout_ms: 3_000 }
+  if (input.layer === 'native') {
+    if (input.gitConfigFile)
+      items.push({
+        item: 'write.git_config',
+        kind: 'open_write',
+        expected: 'deny',
+        target: input.gitConfigFile,
+      })
+    if (input.codexHomeAuth)
+      items.push({
+        item: 'read.codex_home_auth',
+        kind: 'read',
+        expected: 'deny',
+        target: input.codexHomeAuth,
+      })
+  }
+  return {
+    workdir: input.cwd,
+    items: input.layer === 'native' ? items.map(nativeItem) : items,
+    connect_timeout_ms: 3_000,
+  }
+}
+
+/**
+ * native 下跳过的写入项：`write.git_commondir`（profile 只能把已存在的 git 指针收回为只读）、`write.registered_git`
+ * （native 的写类角色直接在登记仓库中工作，由 `write.git_hooks`、`write.git_config` 覆盖）、`write.shared_tmp`（`:workspace` 放行 TMPDIR）。
+ * `write.git_hooks` 与 `write.git_config` 预期拒绝：profile 把工作目录 `.git` 的 hooks、config 收回为只读（审查第一轮 M3）。
+ */
+const NATIVE_CODEX_WRITE_ITEMS: ReadonlySet<string> = new Set([
+  'write.git_commondir',
+  'write.registered_git',
+  'write.shared_tmp',
+])
+
+/** native 下改为跳过的项（见 `ProbePlanInput.layer`）：只保留项名、种类与预期，不尝试。 */
+function nativeItem(i: ProbePlanItem): ProbePlanItem {
+  const skip = NATIVE_CODEX_WRITE_ITEMS.has(i.item)
+    ? PROBE_NATIVE_CODEX_WRITE_SKIP
+    : i.item === 'write.own_profile'
+      ? PROBE_NATIVE_PROFILE_SKIP
+      : i.item === 'connect.hub'
+        ? PROBE_NATIVE_HUB_SKIP
+        : undefined
+  return skip === undefined ? i : { item: i.item, kind: i.kind, expected: i.expected, skip }
 }
 
 /** 探针运行前造的假令牌内容：明显为假，便于在输出中断言不出现。 */
@@ -352,9 +419,9 @@ export function probeRunSummary(run: IsolationProbeRun): {
         ),
       ...(run.error
         ? []
-        : PROBE_REQUIRED_DENY_ITEMS.filter(
-            (id) => !run.items.some((i) => i.item === id && i.expected === 'deny'),
-          ).map((id) => `${id}：缺少核心受保护项`)),
+        : probeRequiredDenyItems(run.applied_layer)
+            .filter((id) => !run.items.some((i) => i.item === id && i.expected === 'deny'))
+            .map((id) => `${id}：缺少核心受保护项`)),
     ],
     skipped: run.items
       .filter((i) => i.actual === 'skipped')
@@ -376,6 +443,8 @@ export interface IsolationStatusRow {
   ran_at: string | null
   macos_version: string | null
   run?: IsolationProbeRun
+  /** native 的联网组（PR #104 审查第二轮 M2）：只给联网角色看的探针结果。 */
+  network?: boolean
 }
 
 /** 列出节点每个执行器 × 沙箱设置的隔离状态；执行器未上报 `credential_isolation` 时给出一行 `setting: '—'`。 */
@@ -406,6 +475,27 @@ export function isolationStatusRows(
       continue
     }
     for (const setting of Object.keys(declared.layers).sort()) {
+      // 联网组（native）另起一行：联网与不联网的角色各看各的结果。
+      const netRun = findProbeRun(report, e.type, setting, true)
+      if (netRun && report) {
+        const view = credentialIsolationFor(
+          e.adapter_capabilities,
+          setting as never,
+          { run: netRun, ran_at: report.ran_at },
+          now,
+        )
+        rows.push({
+          executor: e.type,
+          setting,
+          declared_layer: declared.layers[setting] ?? 'none',
+          enforced: view.enforced,
+          probe: probeRunPassed(netRun) ? 'passed' : 'failed',
+          ran_at: report.ran_at,
+          macos_version: report.macos_version,
+          run: netRun,
+          network: true,
+        })
+      }
       const run = findProbeRun(report, e.type, setting)
       const view = credentialIsolationFor(
         e.adapter_capabilities,
@@ -439,7 +529,7 @@ export function isolationStatusRows(
 export function describeIsolationStatus(row: IsolationStatusRow, indent = '    '): string[] {
   if (row.setting === '—') return [`${row.executor}：未上报凭证隔离能力（按 none 处理，未探测）`]
   const applied = row.enforced ? '已施加' : '未施加'
-  const head = `${row.executor} × ${row.setting}：声明 ${row.declared_layer}，${applied}`
+  const head = `${row.executor} × ${row.setting}${row.network ? '（联网角色）' : ''}：声明 ${row.declared_layer}，${applied}`
   switch (row.probe) {
     case 'not_applicable':
       return [`${head}；施加层为 none，不探测`]

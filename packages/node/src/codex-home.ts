@@ -194,7 +194,8 @@ async function ensureRunDirs(dir: string, runRoot: string): Promise<void> {
 
 /**
  * codex-orca 与 codex-exec 的凭证隔离声明（D1）：harness 沙箱关闭（danger-full-access / bypass）时由外层 seatbelt 施加，
- * 开启（workspace-write / read-only）时由 Codex permissions profile 施加。本阶段只声明，尚未施加。
+ * 开启（workspace-write / read-only）时由 Codex permissions profile 施加（`codex-native.ts`）。开关 `isolation.enforce` 关闭时只声明、
+ * `enforced: false`；打开时由 `effectiveCredentialIsolation` 标为已施加（是否生效以探针为准）。
  */
 export const CODEX_CREDENTIAL_ISOLATION: CredentialIsolation = {
   layers: { 'danger-full-access': 'seatbelt', 'workspace-write': 'native', 'read-only': 'native' },

@@ -15,6 +15,7 @@ import {
   renderSeatbeltProfile,
   roleSandboxSetting,
 } from '@raindown/core'
+import type { NativeProbeGate } from './isolation-gate.ts'
 import { writeSeatbeltProfile } from './lease-token.ts'
 import { recordMdsBaseline } from './mds.ts'
 
@@ -31,8 +32,11 @@ import { recordMdsBaseline } from './mds.ts'
 
 export const SANDBOX_EXEC = '/usr/bin/sandbox-exec'
 
-/** 本阶段已实现的施加层：只有外层 seatbelt。`native`（Codex permissions profile）留给 tasks 5.1。 */
-export const IMPLEMENTED_ISOLATION_LAYERS: readonly IsolationLayer[] = ['seatbelt']
+/**
+ * 已实现的施加层：外层 seatbelt（tasks 4.1–4.4）与 `native`（Codex permissions profile，tasks 5.1，见 `codex-native.ts`）。
+ * `separate_user` 未实现（tasks 5.2）。
+ */
+export const IMPLEMENTED_ISOLATION_LAYERS: readonly IsolationLayer[] = ['seatbelt', 'native']
 
 export interface SeatbeltOptions {
   /** `config/node.yaml` 的 `isolation.enforce`；缺省 false。 */
@@ -64,6 +68,11 @@ export interface SeatbeltOptions {
    * 缺省（解析失败）不放行，doctor 提示。
    */
   darwinUserCacheDir?: string
+  /**
+   * native 施加层的启动闸门（PR #104 审查第一轮 H1）：native 启动前要求最近一次探针以 native 运行且通过、使用同一个 codex 可执行文件。
+   * 缺省没有闸门，native 一律不启动（fail closed）。`raindown node start` 创建并与探针共享。
+   */
+  nativeGate?: NativeProbeGate
 }
 
 /** 开关是否在本机生效：打开且运行在 macOS 上。 */
@@ -72,7 +81,7 @@ export const seatbeltActive = (o?: SeatbeltOptions): o is SeatbeltOptions =>
 
 /**
  * 适配器上报的凭证隔离声明。开关未生效时原样返回（只声明、`enforced: false`）；
- * 生效时只保留已实现的施加层，其余（`native` 等）改为 `none` 并标记 `enforced: true`：未实现的施加层不能显示为已施加。
+ * 生效时只保留已实现的施加层（seatbelt、native），其余（`separate_user` 等）改为 `none` 并标记 `enforced: true`：未实现的施加层不能显示为已施加。
  */
 export function effectiveCredentialIsolation(
   declared: CredentialIsolation,

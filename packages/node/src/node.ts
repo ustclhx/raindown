@@ -61,11 +61,13 @@ import {
   type ExecutorRegistry,
   type ExecutorRun,
   type InjectResult,
+  type IsolationExpectation,
   isIdleSignal,
   isResumedSignal,
   type StuckVerdict,
 } from './executor.ts'
 import { createFakeExecutor } from './fake.ts'
+import type { IsolationProbeGate } from './isolation-gate.ts'
 import {
   cleanProbeLeftovers,
   defaultMacosVersion,
@@ -205,6 +207,11 @@ export interface IsolationProbeNodeOptions
   versionCheckMs?: number
   /** 替换探针实现（测试用）。 */
   run?: (o: IsolationProbeOptions) => Promise<IsolationProbeReport>
+  /**
+   * native 施加层的启动闸门（PR #104 审查第一轮 H1）：每次探针结束（含失败）后传入报告；闸门发现 codex 可执行文件变化时
+   * 请节点重新运行探针。
+   */
+  gate?: IsolationProbeGate
 }
 
 export const ISOLATION_PROBE_INTERVAL_MS = 6 * 60 * 60_000
@@ -288,6 +295,8 @@ interface Env {
    * 给出时不启动 harness，直接以 `blocked(other)` 结束。领到租约时按本地角色配置、能力声明与最近一次探针计算。
    */
   isolationBlock?: string
+  /** required 判定所依据的隔离（交给执行器核对，PR #104 审查第二轮 M1）。 */
+  isolationExpected?: IsolationExpectation
   timeoutGraceMs: number
   deliverTimeoutMs: number
   deliverGiveUpMs: number
@@ -1092,6 +1101,7 @@ class LeaseRunner {
   /**
    * 这次卡住的代回复字段（D15）：
    * - supervisor 的批准刚被拒收：`no_delegate: true`，不带 decision_id；
+   * - 执行器标注批准即脱离隔离（hint 的 `isolation_escape`，native 施加层）：`no_delegate: true`；
    * - 授权卡住且执行器在 hint 中给出 `decision_id`，并且它确实来自本租约的预检：带上 decision_id 与
    *   节点记录的请求文本（工具、命令来自节点发出的预检，不取执行器的说法）；
    * - 其他：不带。
@@ -1105,6 +1115,10 @@ class LeaseRunner {
       this.noDelegateNext = false
       return { no_delegate: true }
     }
+    // 批准即脱离隔离的授权（native，design D5）：supervisor 不得代批，只能转给用户。
+    // native 下执行器声明本次运行的卡住都不委托（无法识别的授权界面也可能被归为 question / other）。
+    if (hint?.isolation_escape === true || this.run?.noDelegate?.() === true)
+      return { no_delegate: true }
     if (reason !== 'awaiting_approval') return {}
     const id = hint?.decision_id
     if (typeof id !== 'number' || !Number.isInteger(id)) return {}
@@ -1448,6 +1462,7 @@ class LeaseRunner {
             }),
           },
           signal: this.abort.signal,
+          ...(env.isolationExpected ? { isolationExpected: env.isolationExpected } : {}),
           ...(grant.resume ? { resume: grant.resume } : {}),
           ...(grant.recovery ? { recovery: grant.recovery } : {}),
           ...(grant.inputs?.length ? { inputs: grant.inputs } : {}),
@@ -1583,7 +1598,7 @@ class LeaseRunner {
       // 以 blocked 结束（崩溃、执行器自己判定卡住）时同样附带改动摘要；刚拒收过批准时不委托。
       const diff = await this.diffStat()
       if (this.released) return
-      const noDelegate = this.noDelegateNext
+      const noDelegate = this.noDelegateNext || this.run?.noDelegate?.() === true
       this.noDelegateNext = false
       if (diff || noDelegate) {
         req = {
@@ -1979,7 +1994,11 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
    */
   const roleContext = async (
     contract: TaskContract,
-  ): Promise<{ resolver: NoProgressResolver | undefined; isolationBlock?: string }> => {
+  ): Promise<{
+    resolver: NoProgressResolver | undefined
+    isolationBlock?: string
+    isolationExpected?: IsolationExpectation
+  }> => {
     const loaded = await (options.loadRole ?? defaultLoadRole)(contract.role)
     // 读不到角色时无法确认隔离要求：按 required 不满足处理，不启动 harness（审查第一轮 L1，fail closed）。
     if (!loaded.ok || !loaded.data) {
@@ -2006,12 +2025,21 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
     const assessed = assessIsolation({
       capabilities: info?.adapter_capabilities ?? {},
       setting: target.setting,
+      network: target.network,
       probe: latestProbe ?? null,
       executor: contract.executor,
       now: clock.now(),
       platform: options.platform ?? process.platform,
     })
-    if (assessed.view.enforced) return { resolver }
+    if (assessed.view.enforced && target.setting !== undefined)
+      return {
+        resolver,
+        isolationExpected: {
+          setting: target.setting,
+          layer: assessed.view.layer,
+          network: target.network,
+        },
+      }
     return {
       resolver,
       isolationBlock: isolationUnavailableMessage(target, contract.executor, [
@@ -2021,7 +2049,7 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
   }
 
   const startRunner = async (grant: LeaseGrant, kind: LeaseSlotKind) => {
-    const { resolver, isolationBlock } = await roleContext(grant.contract)
+    const { resolver, isolationBlock, isolationExpected } = await roleContext(grant.contract)
     // 读取角色期间节点被停止：不再启动，租约到期后由中枢按合同处理（与 stop 的语义一致）。
     if (stopper.signal.aborted) return
     const runner = new LeaseRunner(
@@ -2029,6 +2057,7 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
         ...env,
         roleNoProgressMinutes: resolver,
         ...(isolationBlock === undefined ? {} : { isolationBlock }),
+        ...(isolationExpected === undefined ? {} : { isolationExpected }),
       },
       grant,
     )
@@ -2085,7 +2114,7 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
     if (!probeOptions) return Promise.resolve()
     probing ??= (async () => {
       try {
-        const { run, intervalMs: _i, versionCheckMs: _v, ...rest } = probeOptions
+        const { run, intervalMs: _i, versionCheckMs: _v, gate: _g, ...rest } = probeOptions
         latestProbe = await (run ?? runIsolationProbe)({
           ...rest,
           home,
@@ -2112,6 +2141,7 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
         logger.warn(`隔离自检（${why}）失败`, String(err))
       } finally {
         probing = undefined
+        if (latestProbe) probeOptions.gate?.update(latestProbe)
       }
     })()
     return probing
@@ -2124,6 +2154,11 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
     if (!r.ok) logger.warn('上报隔离自检结果失败', r.error.code)
   }
   if (probeOptions) {
+    // codex 可执行文件变化（例如升级）后 native 启动被闸门拒绝：尽快重新自检并上报。
+    if (probeOptions.gate)
+      probeOptions.gate.onStale = () => {
+        if (!stopper.signal.aborted) void runProbe('codex 可执行文件变化').then(reportProbe)
+      }
     const intervalMs = probeOptions.intervalMs ?? ISOLATION_PROBE_INTERVAL_MS
     const versionCheckMs = probeOptions.versionCheckMs ?? ISOLATION_PROBE_VERSION_CHECK_MS
     const macosVersion = probeOptions.macosVersion ?? defaultMacosVersion

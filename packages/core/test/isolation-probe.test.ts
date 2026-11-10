@@ -464,4 +464,60 @@ describe('审查第一轮：开关与 Orca 端口的 doctor 提示', () => {
     expect(c?.message).toContain('connect.orca_port')
     expect(c?.hint).toContain('Orca 本机端口未解析')
   })
+
+  test('native（tasks 5.1）：Codex 版本过低时提示升级；native 探针不通过时提示检查 Codex', async () => {
+    const native = (r: IsolationProbeRun): NodeView => {
+      const v = nodeView(probe(r), true)
+      v.executors[0] = {
+        type: 'codex-exec',
+        adapter_capabilities: {
+          ...NO_ADAPTER_CAPABILITIES,
+          credential_isolation: { layers: { 'read-only': 'native' }, enforced: true },
+        },
+      }
+      return v
+    }
+    const base: IsolationProbeRun = {
+      executor: 'codex-exec',
+      setting: 'read-only',
+      declared_layer: 'native',
+      applied_layer: 'native',
+      passed: false,
+      items: [],
+    }
+    const checksFor = async (nodes: NodeView[]) =>
+      isolationProbeChecks(async () => ok({ nodes }), Date.parse('2026-11-09T02:00:00.000Z'))
+    const old = await checksFor([
+      native({
+        ...base,
+        error: {
+          code: 'native_codex_unsupported',
+          message: 'Codex 版本 0.144.4 过低；native 施加层需要 codex-cli 0.167.0 及以上',
+        },
+      }),
+    ])
+    const c = old.find((x) => x.id === 'isolation.n-1.codex-exec.read-only')
+    expect(c).toMatchObject({ ok: false, severity: 'warning' })
+    expect(c?.message).toContain('无法运行：native_codex_unsupported')
+    expect(c?.hint).toContain('Codex 版本过低')
+    const leaky = await checksFor([
+      native({ ...run({ failing: true }), ...base, items: run({ failing: true }).items }),
+    ])
+    expect(leaky.find((x) => x.id === 'isolation.n-1.codex-exec.read-only')?.hint).toContain(
+      '已施加 native',
+    )
+    // 审查第一轮 M3：角色打开网络，Orca 端口可达：按未施加处理并说明原因。
+    const net = await checksFor([
+      native({
+        ...base,
+        items: [
+          ...run().items,
+          { item: 'connect.orca_port.6000', expected: 'deny', actual: 'allow', ok: false },
+        ],
+      }),
+    ])
+    const n = net.find((x) => x.id === 'isolation.n-1.codex-exec.read-only')
+    expect(n?.message).toContain('未施加')
+    expect(n?.hint).toContain('network_access')
+  })
 })

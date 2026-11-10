@@ -33,7 +33,10 @@
 节点为每次派工生成 `IsolationSpec{deny_read[], deny_write[], allow_read[], allow_write[], allow_unix_sockets[], allow_local_ports[]}`。写入是白名单（4.6，见 D2）：`allow_write`（子树）、`allow_write_literals`（单个文件）与 `allow_write_regex` 就是全部可写位置，`write_carve_outs*` 在其中再挖掉登记仓库的 git 目录与 harness 配置，`allow_write_git` 再放行本任务独立 clone 的 `.git`；`deny_*` 受保护项与 `deny_write_except`（持久化位置）最后写入，白名单不能重新放开它们。路径一律规范化为 realpath，这是正确性前提而不只是整洁：seatbelt 按真实路径匹配，未规范化的规则（例如 `/var/…` 而真实路径是 `/private/var/…`）会静默不生效。规范化在生成配置时做，不存在的路径按其最近的已存在祖先规范化后拼回。适配器把它落到三种施加层之一：
 - **外层 seatbelt**：用于 harness 自带 OS 沙箱关闭的情况（danger-full-access、bypass）。节点生成 SBPL 配置，用 `sandbox-exec -f` 启动 harness。配置以 `allow default` 为基础（读、网络、进程等不改变），紧接着 `(deny file-write*)` 把写入改为白名单（4.6），显式 deny 受保护资源。
 - **harness 原生的读限制**：用于 harness 自带沙箱开启、无法嵌套的情况。1.1 实测结论：
-  - Codex 支持：Raindown 在其管理的 CODEX_HOME 中生成 permissions profile，受保护路径写 `"deny"`，启动时不传 `-s`，改传 `-c default_permissions=<name>`。声明为 `native`。
+  - Codex 支持：Raindown 生成 permissions profile，受保护路径写 `"deny"`，启动时不传 `-s`，改传 `-c default_permissions=<name>`。声明为 `native`。
+    5.1 实现：profile 由同一个 `IsolationSpec` 生成（raindown-home 整体拒绝，派工令牌写 `"read"`；Codex 进程不在沙箱内，额外拒绝该执行器的 CODEX_HOME 与 `auth.json` 源文件），
+    **每次启动经 `-c` 以 TOML 内联表传入**，不写进共享 CODEX_HOME 的 `config.toml`（多个任务共享同一 CODEX_HOME，按任务的条目写文件会竞态）；profile 名带随机后缀，
+    防止被同名表合并追加条目。探针以 `codex sandbox -P` 运行同源 profile；授权请求按 D5 标注并交给用户。见 `docs/executors.md`「`native`」。
   - Claude Code 不支持可靠的原生读限制（`denyRead` 只覆盖 Bash）。claude-sdk 开启 bash 沙箱时声明为 `none`；需要隔离的角色应关闭 bash 沙箱，改由外层 seatbelt 施加。
 - **独立系统用户**：最稳妥的退路，与 harness 沙箱完全正交。worker 以专用用户运行，受保护资源仍由主用户持有（0700）。代价有三：需要用户批准系统级改动（新建用户、sudoers 规则）；harness 凭证需要为该用户单独登录或经 Raindown 注入；worktree 需要共享组权限。只在前两层都不可行时启用，并且需要用户在实施时明确同意。
 - 适配器能力 `credential_isolation` 取值为 `seatbelt | native | separate_user | none`，按角色的沙箱设置分别声明。中枢按能力派送。按 1.1 的结论：
@@ -124,6 +127,8 @@ seatbelt 的规则后者优先，允许项写得最窄（具体文件，而不�
 - `isolation` 默认 `preferred`。任务 1.1 的实测通过后，升级说明建议把 dev 类角色改为 `required`。之后的版本在 doctor 通过时把写类角色的默认值改为 `required`。
 - `required` 不满足时，任务以 `blocked(other)` 并带原因 `isolation_unavailable` 停下，不启动 harness。
 - 施加层为 `native` 的 `required` 角色：越出 harness 沙箱的授权请求会让该命令脱离隔离。这类请求在收件箱与 supervisor 代回复输入中标注“批准将脱离隔离”，supervisor 不得代批，只能转给用户。
+  5.1 实现：native 下 codex-orca 的授权弹窗不做策略预检、不自动放行，卡住说明标注“【批准即解除本次命令的隔离】”，节点以 `no_delegate` 上报（不论角色的 `isolation` 取值）；
+  策略层对 `escapesIsolation` 的请求同样直接交给用户。codex-exec 没有交互审批通道，native 下固定 `approval_policy="never"`。
 
 ### D6. 自检探针
 探针与 worker 走同一个施加层，运行节点自带的检查程序，逐项尝试：
@@ -162,6 +167,9 @@ seatbelt 的规则后者优先，允许项写得最窄（具体文件，而不�
   - **会话记录与本任务的 Codex 配置**：独立 CODEX_HOME（整体可写）与按任务的 Claude 配置目录中的会话记录可被改写（提示注入，不是命令执行）；独立 CODEX_HOME 中的 `config.toml`、`.env` 等也可被改写，但该目录只被本任务沙箱内的 Codex 读取，影响限于本任务且仍在沙箱内。
   - **mds**：`<DARWIN_USER_CACHE_DIR>/mds/` 与沙箱外所有使用 Security 框架的进程共用。经符号链接、目录、FIFO 让沙箱外进程写到 `mds/` 之外的途径由 `(deny file-write-create … (require-not (vnode-type REGULAR-FILE)))` 关闭（PR #101 审查第一轮）；残留的是 worker 在 harness 运行期间改写其中普通文件的内容（例如篡改数据库），沙箱外进程会读到，影响未完全排除。节点在每次启动 harness 前与全部已有基线比较、结束后按基线校验，有变化即重置并通知；codex-orca 终端在阻塞期间继续运行时基线保留到终端结束，期间其他任务启动前的比较同样覆盖它。沙箱外进程同时合法更新也会触发重置，重置也可能删除其他同时运行的任务或沙箱外进程正在写入的文件，macOS 会重建它们。基线只保存已知良好的哈希、重置后不刷新（审查第三轮：内容无法区分 macOS 重建与 worker 重写；与已知良好哈希相同或缺失算正常，内容不同就再次重置），篡改的内容因此不会被保留；节点级的已知良好快照 `state/mds-known-good.json`（审查第四轮）在每次记录新基线、节点启动时先比较并重置，覆盖没有基线的时间段，新基线复制它的哈希；harness 的任何退出路径都结束其进程组（codex-exec、claude-sdk；codex-orca 的终端由 Orca 关闭），但调用 `setsid` 的子进程仍可离开进程组、在 harness 结束后继续运行并改写 mds，这类改动由已知良好快照在下一次记录基线或节点启动时发现并重置（残余窗口为两次检查之间）；通知按（任务，文件名）每个基线只发一条，重复重置只计数，同一文件超过 5 次时另发一条“反复重置”的 Digest；终端已不存在的 hold 基线在节点启动或下次启动新终端时做最后一次校验并删除。
   - **Codex 项目配置**：预置信任后，Codex 会加载 clone 内的 `.codex/config.toml`。`notify`、`model_provider` 用命令行固定，`.codex/` 出现即停下，但 `model_providers` 表、`mcp_servers` 等覆盖不了的项，在出现到下一次检查之间可能生效；它们只在外层 seatbelt 内生效（审查第二轮 L2）。
+  - **native 下被跟踪的 hooks 目录**（PR #104 审查第二轮）：写类 native 角色直接在登记仓库（或 Orca worktree）中工作，profile 只把 `.git/hooks`、`.git/config` 等收回为只读；
+    `core.hooksPath` 指向被跟踪目录（例如 husky 的 `.husky/`）时，hook 在可写的工作目录中，worker 可以改写，之后在沙箱外运行 git 时被执行。
+    需要隔离的写类角色优先用外层 seatbelt（独立 clone）；或在角色说明中禁止改写 hooks 目录并在审查时检查。
   - **手动运行 git**：用户在任务 clone 中手动运行 git 时，git 会跟随 worker 预埋在 `.git` 中的符号链接写入（例如 `COMMIT_EDITMSG`、已有的 reflog）。
   → 写入文档；4.5 验收后按实际情况决定是否进一步收紧。
 - [写白名单误伤 harness 或工具链]

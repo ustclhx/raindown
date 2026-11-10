@@ -1,0 +1,8 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`Codex permissions profile（native） read-only：受保护路径与 raindown-home 整体 deny，派工令牌与 CODEX_HOME/tmp 为 read；结构快照 1`] = `
+[
+  "permissions.raindown-abc={extends=":read-only",filesystem={"/Users/u/.codex/auth.json"="deny","/Users/u/.config/sops/age"="deny","/Users/u/Library/Application Support/orca"="deny","/Users/u/Library/LaunchAgents"="deny","/Users/u/raindown-home"="deny","/Users/u/raindown-home/run/executors/codex-exec/codex-read-home/tmp"="read","/Users/u/raindown-home/run/tasks/t-1/dispatch-tokens/l-1.token"="read"},network={unix_sockets={"/Users/u/Library/Application Support/orca"="deny"}}}",
+  "default_permissions="raindown-abc"",
+]
+`;

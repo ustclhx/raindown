@@ -16,6 +16,8 @@ import {
   renderRecoveryPrompt,
   renderTaskInputs,
   renderWorkerTaskPrompt,
+  roleCodexNetwork,
+  roleSandboxSetting,
   type TaskContract,
   type TaskCost,
   type TaskResult,
@@ -35,6 +37,12 @@ import {
   SEALED_CODEX_HOME,
   sealedCodexHome,
 } from './codex-home.ts'
+import {
+  NATIVE_DROPPED_CONFIG_KEYS,
+  nativeApplies,
+  nativeFailureMessage,
+  prepareCodexNative,
+} from './codex-native.ts'
 import { questionMessage } from './codex-orca/classify.ts'
 import { resolveContext } from './codex-orca/spec.ts'
 import { executorRoleEnv } from './env.ts'
@@ -42,6 +50,7 @@ import {
   ActivityQueue,
   type ExecutorOutcome,
   type ExecutorPlugin,
+  isolationMismatch,
   resumedSignal,
 } from './executor.ts'
 import { killProcessGroup } from './process-group.ts'
@@ -108,6 +117,8 @@ export interface CodexExecOptions {
    * 打开后，角色 `permissions.sandbox` 为 danger-full-access 时子进程经 `sandbox-exec -f <配置> codex …` 启动。
    */
   isolation?: SeatbeltOptions
+  /** native 的 permissions profile 名（测试固定）；缺省每次启动随机（`codexNativeProfileName`）。 */
+  nativeProfileName?: string
 }
 
 const safe = (text: string, max = 16_000) => clipText(redactSecrets(text), max)
@@ -345,7 +356,10 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
         const readRole = effectiveRoleKind(role.data) === 'read'
         // 外层 seatbelt（4.3）：开关打开且角色沙箱为 danger-full-access 时施加；失败时不启动 Codex。
         // 施加时使用独立的 CODEX_HOME（审查第一轮 H3），写类角色在本任务的独立 clone 中运行（第一步方案）。
-        const applies = seatbeltApplies(credentialIsolation, role.data, options.isolation)
+        // 沙箱设置一律按本执行器推算（与 required 判定的 roleIsolationTarget 同一函数，PR #104 审查第二轮 M1）：
+        // 角色的 executor 可能不是 codex-exec（例如 claude-sdk 角色被合同派给 codex-exec）。
+        const execRole = { ...role.data, executor: 'codex-exec' as const }
+        const applies = seatbeltApplies(credentialIsolation, execRole, options.isolation)
         const dir = applies
           ? sealedCodexHome(options.home, ctx.taskId)
           : readRole
@@ -370,6 +384,55 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
         if (finished) return
         let seatbelt: string[] = []
         let scratchEnv: Record<string, string> = {}
+        // native（tasks 5.1）：开关打开且角色沙箱为 workspace-write / read-only 时，以 Codex permissions profile 拒绝受保护路径；
+        // 失败时不启动 Codex。profile 每次启动经 -c 传入（不写共享 CODEX_HOME 的 config.toml），不再传 -s。
+        let native: string[] | undefined
+        let codexPath: string | undefined
+        const nativeSandbox = nativeApplies(credentialIsolation, execRole, options.isolation)
+        const network = roleCodexNetwork(execRole)
+        // 纵深防御：节点 required 判定所依据的隔离与这里实际要施加的不一致时不启动。
+        const mismatch = isolationMismatch(ctx.isolationExpected, {
+          setting: roleSandboxSetting(execRole),
+          layer: applies ? 'seatbelt' : nativeSandbox ? 'native' : 'none',
+          network,
+        })
+        if (mismatch) {
+          finish(ok({ outcome: 'failed', result: result(mismatch, 'isolation_not_applied') }))
+          return
+        }
+        if (nativeSandbox && options.isolation) {
+          const prepared = await prepareCodexNative(options.isolation, {
+            home: options.home,
+            taskId: ctx.taskId,
+            executor: 'codex-exec',
+            codexHome: isolated.data,
+            authSource: source,
+            cwd,
+            access: readRole ? 'read' : 'write',
+            sandbox: nativeSandbox,
+            // 与 spawn 时的 PATH 一致；启动改用解析出的绝对路径（与隔离自检同一个文件，审查第一轮 H1）。
+            codexBin: command[0] ?? 'codex',
+            pathEnv: env.data.PATH ?? process.env.PATH,
+            ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
+            ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
+            ...(network ? { networkEnabled: true } : {}),
+            ...(options.nativeProfileName !== undefined
+              ? { profileName: options.nativeProfileName }
+              : {}),
+          })
+          if (finished) return
+          if (!prepared.ok) {
+            finish(
+              ok({
+                outcome: 'failed',
+                result: result(nativeFailureMessage(prepared.error.message), prepared.error.code),
+              }),
+            )
+            return
+          }
+          native = prepared.data.args
+          codexPath = prepared.data.codexPath
+        }
         if (applies && options.isolation) {
           scratchApplied = true
           const common = {
@@ -438,8 +501,11 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
         if (finished) return
         // exec 无 -a 选项、不走交互审批，无需默认覆盖 reviewer。
         const args = [...command.slice(1), 'exec', '--json']
-        for (const [key, value] of Object.entries(perms.data.config))
+        for (const [key, value] of Object.entries(perms.data.config)) {
+          // native：沙箱由 permissions profile 决定，不与 sandbox_mode 混用。
+          if (native && NATIVE_DROPPED_CONFIG_KEYS.includes(key)) continue
           args.push('-c', `${key}=${value}`)
+        }
         args.push(
           '-c',
           codexTaskMcpConfig({ home: options.home, role: role.data.name, taskId: ctx.taskId }),
@@ -447,8 +513,13 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
         for (const value of codexShellEnvPolicyConfig(perms.data.config)) args.push('-c', value)
         if (role.data.model) args.push('-m', role.data.model)
         if (role.data.effort) args.push('-c', `model_reasoning_effort=${role.data.effort}`)
+        if (native) {
+          // native：profile 与选中它的 default_permissions 代替 -s（exec 层的 -c 对 resume 同样生效）。
+          // codex exec 没有交互审批通道；固定 approval_policy=never（纵深防御），不会出现越出沙箱的授权请求（design D4/D5）。
+          args.push(...native, '-c', 'approval_policy="never"')
+        }
         // exec 层的 -s 对 resume 同样生效，且优先于 permissions.config 中的 sandbox_mode。
-        args.push('-s', perms.data.sandbox)
+        else args.push('-s', perms.data.sandbox)
         const start = async (resumeSession?: string) => {
           let prompt =
             resumeSession && ctx.resume
@@ -463,7 +534,7 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
           const processArgs = [...args]
           if (resumeSession) processArgs.push('resume', resumeSession)
           processArgs.push('--', prompt)
-          const argv = [...seatbelt, command[0] ?? 'codex', ...processArgs]
+          const argv = [...seatbelt, codexPath ?? command[0] ?? 'codex', ...processArgs]
           child = spawn(argv[0] as string, argv.slice(1), {
             cwd,
             env: childEnv,

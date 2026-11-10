@@ -5513,6 +5513,10 @@
                                     "type": "boolean",
                                     "description": "受保护项全部被拒绝、允许项全部可用（跳过与未验证不计入），且至少一个受保护项确实被拒绝"
                                   },
+                                  "network": {
+                                    "description": "native（Codex permissions profile）下是否以打开网络的 profile 运行（角色打开 sandbox_workspace_write.network_access）；缺省 false",
+                                    "type": "boolean"
+                                  },
                                   "items": {
                                     "maxItems": 64,
                                     "type": "array",

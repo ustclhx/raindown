@@ -61,6 +61,10 @@ export const isolationProbeRun = z
       description:
         '受保护项全部被拒绝、允许项全部可用（跳过与未验证不计入），且至少一个受保护项确实被拒绝',
     }),
+    network: z.boolean().optional().meta({
+      description:
+        'native（Codex permissions profile）下是否以打开网络的 profile 运行（角色打开 sandbox_workspace_write.network_access）；缺省 false',
+    }),
     items: z.array(isolationProbeItem).max(64),
     error: z
       .object({ code: z.string().max(64), message: z.string().max(1000) })
@@ -102,6 +106,26 @@ export const PROBE_REQUIRED_DENY_ITEMS = [
 ] as const
 
 /**
+ * `native` 施加层（Codex permissions profile，tasks 5.1）的核心受保护项：与 seatbelt 相同的读拒绝项、`config/` 不可写、
+ * 受保护路径的祖先不可改名，以及白名单之外的模拟 shell 启动文件不可写（Codex 沙箱只放行工作区与临时目录）。
+ * seatbelt 专有的项不适用：配置经命令行 `-c` 传入，没有可改写的配置文件（`write.own_profile`）；
+ * git 目录与共享临时目录的写入由 Codex 沙箱语义决定，不是 Raindown 的写白名单（`write.git_*`、`write.registered_git`、`write.shared_tmp`）。
+ */
+export const PROBE_NATIVE_REQUIRED_DENY_ITEMS = [
+  'read.hub_token',
+  'read.ledger_db',
+  'read.other_task_token',
+  'write.config',
+  'rename.protected_ancestor',
+  'write.shell_startup',
+] as const
+
+/** 某施加层的核心受保护项：native 用 `PROBE_NATIVE_REQUIRED_DENY_ITEMS`，其余（seatbelt、none 等）用 `PROBE_REQUIRED_DENY_ITEMS`。 */
+export function probeRequiredDenyItems(appliedLayer?: string): readonly string[] {
+  return appliedLayer === 'native' ? PROBE_NATIVE_REQUIRED_DENY_ITEMS : PROBE_REQUIRED_DENY_ITEMS
+}
+
+/**
  * 由预期与实际重新计算 `ok`，不信任上报值：deny / allow 时为 `actual === expected`；
  * skipped / unverified 为 null；error 为 false。
  */
@@ -113,12 +137,14 @@ export function probeItemOk(i: Pick<IsolationProbeItem, 'expected' | 'actual'>):
 
 /**
  * 按条目重新计算一次运行是否通过，**不信任上报的 `ok` 与 `passed`**：没有运行错误，没有（重新计算后）不符合预期的项，
- * 并且核心受保护项（`PROBE_REQUIRED_DENY_ITEMS`）全部出现且确实被拒绝（全部跳过或缺项不能算通过）。
+ * 并且核心受保护项（按实际施加层，`probeRequiredDenyItems`）全部出现且确实被拒绝（全部跳过或缺项不能算通过）。
  */
-export function probeRunPassed(run: Pick<IsolationProbeRun, 'items' | 'error'>): boolean {
+export function probeRunPassed(
+  run: Pick<IsolationProbeRun, 'items' | 'error'> & { applied_layer?: string },
+): boolean {
   if (run.error) return false
   if (run.items.some((i) => probeItemOk(i) === false)) return false
-  return PROBE_REQUIRED_DENY_ITEMS.every((id) =>
+  return probeRequiredDenyItems(run.applied_layer).every((id) =>
     run.items.some((i) => i.item === id && i.expected === 'deny' && i.actual === 'deny'),
   )
 }
@@ -132,7 +158,11 @@ export function normalizeProbeReport(report: IsolationProbeReport): IsolationPro
       return {
         ...run,
         items,
-        passed: probeRunPassed({ items, ...(run.error ? { error: run.error } : {}) }),
+        passed: probeRunPassed({
+          items,
+          applied_layer: run.applied_layer,
+          ...(run.error ? { error: run.error } : {}),
+        }),
       }
     }),
   }
@@ -146,6 +176,10 @@ export function findProbeRun(
   report: IsolationProbeReport | null | undefined,
   executor: string,
   setting: string,
+  /** 只找以（不）联网 profile 运行的结果（native 按网络分别探针，PR #104 审查第二轮 M2）；缺省 false。 */
+  network = false,
 ): IsolationProbeRun | undefined {
-  return report?.runs.find((r) => r.executor === executor && r.setting === setting)
+  return report?.runs.find(
+    (r) => r.executor === executor && r.setting === setting && (r.network === true) === network,
+  )
 }

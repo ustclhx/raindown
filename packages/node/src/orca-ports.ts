@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process'
 import type { Dirent } from 'node:fs'
 import { readdir } from 'node:fs/promises'
 import { join } from 'node:path'
-import { ORCA_RUNTIME_DIR } from '@raindown/core'
+import { ORCA_RUNTIME_DIR, type ProbeTargets } from '@raindown/core'
 
 /**
  * Orca 本机 TCP 端口的只读解析（add-worker-credential-isolation D2，审查第一轮 M2）。不连接 Orca、不运行 orca 命令、
@@ -101,4 +101,24 @@ export async function resolveOrcaPorts(
       '没有找到 Orca 进程监听的本机 TCP 端口（Orca 未运行、套接字中的 pid 不是 Orca app 或 lsof 没有结果）',
     )
   return [...ports].sort((a, b) => a - b)
+}
+
+/** 列出 Orca 运行时目录（及 `daemon/`）中的 unix 套接字；只看目录项类型，不读文件、不连接。 */
+export async function findOrcaSockets(userHome: string): Promise<ProbeTargets> {
+  const root = join(userHome, ORCA_RUNTIME_DIR)
+  const found: string[] = []
+  for (const dir of [root, join(root, 'daemon')]) {
+    let entries: Dirent[]
+    try {
+      entries = await readdir(dir, { withFileTypes: true })
+    } catch (err) {
+      if (dir === root && (err as NodeJS.ErrnoException).code === 'ENOENT')
+        return { status: 'none', reason: 'Orca 运行时目录不存在' }
+      continue
+    }
+    for (const e of entries) if (e.isSocket()) found.push(join(dir, e.name))
+  }
+  return found.length
+    ? { status: 'found', paths: found.sort() }
+    : { status: 'none', reason: 'Orca 运行时目录中没有 unix 套接字' }
 }

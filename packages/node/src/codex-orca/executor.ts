@@ -17,6 +17,8 @@ import {
   redactSecrets,
   renderRecoveryPrompt,
   renderTaskInputs,
+  roleCodexNetwork,
+  roleSandboxSetting,
   SUPERVISOR_ACTOR,
   type TaskContract,
   type TaskResult,
@@ -35,6 +37,12 @@ import {
   sameCodexHome,
   sealedCodexHome,
 } from '../codex-home.ts'
+import {
+  NATIVE_DROPPED_CONFIG_KEYS,
+  nativeApplies,
+  nativeFailureMessage,
+  prepareCodexNative,
+} from '../codex-native.ts'
 import { CHILD_ENV_DENYLIST, dualRaindownEnv, executorRoleEnv } from '../env.ts'
 import {
   ActivityQueue,
@@ -45,6 +53,7 @@ import {
   type ExecutorRun,
   type InjectResult,
   idleSignal,
+  isolationMismatch,
   resumedSignal,
 } from '../executor.ts'
 import {
@@ -164,6 +173,8 @@ export interface CodexOrcaOptions {
    * 打开后，角色沙箱设置为 danger-full-access / bypass 时以 `sandbox-exec -f <配置>` 只包住 `codex` 本身。
    */
   isolation?: SeatbeltOptions
+  /** native 的 permissions profile 名（测试固定）；缺省每次启动随机（`codexNativeProfileName`）。 */
+  nativeProfileName?: string
 }
 
 /** 合同 `inputs` 中 codex-orca 使用的字段。 */
@@ -223,10 +234,10 @@ const stateSchema = z.object({
   pty_id: z.string().optional(),
   incarnation_id: z.string().optional(),
   /**
-   * 终端启动时施加的外层隔离（tasks 4.2）。缺失表示启动时没有施加（升级前或开关关闭时启动的终端）：
-   * 开关打开时这类终端不重新挂接，按无法恢复处理。
+   * 终端启动时施加的隔离（外层 seatbelt，tasks 4.2；Codex permissions profile，tasks 5.1）。缺失表示启动时没有施加
+   * （升级前或开关关闭时启动的终端）：开关打开时，施加层与本次要求不同的终端不重新挂接，按无法恢复处理。
    */
-  isolation_layer: z.literal('seatbelt').optional(),
+  isolation_layer: z.enum(['seatbelt', 'native']).optional(),
   /**
    * 施加外层 seatbelt 的写类任务的工作目录布局（审查第一轮，第一步方案）：`sealed` 时 `worktree_path` 是本任务的独立 clone
    * （`run/tasks/<任务>/repo`），Orca worktree（`host_worktree`）只作终端宿主。缺失表示旧布局（Orca worktree 即工作目录）。
@@ -285,6 +296,11 @@ export function buildCodexCommand(input: {
    * 信任弹窗的确认无法保存；改为 `-c projects={"<目录>"={trust_level="trusted"}}`。缺省时命令不变。
    */
   trustProject?: string
+  /**
+   * native（tasks 5.1）：Codex permissions profile 的 `-c` 参数（`prepareCodexNative` 的结果）。给出时不再传 `-s`，
+   * 角色 `config.sandbox_mode` 也不再传（官方要求 default_permissions 不与 sandbox_mode 混用）。缺省时命令不变。
+   */
+  native?: readonly string[]
 }): Result<string> {
   if (input.codexBin.includes('=')) {
     return fail('usage', 'invalid_codex_bin', 'codexBin 不能包含 =，避免被 env 当作环境变量赋值')
@@ -299,16 +315,22 @@ export function buildCodexCommand(input: {
   const argv = [input.codexBin]
   if (input.role.model) argv.push('-m', input.role.model)
   if (input.role.effort) argv.push('-c', `model_reasoning_effort=${input.role.effort}`)
-  for (const [k, v] of Object.entries(p.config ?? {})) argv.push('-c', `${k}=${String(v)}`)
-  if (p.approval === 'never' && p.sandbox === 'danger-full-access') {
+  for (const [k, v] of Object.entries(p.config ?? {})) {
+    if (input.native && NATIVE_DROPPED_CONFIG_KEYS.includes(k)) continue
+    // native：授权一律交给用户（审查第一轮 M4），忽略角色的 approvals_reviewer（例如 auto_review 会代批越出沙箱的请求）。
+    if (input.native && k === 'approvals_reviewer') continue
+    argv.push('-c', `${k}=${String(v)}`)
+  }
+  if (p.approval === 'never' && p.sandbox === 'danger-full-access' && !input.native) {
     argv.push('--dangerously-bypass-approvals-and-sandbox')
   } else {
     // 避免用户级 auto_review 吞掉授权弹窗；角色显式配置 reviewer 时以角色为准。
-    if (p.approval !== 'never' && p.config?.approvals_reviewer === undefined) {
+    if (input.native || (p.approval !== 'never' && p.config?.approvals_reviewer === undefined)) {
       argv.push('-c', 'approvals_reviewer=user')
     }
     if (p.approval) argv.push('-a', p.approval)
-    if (p.sandbox) argv.push('-s', p.sandbox)
+    if (input.native) argv.push(...input.native)
+    else if (p.sandbox) argv.push('-s', p.sandbox)
   }
   if (input.trustProject !== undefined) {
     const trust = codexTrustConfig(input.trustProject)
@@ -562,6 +584,11 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
       let launchedHere = false
       /** 终端里出现过忙碌标记：之后不再自动确认信任提示。 */
       let seenBusy = false
+      /**
+       * 当前终端以 native（Codex permissions profile）启动：Codex 的授权请求都是越出沙箱的请求，批准即让该命令脱离隔离，
+       * 预检不自动放行、卡住带 `isolation_escape` 标注（design D4/D5）。
+       */
+      let escapeOnApproval = false
       /** 已报告停下（idle 信号已发出），等待回复或自行恢复。 */
       let reported = false
       let reportedKind: TailAnalysis['kind'] | undefined
@@ -1382,6 +1409,8 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
       ): Record<string, unknown> => ({
         kind: a.kind,
         message: a.message,
+        // native：授权卡住标注“批准即解除本次命令的隔离”，节点以 no_delegate 上报（supervisor 不代批，design D5）。
+        ...(escapeOnApproval ? { isolation_escape: true } : {}),
         tail: redactLines(tail).slice(-STUCK_TAIL),
         ...(approvalRound && approvalFingerprint(a) === approvalRound.fingerprint
           ? {
@@ -1404,6 +1433,22 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
         const precheck = ctx.precheck
         if (!precheck) return 'user'
         const p = approvalForPrecheck(tail)
+        if (escapeOnApproval) {
+          // native：Codex 的授权弹窗是请求在沙箱之外执行，批准即让这条命令脱离隔离（design D4/D5）。
+          // 策略不得自动放行（supervisor 档位也不行）：带 escapesIsolation 交给策略层（不送中枢判定，直接 user）；
+          // 即使返回放行也不发回车。停下时标注并以 no_delegate 上报。
+          const v = await precheck({
+            tool: CODEX_ORCA_PRECHECK_TOOL,
+            ...(p ? { command: p.command } : {}),
+            escapesIsolation: true,
+          })
+          status(
+            needsUserText(
+              v.allow ? { escapes_isolation: true } : { ...v, escapes_isolation: true },
+            ),
+          )
+          return 'user'
+        }
         if (!p) {
           status('授权请求中提取不到可核对的命令，交给用户审批')
           return 'user'
@@ -1638,11 +1683,25 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
         const scope = codexOrcaInputs.parse(contract.inputs ?? {}).scope
 
         // 外层 seatbelt（4.2）：开关打开且角色沙箱设置为 danger-full-access / bypass 时施加。
-        const isolation = seatbeltApplies(credentialIsolation, role, options.isolation)
+        // 沙箱设置一律按本执行器推算（与 required 判定的 roleIsolationTarget 同一函数，PR #104 审查第二轮 M1）。
+        const orcaRole = { ...role, executor: 'codex-orca' as const }
+        const isolation = seatbeltApplies(credentialIsolation, orcaRole, options.isolation)
           ? options.isolation
           : undefined
         // 写类角色在本任务的独立 clone 中运行，Orca worktree 只作终端宿主（审查第一轮，第一步方案 (b)）。
         const sealedRole = isolation !== undefined && effectiveRoleKind(role) !== 'read'
+        // native（tasks 5.1）：开关打开且角色沙箱设置为 workspace-write / read-only 时，以 Codex permissions profile 施加。
+        const nativeSandbox = nativeApplies(credentialIsolation, orcaRole, options.isolation)
+        const network = roleCodexNetwork(orcaRole)
+        /** 本次要求的施加层：重新挂接的终端必须以同一施加层启动。 */
+        const requiredLayer = isolation ? 'seatbelt' : nativeSandbox ? 'native' : undefined
+        // 纵深防御：节点 required 判定所依据的隔离与这里实际要施加的不一致时不启动。
+        const mismatch = isolationMismatch(ctx.isolationExpected, {
+          setting: roleSandboxSetting(orcaRole),
+          layer: requiredLayer ?? 'none',
+          network,
+        })
+        if (mismatch) return failed('isolation_not_applied', mismatch)
 
         state = await readState()
         if (state && state.repo !== repo) state = undefined
@@ -1766,12 +1825,14 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
         if (finished || stopping) return
 
         // 施加外层 seatbelt 时使用独立的 CODEX_HOME（审查第一轮 H3）。
+        const codexAuthSource =
+          options.codexAuthSource ??
+          actorEnv.data.CODEX_HOME ??
+          process.env.CODEX_HOME ??
+          join(homedir(), '.codex')
         const isolated = await prepareCodexHome(
           isolation ? sealedCodexHome(options.home, ctx.taskId) : orcaCodexHome(options.home),
-          options.codexAuthSource ??
-            actorEnv.data.CODEX_HOME ??
-            process.env.CODEX_HOME ??
-            join(homedir(), '.codex'),
+          codexAuthSource,
         )
         if (!isolated.ok) return failed(isolated.error.code, isolated.error.message)
         if (finished || stopping) return
@@ -1803,9 +1864,9 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
               delete st.incarnation_id
               await saveState()
               status('派工绑定已变化，保留工作目录并重启 Codex')
-            } else if (isolation && st.isolation_layer !== 'seatbelt') {
-              // 存活进程无法事后施加隔离：启动时没有施加外层 seatbelt 的终端（升级前、开关打开前启动）不重新挂接，
-              // 顺手关闭它（审查第一轮 L1）；派工绑定已变化的旧终端走上面的分支，关闭后以隔离方式重启。
+            } else if (requiredLayer && st.isolation_layer !== requiredLayer) {
+              // 存活进程无法事后施加隔离：启动时没有施加本次要求的施加层的终端（升级前、开关打开前启动，或以另一施加层启动）
+              // 不重新挂接，顺手关闭它（审查第一轮 L1）；派工绑定已变化的旧终端走上面的分支，关闭后以隔离方式重启。
               const closed = await orca.terminalClose({ handle: st.handle })
               const old = st.handle
               if (closed.ok) {
@@ -1814,10 +1875,23 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
                 delete st.incarnation_id
                 await saveState()
               }
-              return failed(
-                'isolation_not_applied',
-                `已有 Codex 终端 ${old} 启动时没有施加外层 seatbelt（升级前或 isolation.enforce 打开前启动），不能重新挂接；${closed.ok ? '已关闭该终端，重试即以隔离方式重启' : '关闭失败，请先手动关闭旧终端后重试'}`,
+              const what = `已有 Codex 终端 ${old} 启动时没有施加${requiredLayer === 'native' ? ' Codex 原生隔离（native）' : '外层 seatbelt'}（升级前或 isolation.enforce 打开前启动），不能重新挂接`
+              if (closed.ok)
+                return failed(
+                  'isolation_not_applied',
+                  `${what}；已关闭该终端，重试即以隔离方式重启`,
+                )
+              // 关闭失败：未隔离的终端可能仍在运行，不能以 failed 结束后任其运行（审查第一轮）。交给用户（blocked），
+              // 记录中保留 handle，下次启动（用户回复或重试）时再次尝试关闭。
+              logger?.warn(`关闭未隔离的旧终端 ${old} 失败`, closed.error.message)
+              finish(
+                ok({
+                  outcome: 'blocked',
+                  reason: 'other',
+                  message: `${what}，且关闭失败（${closed.error.message}）：该终端可能仍在未隔离地运行，请在 Orca 中手动关闭后回复；下次运行会再次尝试关闭`,
+                }),
               )
+              return
             } else {
               if (isolation && st.isolation_layer === 'seatbelt') {
                 // 重新挂接仍在外层 seatbelt 内运行的终端：先与全部已有基线比较并重置，基线 hold 到终端结束（4.5，审查第一轮）。
@@ -1833,6 +1907,7 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
               }
               handle = st.handle
               prevTail = tail
+              escapeOnApproval = st.isolation_layer === 'native'
               status(`接着使用已有的终端 ${handle}`)
               await deliverResumeReply()
               await deliverRecoveryPrompt()
@@ -1883,8 +1958,36 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
             seatbelt = prepared.data.prefix
             scratchEnv = scratch
           }
+          let native: string[] | undefined
+          let nativeCodex: string | undefined
+          if (nativeSandbox && options.isolation) {
+            const prepared = await prepareCodexNative(options.isolation, {
+              home: options.home,
+              taskId: ctx.taskId,
+              executor: 'codex-orca',
+              codexHome: isolated.data,
+              authSource: codexAuthSource,
+              cwd: st.worktree_path,
+              access: effectiveRoleKind(role) === 'read' ? 'read' : 'write',
+              sandbox: nativeSandbox,
+              // 终端命令改用节点解析出的绝对路径（与隔离自检同一个文件，审查第一轮 H1）；按 worker 环境的 PATH 查找。
+              codexBin,
+              pathEnv: actorEnv.data.PATH ?? process.env.PATH,
+              ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
+              ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
+              ...(network ? { networkEnabled: true } : {}),
+              ...(options.nativeProfileName !== undefined
+                ? { profileName: options.nativeProfileName }
+                : {}),
+            })
+            if (finished || stopping) return
+            if (!prepared.ok)
+              return failed(prepared.error.code, nativeFailureMessage(prepared.error.message))
+            native = prepared.data.args
+            nativeCodex = prepared.data.codexPath
+          }
           const cmd = buildCodexCommand({
-            codexBin,
+            codexBin: nativeCodex ?? codexBin,
             codexHome: isolated.data,
             worktreePath: st.worktree_path,
             specPath,
@@ -1900,6 +2003,7 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
             // 施加时：按任务私有的临时与缓存目录（M2），并预置工作目录的项目信任，不出现信任弹窗（M6）。
             ...(scratchEnv ? { extraEnv: scratchEnv } : {}),
             ...(seatbelt ? { trustProject: st.worktree_path } : {}),
+            ...(native ? { native } : {}),
           })
           if (!cmd.ok) return failed(cmd.error.code, cmd.error.message)
           const title = `[Raindown] ${ctx.taskId}`
@@ -1926,7 +2030,9 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
             st.isolation_layer = 'seatbelt'
             // 终端在本次执行结束后可能继续运行（阻塞等待回复）：mds 基线保留到终端结束（4.5，审查第一轮）。
             await setMdsBaselineHold(options.home, ctx.taskId, true).catch(() => {})
-          } else delete st.isolation_layer
+          } else if (native) st.isolation_layer = 'native'
+          else delete st.isolation_layer
+          escapeOnApproval = native !== undefined
           if (ctx.leaseTokenFile) st.lease_token_file = ctx.leaseTokenFile
           else delete st.lease_token_file
           if (term.data.ptyId) st.pty_id = term.data.ptyId
@@ -1955,6 +2061,8 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
         cancel: () => stop('codex-orca 已取消：终端已关闭，worktree 保留'),
         deliver,
         inject,
+        // native：本次终端的卡住一律不委托 supervisor（审查第一轮，保守）。
+        noDelegate: () => escapeOnApproval,
         bindBlocked(binding) {
           if (approvalRound?.request_id === binding.request_id) {
             approvalRound.blockSeq = binding.seq

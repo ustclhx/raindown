@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   buildProbePlan,
+  codexNativeConfigValues,
   computeIsolationSpec,
   type Env,
   type ExecutorInfo,
@@ -15,26 +16,41 @@ import {
   type IsolationProbeRun,
   type IsolationSpec,
   isolationProbeItem,
-  ORCA_RUNTIME_DIR,
+  loadRoles,
   PROBE_FAKE_TOKEN_CONTENT,
   PROBE_FILE_PREFIX,
   type ProbeTargets,
   probeItemOk,
   probeRunPassed,
+  type Result,
+  type Role,
   raindownPaths,
   resolveAgeKeyFile,
+  roleCodexNetwork,
+  roleSandboxSetting,
   runTasksDir,
   taskIsolationProfile,
   taskRunDir,
 } from '@raindown/core'
 import { z } from 'zod'
+import { prepareCodexHome } from '../codex-home.ts'
+import {
+  CODEX_NATIVE_MIN_VERSION,
+  checkCodexNativeSupport,
+  codexNativeProfileFromSpec,
+} from '../codex-native.ts'
+import { executorEnv } from '../env.ts'
+import { type IsolationProbeGate, resolveExecutable } from '../isolation-gate.ts'
 import {
   removeLeaseTokenFile,
   removeSeatbeltProfile,
   writeFileNoFollow,
   writeLeaseTokenFile,
 } from '../lease-token.ts'
+import { findOrcaSockets } from '../orca-ports.ts'
 import { hubPortOf, type SeatbeltOptions, writeSeatbeltLaunch } from '../seatbelt.ts'
+
+export { findOrcaSockets }
 
 /**
  * 节点侧的隔离自检探针（add-worker-credential-isolation D6，tasks 3.1）：
@@ -58,6 +74,11 @@ export interface ProbeTarget {
   declared_layer: string
   /** 探针实际运行所用的施加层：适配器声明已施加时等于声明层，否则为 none。 */
   applied_layer: string
+  /**
+   * native 的联网组（PR #104 审查第二轮 M2）：该执行器 × workspace-write 下有打开网络的角色时，另以打开网络的 profile 探测一次，
+   * 结果带 `network: true`；联网与不联网的角色各看各的结果。
+   */
+  network?: boolean
 }
 
 /** 启动包装的上下文：探针临时任务与它的隔离清单（与 worker 同一个 `computeIsolationSpec` 结果）。 */
@@ -65,6 +86,14 @@ export interface ProbeLaunch {
   home: string
   taskId: string
   spec: IsolationSpec
+  /** 探针工作目录与读写类别（native 下写类角色把工作目录 `.git` 的 hooks、config 收回为只读，与 worker 一致）。 */
+  cwd?: string
+  access?: 'read' | 'write'
+  /**
+   * native：探针自己的临时 CODEX_HOME（与执行器的结构一致：`config.toml`、`tmp/`、链接到同一来源的 `auth.json`）。
+   * 探针不改动执行器真实的 CODEX_HOME（其中的 auth.json 链接正被运行中的 worker 使用，审查第二轮）。
+   */
+  codexHome?: string
 }
 
 /** 启动包装：接收探针子进程的 argv，返回实际执行的 argv（施加 seatbelt 时加上 sandbox-exec）。缺省为恒等。 */
@@ -90,6 +119,149 @@ export function seatbeltProbeLaunchWrapper(
   }
 }
 
+/** native 目标的探针工作目录的缺省父目录：不在 $TMPDIR、/tmp 下（`:workspace` 会放行它们）。 */
+export const NATIVE_PROBE_TMP = '/var/tmp'
+
+/** native 探针启动包装的选项。 */
+export interface NativeProbeOptions {
+  /** Codex 可执行文件；缺省 `codex`，按 `pathEnv` 解析为绝对路径（与 worker 启动相同）。测试用假脚本，**不运行真实 codex**。 */
+  codexBin?: string
+  /** 查找 codex 的 PATH；缺省为节点进程的 PATH（worker 的 PATH 来自节点环境）。 */
+  pathEnv?: string
+  /** `auth.json` 链接的源目录（与 worker 相同）；缺省为节点环境的 `CODEX_HOME`，再缺省为 `~/.codex`。只用于链接与拒绝项，不读取。 */
+  codexAuthSource?: string
+  /** 用户主目录（列出 Orca 套接字）；缺省 `os.homedir()`。 */
+  userHome?: string
+  /** profile 名（测试固定）；缺省每次随机。 */
+  profileName?: string
+  /** 启动闸门：记录本次探针使用的 codex（身份）与网络设置，worker 启动时据此核对（审查第一轮 H1）。 */
+  gate?: IsolationProbeGate
+}
+
+/** 该执行器 × 沙箱设置 × 联网组下的角色（按本执行器推算设置，与 worker 启动、required 判定同一函数）。 */
+async function nativeRoles(home: string, target: Pick<ProbeTarget, 'executor' | 'setting'>) {
+  const loaded = await loadRoles(home)
+  return loaded.ok
+    ? loaded.data.roles.filter((r) => {
+        const asTarget = { ...r, executor: target.executor as Role['executor'] }
+        return r.executor === target.executor && roleSandboxSetting(asTarget) === target.setting
+      })
+    : []
+}
+
+/**
+ * 该执行器 × 沙箱设置 × 联网组下角色的 `sandbox_workspace_write.*` 配置（与 worker 启动相同地以 `-c` 传入）。
+ * 联网组以打开网络的 profile 运行：Orca 端口已解析时本机 TCP 可达，探针因此不通过，联网角色按未施加处理（审查第一轮 M3）；
+ * 不联网的角色不受影响（审查第二轮 M2）。
+ */
+async function nativeRoleSettings(
+  home: string,
+  target: Pick<ProbeTarget, 'executor' | 'setting' | 'network'>,
+): Promise<{ network: boolean; config: string[] }> {
+  const network = target.network === true
+  const roles = (await nativeRoles(home, target)).filter(
+    (r) => roleCodexNetwork({ ...r, executor: target.executor as Role['executor'] }) === network,
+  )
+  const config = new Map<string, string>()
+  for (const r of roles) {
+    const c = (r.permissions?.config ?? {}) as Record<string, unknown>
+    for (const [k, v] of Object.entries(c))
+      if (
+        k.startsWith('sandbox_workspace_write.') &&
+        ['string', 'number', 'boolean'].includes(typeof v)
+      )
+        config.set(k, `${k}=${String(v)}`)
+  }
+  return { network, config: [...config.values()].sort() }
+}
+
+/**
+ * 开关打开时 native 目标的启动包装（tasks 5.1，审查第一轮 H1、M3）：与 worker 启动一致——
+ * 1. 按 PATH 把 codex 解析为绝对路径，`<codex> --version`（不调用模型；按路径 + mtime 等身份缓存）低于 0.167.0 时失败；
+ * 2. CODEX_HOME 是探针自己的临时目录，结构与执行器的一致（`prepareCodexHome`：config.toml、链接到同一来源的 auth.json；`tmp/`），
+ *    不改动执行器真实的 CODEX_HOME；profile 由 `codexNativeProfileFromSpec` 从同一份隔离清单生成，
+ *    带上该联网组的网络设置与角色的 `sandbox_workspace_write.*` 配置；
+ * 3. 以 `env CODEX_HOME=<…> <codex 绝对路径> sandbox [-c 角色配置…] -c permissions.<名>=<内联表> -c default_permissions="<名>" -- <探针程序>`
+ *    启动（与 worker 相同用 default_permissions 选中 profile，不用 -P）；
+ * 4. 把所用 codex 的身份与网络设置记入闸门。其他施加层恒等。
+ */
+export function nativeProbeLaunchWrapper(n: NativeProbeOptions = {}): ProbeLaunchWrapper {
+  const versions = new Map<string, Promise<Result<string>>>()
+  return async (target, argv, launch) => {
+    if (target.applied_layer !== 'native') return [...argv]
+    if (target.setting !== 'workspace-write' && target.setting !== 'read-only')
+      throw new ProbeError(
+        'native_setting_unsupported',
+        `native 只支持 workspace-write 与 read-only，不支持 ${target.setting}`,
+      )
+    const codexBin = n.codexBin ?? 'codex'
+    // 与 worker 相同的 PATH：worker 环境是节点的 executorEnv()（执行器只追加 RAINDOWN_* 变量）。
+    const codex = resolveExecutable(codexBin, n.pathEnv ?? executorEnv().PATH)
+    if (!codex)
+      throw new ProbeError(
+        'native_codex_unsupported',
+        `找不到 codex 可执行文件 ${codexBin}（按节点的 PATH 查找）；native 施加层需要 codex-cli ${CODEX_NATIVE_MIN_VERSION} 及以上`,
+      )
+    const authSource = n.codexAuthSource ?? process.env.CODEX_HOME ?? join(homedir(), '.codex')
+    // 探针自己的临时 CODEX_HOME（结构与执行器的一致），不改动执行器真实的 CODEX_HOME（审查第二轮）。
+    const probeHome = launch.codexHome ?? join(taskRunDir(launch.home, launch.taskId), 'codex-home')
+    const prepared = await prepareCodexHome(probeHome, authSource)
+    if (!prepared.ok) throw new ProbeError(prepared.error.code, prepared.error.message)
+    const codexHome = prepared.data
+    const env = {
+      ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
+      ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
+      CODEX_HOME: codexHome,
+    }
+    let checked = versions.get(codex.key)
+    if (!checked) {
+      checked = checkCodexNativeSupport(codex.path, env)
+      versions.set(codex.key, checked)
+    }
+    const version = await checked
+    if (!version.ok) throw new ProbeError(version.error.code, version.error.message)
+    const role = await nativeRoleSettings(launch.home, target)
+    const profile = await codexNativeProfileFromSpec({
+      spec: launch.spec,
+      sandbox: target.setting,
+      codexHome,
+      authSource,
+      codexPath: codex.path,
+      ...(launch.cwd !== undefined ? { cwd: launch.cwd } : {}),
+      ...(launch.access ? { access: launch.access } : {}),
+      userHome: n.userHome ?? homedir(),
+      ...(role.network ? { networkEnabled: true } : {}),
+      ...(n.profileName !== undefined ? { name: n.profileName } : {}),
+    })
+    if (!profile.ok) throw new ProbeError(profile.error.code, profile.error.message)
+    // 暂存：到节点把本轮报告交给闸门时才生效（审查第二轮）。
+    n.gate?.record(target.executor, target.setting, { codex: codex.key, network: role.network })
+    return [
+      '/usr/bin/env',
+      `CODEX_HOME=${codexHome}`,
+      codex.path,
+      'sandbox',
+      ...role.config.flatMap((c) => ['-c', c]),
+      ...codexNativeConfigValues(profile.data).flatMap((v) => ['-c', v]),
+      '--',
+      ...argv,
+    ]
+  }
+}
+
+/** 开关打开时的启动包装：seatbelt 目标走 `seatbeltProbeLaunchWrapper`，native 目标走 `nativeProbeLaunchWrapper`，其他恒等。 */
+export function isolationProbeLaunchWrapper(
+  o: Pick<SeatbeltOptions, 'sandboxExec'> = {},
+  n: NativeProbeOptions = {},
+): ProbeLaunchWrapper {
+  const seatbelt = seatbeltProbeLaunchWrapper(o)
+  const native = nativeProbeLaunchWrapper(n)
+  return (target, argv, launch) =>
+    target.applied_layer === 'native'
+      ? native(target, argv, launch)
+      : seatbelt(target, argv, launch)
+}
+
 export interface IsolationProbeOptions {
   home: string
   hubUrl: string
@@ -107,6 +279,8 @@ export interface IsolationProbeOptions {
   /** 本用户的 `DARWIN_USER_CACHE_DIR`（与 worker 的隔离清单一致：放行 mds，4.5）。探针不写其中任何文件。 */
   darwinUserCacheDir?: string
   launchWrapper?: ProbeLaunchWrapper
+  /** native 目标的探针工作目录的父目录；缺省 `/var/tmp`（不在 $TMPDIR、/tmp 下）。给出 `tmpDir` 时以 `tmpDir` 为准。 */
+  nativeTmpDir?: string
   /** 子进程的可执行文件（缺省为当前运行时，即 bun）。 */
   execPath?: string
   /** 单个探针子进程的超时。 */
@@ -193,26 +367,6 @@ function executorHomeFor(target: ProbeTarget): string | undefined {
     return target.setting === 'read-only' ? 'codex-read-home' : 'codex-home'
   if (target.executor === 'codex-orca') return 'codex-home'
   return undefined
-}
-
-/** 列出 Orca 运行时目录（及 `daemon/`）中的 unix 套接字；只看目录项类型，不读文件、不连接。 */
-export async function findOrcaSockets(userHome: string): Promise<ProbeTargets> {
-  const root = join(userHome, ORCA_RUNTIME_DIR)
-  const found: string[] = []
-  for (const dir of [root, join(root, 'daemon')]) {
-    let entries: import('node:fs').Dirent[]
-    try {
-      entries = await readdir(dir, { withFileTypes: true })
-    } catch (err) {
-      if (dir === root && (err as NodeJS.ErrnoException).code === 'ENOENT')
-        return { status: 'none', reason: 'Orca 运行时目录不存在' }
-      continue
-    }
-    for (const e of entries) if (e.isSocket()) found.push(join(dir, e.name))
-  }
-  return found.length
-    ? { status: 'found', paths: found.sort() }
-    : { status: 'none', reason: 'Orca 运行时目录中没有 unix 套接字' }
 }
 
 /** `sw_vers -productVersion`；非 macOS 或失败时为 null。 */
@@ -346,6 +500,7 @@ async function runOne(
     setting: target.setting,
     declared_layer: target.declared_layer,
     applied_layer: target.applied_layer,
+    ...(target.network ? { network: true } : {}),
   }
   const failed = (code: string, message: string): IsolationProbeRun => ({
     ...base,
@@ -358,15 +513,29 @@ async function runOne(
   const otherTask = `${PROBE_TASK_PREFIX}other-${hex}`
   let cwd: string | undefined
   let scratch: string | undefined
+  let nativeScratch: string | undefined
   const tokens: string[] = []
+  const native = target.applied_layer === 'native'
   try {
     // 规范化为真实路径：与隔离清单中的路径一致（seatbelt 按真实路径匹配）。
-    cwd = await realpath(await mkdtemp(join(o.tmpDir ?? tmpdir(), 'raindown-isolation-probe-')))
+    // native 的探针工作目录不放在 $TMPDIR 下（审查第一轮 M3）：`:workspace` 本来就放行 TMPDIR，那里可写证明不了工作目录可写。
+    const workRoot =
+      o.tmpDir ??
+      (target.applied_layer === 'native' ? (o.nativeTmpDir ?? NATIVE_PROBE_TMP) : tmpdir())
+    cwd = await realpath(await mkdtemp(join(workRoot, 'raindown-isolation-probe-')))
     // 写白名单探针（tasks 4.6）：模拟的用户主目录与登记仓库，位于写白名单之外。
     scratch = join(raindownPaths(o.home).run, `${PROBE_SCRATCH_PREFIX}${hex}`)
     await mkdir(join(scratch, 'home'), { recursive: true, mode: 0o700 })
     scratch = await realpath(scratch)
-    const shellStartupFile = join(scratch, 'home', '.zshenv')
+    // native（审查第二轮）：模拟 home 与改名目录放在 raindown-home 之外、工作目录的兄弟目录（同在 /var/tmp 下），
+    // 不被 raindown-home 的整体拒绝覆盖，测的是 `:workspace` 对工作区之外的真实写限制。
+    if (native) {
+      nativeScratch = await realpath(
+        await mkdtemp(join(workRoot, 'raindown-isolation-probe-scratch-')),
+      )
+      await mkdir(join(nativeScratch, 'home'), { mode: 0o700 })
+    }
+    const shellStartupFile = join(nativeScratch ?? scratch, 'home', '.zshenv')
     const repo = await buildProbeRepo(scratch, cwd)
     // 本任务令牌（允许项）与临时伪造的他人任务令牌（受保护项）：内容明显为假，结束后删除。
     const fake = PROBE_FAKE_TOKEN_CONTENT.trim()
@@ -376,7 +545,7 @@ async function runOne(
     tokens.push(otherToken)
     // 改名探针（审查第一轮 H1）：在本探针临时任务目录下自建 a/b/secret，把 secret 作为受保护项加入清单，
     // 子进程尝试改名 a（受保护路径的祖先目录）。只操作探针自建的临时目录树，绝不改名真实目录。
-    const renameRoot = join(taskRunDir(o.home, ownTask), RENAME_PROBE_DIR)
+    const renameRoot = join(nativeScratch ?? taskRunDir(o.home, ownTask), RENAME_PROBE_DIR)
     await mkdir(join(renameRoot, 'a', 'b'), { recursive: true, mode: 0o700 })
     await writeFileNoFollow(join(renameRoot, 'a', 'b', 'secret'), `${fake}\n`)
     const renameTarget = await realpath(join(renameRoot, 'a'))
@@ -407,6 +576,8 @@ async function runOne(
       deny_read: [...spec.data.deny_read, renameSecret],
       deny_write: [...spec.data.deny_write, renameSecret],
     }
+    // native：探针自己的临时 CODEX_HOME（启动包装按执行器的结构准备），不改动执行器真实的 CODEX_HOME。
+    const probeCodexHome = join(taskRunDir(o.home, ownTask), 'codex-home')
     const plan = buildProbePlan({
       spec: probeSpec,
       renameTarget,
@@ -424,16 +595,35 @@ async function runOne(
       shellStartupFile,
       ...repo.plan,
       sharedTmp: await realpath(tmpdir()),
+      layer: target.applied_layer,
+      gitConfigFile: join(cwd, '.git', 'config'),
+      ...(native ? { codexHomeAuth: join(probeCodexHome, 'auth.json') } : {}),
     })
     const wrap = o.launchWrapper ?? identityLaunchWrapper
     const argv = await wrap(target, [o.execPath ?? process.execPath, PROBE_CHILD_SCRIPT], {
       home: o.home,
       taskId: ownTask,
       spec: probeSpec,
+      cwd,
+      access: targetAccess(target),
+      ...(native ? { codexHome: probeCodexHome } : {}),
     })
     const items = await spawnProbe(argv, plan, o.timeoutMs ?? PROBE_TIMEOUT_MS, cwd)
-    return { ...base, items, passed: probeRunPassed({ items }) }
+    return {
+      ...base,
+      items,
+      passed: probeRunPassed({ items, applied_layer: target.applied_layer }),
+    }
   } catch (err) {
+    if (
+      err instanceof ProbeError &&
+      err.code === 'probe_failed' &&
+      target.applied_layer === 'native'
+    )
+      return failed(
+        err.code,
+        `${err.message}（codex sandbox 没有正常运行探针：Codex 可能不支持 permissions profile 或拒绝了生成的 profile，见 docs/executors.md「native」）`,
+      )
     if (err instanceof ProbeError) return failed(err.code, err.message)
     return failed(
       'probe_failed',
@@ -447,6 +637,7 @@ async function runOne(
       await rm(taskRunDir(o.home, task), { recursive: true, force: true }).catch(() => {})
     if (cwd) await rm(cwd, { recursive: true, force: true }).catch(() => {})
     if (scratch) await rm(scratch, { recursive: true, force: true }).catch(() => {})
+    if (nativeScratch) await rm(nativeScratch, { recursive: true, force: true }).catch(() => {})
   }
 }
 
@@ -501,8 +692,13 @@ function reuseRun(rep: IsolationProbeRun, target: ProbeTarget): IsolationProbeRu
     setting: target.setting,
     declared_layer: target.declared_layer,
     applied_layer: target.applied_layer,
+    ...(target.network ? { network: true } : {}),
     items,
-    passed: probeRunPassed({ items, ...(rep.error ? { error: rep.error } : {}) }),
+    passed: probeRunPassed({
+      items,
+      applied_layer: target.applied_layer,
+      ...(rep.error ? { error: rep.error } : {}),
+    }),
     ...(rep.error ? { error: rep.error } : {}),
   }
 }
@@ -512,19 +708,36 @@ function reuseRun(rep: IsolationProbeRun, target: ProbeTarget): IsolationProbeRu
  * 同一实际施加层（`applied_layer`）的目标只真正运行一次（受保护文件每轮每个施加层只打开一次），
  * 结果复用到同层的其他执行器 × 沙箱设置；不同施加层并行运行。
  */
+/**
+ * native 的联网组（PR #104 审查第二轮 M2）：施加 native 的执行器 × workspace-write 下有打开网络的角色时，另加一个以打开网络的
+ * profile 运行的目标（结果带 `network: true`）。联网与不联网的角色分别探测、分别判定，一个联网角色不会让同一设置下其他角色失败。
+ */
+async function withNetworkTargets(home: string, targets: ProbeTarget[]): Promise<ProbeTarget[]> {
+  const out: ProbeTarget[] = []
+  for (const t of targets) {
+    out.push(t)
+    if (t.applied_layer !== 'native' || t.setting !== 'workspace-write') continue
+    const roles = await nativeRoles(home, t)
+    if (roles.some((r) => roleCodexNetwork({ ...r, executor: t.executor as Role['executor'] })))
+      out.push({ ...t, network: true })
+  }
+  return out
+}
+
 export async function runIsolationProbe(o: IsolationProbeOptions): Promise<IsolationProbeReport> {
   const userHome = o.userHome ?? homedir()
   await cleanProbeLeftovers(o.home)
-  const targets = probeTargets(o.executors)
+  const targets = await withNetworkTargets(o.home, probeTargets(o.executors))
   const sockets: ProbeTargets = targets.length
     ? await findOrcaSockets(userHome)
     : { status: 'none', reason: '' }
   // 未施加（none）时各目标的结果相同，只运行一次；施加时清单随执行器及其 harness 子目录变化（保留的目录不同），
   // 按执行器 × harness 子目录分别运行（审查第一轮 L4），只在完全相同的配置之间复用。
+  // native 的 profile 随沙箱设置变化（`:workspace` / `:read-only`），工作目录是否可写由 Codex 决定，按设置分别运行。
   const groupKey = (t: ProbeTarget) =>
     t.applied_layer === 'none'
       ? 'none'
-      : `${t.applied_layer}|${t.executor}|${executorHomeFor(t) ?? ''}`
+      : `${t.applied_layer}|${t.executor}|${executorHomeFor(t) ?? ''}${t.applied_layer === 'native' ? `|${t.setting}${t.network ? '|net' : ''}` : ''}`
   const groups = new Map<string, ProbeTarget[]>()
   for (const t of targets) groups.set(groupKey(t), [...(groups.get(groupKey(t)) ?? []), t])
   const results = await Promise.all(

@@ -10,6 +10,7 @@ import { type Role, type RoleIsolation, roleIsolationOf } from '../roles.ts'
 import {
   type CredentialIsolationView,
   credentialIsolationFor,
+  roleCodexNetwork,
   roleSandboxSetting,
 } from './capability.ts'
 import { probeRunSummary } from './probe.ts'
@@ -36,6 +37,8 @@ export interface RoleIsolationTarget {
   requirement: RoleIsolation
   /** 合同执行器 × 角色权限推出的沙箱设置；无法确定时 undefined（按 none）。 */
   setting: SandboxSetting | undefined
+  /** native 意义上的联网（`roleCodexNetwork`，按合同执行器）：判定时只看以同样网络设置运行的探针结果。 */
+  network: boolean
 }
 
 /**
@@ -54,6 +57,7 @@ export function roleIsolationTarget(
     role: role.name,
     requirement: roleIsolationOf(role),
     setting: roleSandboxSetting({ ...role, executor: contract.executor }),
+    network: roleCodexNetwork({ ...role, executor: contract.executor }),
   }
 }
 
@@ -68,6 +72,8 @@ export interface AssessIsolationInput {
   /** 执行器的能力；旧节点没有上报执行器信息时传 `{}`（按未上报处理）。 */
   capabilities: Pick<AdapterCapabilities, 'credential_isolation'>
   setting: SandboxSetting | undefined
+  /** 角色的联网设置（`RoleIsolationTarget.network`）；缺省 false。 */
+  network?: boolean
   /** 节点最近一次上报（或本地）的探针结果。 */
   probe: IsolationProbeReport | null | undefined
   executor: string
@@ -80,7 +86,10 @@ export interface AssessIsolationInput {
 export function assessIsolation(o: AssessIsolationInput): IsolationAssessment {
   const now = o.now ?? Date.now()
   const caps = o.capabilities
-  const run = o.setting === undefined ? undefined : findProbeRun(o.probe, o.executor, o.setting)
+  const run =
+    o.setting === undefined
+      ? undefined
+      : findProbeRun(o.probe, o.executor, o.setting, o.network === true)
   const view = credentialIsolationFor(
     caps,
     o.setting,
@@ -104,7 +113,10 @@ export function assessIsolation(o: AssessIsolationInput): IsolationAssessment {
   }
   if (view.layer === 'none') missing.push(`${o.executor} × ${o.setting} 的施加层为 none`)
   if (declared.enforced && view.layer !== 'none') {
-    if (!run || !o.probe) missing.push(`${o.executor} × ${o.setting} 没有隔离自检结果（未探测）`)
+    if (!run || !o.probe)
+      missing.push(
+        `${o.executor} × ${o.setting}${o.network ? '（联网角色）' : ''} 没有隔离自检结果（未探测）`,
+      )
     else {
       const ranAt = Date.parse(o.probe.ran_at)
       const fresh =

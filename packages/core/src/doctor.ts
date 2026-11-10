@@ -667,7 +667,7 @@ export async function isolationProbeChecks(
     for (const row of isolationStatusRows(node, now)) {
       const [head, ...rest] = describeIsolationStatus(row, '       ')
       const message = [`隔离 ${node.node_id} ${head ?? ''}`, ...rest].join('\n')
-      const id = `isolation.${node.node_id}.${row.executor}${row.setting === '—' ? '' : `.${row.setting}`}`
+      const id = `isolation.${node.node_id}.${row.executor}${row.setting === '—' ? '' : `.${row.setting}`}${row.network ? '.network' : ''}`
       if (row.probe === 'failed')
         checks.push({
           id,
@@ -677,9 +677,18 @@ export async function isolationProbeChecks(
           // 失败的探针不会让 enforced 为 true；按探针实际运行的施加层区分“已施加但失效”与“尚未施加”。
           hint:
             row.run && row.run.applied_layer !== 'none'
-              ? row.run.items.some((i) => i.item === 'connect.orca_port' && i.actual === 'error')
-                ? '已施加隔离，但 Orca 本机端口未解析（无法证明 Orca 控制端口被拒绝），不能算已施加：确认 Orca 正在运行后等待下次自检'
-                : '已施加隔离但探针不通过，隔离可能失效：检查失败项、macOS 更新与 seatbelt 配置'
+              ? row.run.error?.code === 'native_codex_unsupported'
+                ? 'Codex 版本过低或无法确认版本，不支持 permissions profile 与 codex sandbox -P（native 施加层需要 codex-cli 0.167.0 及以上）：升级 Codex 后等待下次自检'
+                : row.run.items.some((i) => i.item === 'connect.orca_port' && i.actual === 'error')
+                  ? '已施加隔离，但 Orca 本机端口未解析（无法证明 Orca 控制端口被拒绝），不能算已施加：确认 Orca 正在运行后等待下次自检'
+                  : row.run.applied_layer === 'native' &&
+                      row.run.items.some(
+                        (i) => i.item.startsWith('connect.orca_port') && i.actual === 'allow',
+                      )
+                    ? '角色打开了 sandbox_workspace_write.network_access：native（Codex permissions profile）挡不住本机 TCP，Orca 端口可达，按未施加处理；关闭该角色的网络或改用 danger-full-access（外层 seatbelt）'
+                    : row.run.applied_layer === 'native'
+                      ? '已施加 native（Codex permissions profile）但探针不通过，隔离可能失效：检查失败项、Codex 版本与 docs/executors.md「native」'
+                      : '已施加隔离但探针不通过，隔离可能失效：检查失败项、macOS 更新与 seatbelt 配置'
               : '适配器尚未施加隔离（config/node.yaml 的 isolation.enforce 为 false、不在 macOS 上或该施加层尚未实现），探针如实报告受保护项可访问',
         })
       else if (row.probe === 'untested')
