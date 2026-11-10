@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   buildProbePlan,
+  codexNativeConfigValues,
   computeIsolationSpec,
   type Env,
   type ExecutorInfo,
@@ -15,7 +16,6 @@ import {
   type IsolationProbeRun,
   type IsolationSpec,
   isolationProbeItem,
-  ORCA_RUNTIME_DIR,
   PROBE_FAKE_TOKEN_CONTENT,
   PROBE_FILE_PREFIX,
   type ProbeTargets,
@@ -28,13 +28,19 @@ import {
   taskRunDir,
 } from '@raindown/core'
 import { z } from 'zod'
+import { execCodexHome, orcaCodexHome, readCodexHome } from '../codex-home.ts'
+import { checkCodexNativeSupport, codexNativeProfileFromSpec } from '../codex-native.ts'
 import {
+  ensureTaskRunDir,
   removeLeaseTokenFile,
   removeSeatbeltProfile,
   writeFileNoFollow,
   writeLeaseTokenFile,
 } from '../lease-token.ts'
+import { findOrcaSockets } from '../orca-ports.ts'
 import { hubPortOf, type SeatbeltOptions, writeSeatbeltLaunch } from '../seatbelt.ts'
+
+export { findOrcaSockets }
 
 /**
  * 节点侧的隔离自检探针（add-worker-credential-isolation D6，tasks 3.1）：
@@ -88,6 +94,88 @@ export function seatbeltProbeLaunchWrapper(
     if (!prepared.ok) throw new ProbeError(prepared.error.code, prepared.error.message)
     return [...prepared.data.prefix, ...argv]
   }
+}
+
+/** native 探针启动包装的选项。 */
+export interface NativeProbeOptions {
+  /** Codex 可执行文件；缺省 `codex`。测试用假脚本，**不运行真实 codex**。 */
+  codexBin?: string
+  /** `auth.json` 链接的源目录（与 worker 相同）；缺省为节点环境的 `CODEX_HOME`，再缺省为 `~/.codex`。只用于生成拒绝项，不读取。 */
+  codexAuthSource?: string
+  /** 用户主目录（列出 Orca 套接字）；缺省 `os.homedir()`。 */
+  userHome?: string
+  /** profile 名（测试固定）；缺省每次随机。 */
+  profileName?: string
+}
+
+/** 与执行器实际使用的 native CODEX_HOME 一致（`codex-home.ts` 的 `orcaCodexHome` / `execCodexHome` / `readCodexHome`）。 */
+function nativeCodexHomeFor(home: string, target: ProbeTarget): string {
+  if (target.executor === 'codex-exec')
+    return target.setting === 'read-only' ? readCodexHome(home) : execCodexHome(home)
+  return orcaCodexHome(home)
+}
+
+/**
+ * 开关打开时 native 目标的启动包装（tasks 5.1）：先运行 `<codex> --version` 确认支持 permissions profile（版本过低时探针失败并提示），
+ * 再用与 worker 启动相同的生成函数（`codexNativeProfileFromSpec`）从同一份隔离清单生成 profile，以
+ * `env CODEX_HOME=<探针临时目录> codex sandbox -c permissions.<名>=<内联表> -P <名> -- <探针程序>` 启动探针子进程（不调用模型）。
+ * 探针的 CODEX_HOME 是探针临时任务目录下的 `codex-home/`（随临时任务目录删除），不使用、不改动执行器或用户的 CODEX_HOME；
+ * profile 中拒绝的仍是执行器实际使用的 CODEX_HOME 与 `auth.json` 源文件，与 worker 一致。其他施加层恒等。
+ */
+export function nativeProbeLaunchWrapper(n: NativeProbeOptions = {}): ProbeLaunchWrapper {
+  return async (target, argv, launch) => {
+    if (target.applied_layer !== 'native') return [...argv]
+    if (target.setting !== 'workspace-write' && target.setting !== 'read-only')
+      throw new ProbeError(
+        'native_setting_unsupported',
+        `native 只支持 workspace-write 与 read-only，不支持 ${target.setting}`,
+      )
+    const codexBin = n.codexBin ?? 'codex'
+    const codexHome = join(await ensureTaskRunDir(launch.home, launch.taskId), 'codex-home')
+    await mkdir(codexHome, { recursive: true, mode: 0o700 })
+    const env = {
+      ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
+      ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
+      CODEX_HOME: codexHome,
+    }
+    const version = await checkCodexNativeSupport(codexBin, env)
+    if (!version.ok) throw new ProbeError(version.error.code, version.error.message)
+    const profile = await codexNativeProfileFromSpec({
+      spec: launch.spec,
+      sandbox: target.setting,
+      codexHome: nativeCodexHomeFor(launch.home, target),
+      authSource: n.codexAuthSource ?? process.env.CODEX_HOME ?? join(homedir(), '.codex'),
+      userHome: n.userHome ?? homedir(),
+      ...(n.profileName !== undefined ? { name: n.profileName } : {}),
+    })
+    if (!profile.ok) throw new ProbeError(profile.error.code, profile.error.message)
+    const [definition] = codexNativeConfigValues(profile.data)
+    return [
+      '/usr/bin/env',
+      `CODEX_HOME=${codexHome}`,
+      codexBin,
+      'sandbox',
+      '-c',
+      definition as string,
+      '-P',
+      profile.data.name,
+      '--',
+      ...argv,
+    ]
+  }
+}
+
+/** 开关打开时的启动包装：seatbelt 目标走 `seatbeltProbeLaunchWrapper`，native 目标走 `nativeProbeLaunchWrapper`，其他恒等。 */
+export function isolationProbeLaunchWrapper(
+  o: Pick<SeatbeltOptions, 'sandboxExec'> = {},
+  n: NativeProbeOptions = {},
+): ProbeLaunchWrapper {
+  const seatbelt = seatbeltProbeLaunchWrapper(o)
+  const native = nativeProbeLaunchWrapper(n)
+  return (target, argv, launch) =>
+    target.applied_layer === 'native'
+      ? native(target, argv, launch)
+      : seatbelt(target, argv, launch)
 }
 
 export interface IsolationProbeOptions {
@@ -193,26 +281,6 @@ function executorHomeFor(target: ProbeTarget): string | undefined {
     return target.setting === 'read-only' ? 'codex-read-home' : 'codex-home'
   if (target.executor === 'codex-orca') return 'codex-home'
   return undefined
-}
-
-/** 列出 Orca 运行时目录（及 `daemon/`）中的 unix 套接字；只看目录项类型，不读文件、不连接。 */
-export async function findOrcaSockets(userHome: string): Promise<ProbeTargets> {
-  const root = join(userHome, ORCA_RUNTIME_DIR)
-  const found: string[] = []
-  for (const dir of [root, join(root, 'daemon')]) {
-    let entries: import('node:fs').Dirent[]
-    try {
-      entries = await readdir(dir, { withFileTypes: true })
-    } catch (err) {
-      if (dir === root && (err as NodeJS.ErrnoException).code === 'ENOENT')
-        return { status: 'none', reason: 'Orca 运行时目录不存在' }
-      continue
-    }
-    for (const e of entries) if (e.isSocket()) found.push(join(dir, e.name))
-  }
-  return found.length
-    ? { status: 'found', paths: found.sort() }
-    : { status: 'none', reason: 'Orca 运行时目录中没有 unix 套接字' }
 }
 
 /** `sw_vers -productVersion`；非 macOS 或失败时为 null。 */
@@ -424,6 +492,7 @@ async function runOne(
       shellStartupFile,
       ...repo.plan,
       sharedTmp: await realpath(tmpdir()),
+      layer: target.applied_layer,
     })
     const wrap = o.launchWrapper ?? identityLaunchWrapper
     const argv = await wrap(target, [o.execPath ?? process.execPath, PROBE_CHILD_SCRIPT], {
@@ -432,8 +501,21 @@ async function runOne(
       spec: probeSpec,
     })
     const items = await spawnProbe(argv, plan, o.timeoutMs ?? PROBE_TIMEOUT_MS, cwd)
-    return { ...base, items, passed: probeRunPassed({ items }) }
+    return {
+      ...base,
+      items,
+      passed: probeRunPassed({ items, applied_layer: target.applied_layer }),
+    }
   } catch (err) {
+    if (
+      err instanceof ProbeError &&
+      err.code === 'probe_failed' &&
+      target.applied_layer === 'native'
+    )
+      return failed(
+        err.code,
+        `${err.message}（codex sandbox 没有正常运行探针：Codex 可能不支持 permissions profile 或拒绝了生成的 profile，见 docs/executors.md「native」）`,
+      )
     if (err instanceof ProbeError) return failed(err.code, err.message)
     return failed(
       'probe_failed',
@@ -502,7 +584,11 @@ function reuseRun(rep: IsolationProbeRun, target: ProbeTarget): IsolationProbeRu
     declared_layer: target.declared_layer,
     applied_layer: target.applied_layer,
     items,
-    passed: probeRunPassed({ items, ...(rep.error ? { error: rep.error } : {}) }),
+    passed: probeRunPassed({
+      items,
+      applied_layer: target.applied_layer,
+      ...(rep.error ? { error: rep.error } : {}),
+    }),
     ...(rep.error ? { error: rep.error } : {}),
   }
 }
@@ -521,10 +607,11 @@ export async function runIsolationProbe(o: IsolationProbeOptions): Promise<Isola
     : { status: 'none', reason: '' }
   // 未施加（none）时各目标的结果相同，只运行一次；施加时清单随执行器及其 harness 子目录变化（保留的目录不同），
   // 按执行器 × harness 子目录分别运行（审查第一轮 L4），只在完全相同的配置之间复用。
+  // native 的 profile 随沙箱设置变化（`:workspace` / `:read-only`），工作目录是否可写由 Codex 决定，按设置分别运行。
   const groupKey = (t: ProbeTarget) =>
     t.applied_layer === 'none'
       ? 'none'
-      : `${t.applied_layer}|${t.executor}|${executorHomeFor(t) ?? ''}`
+      : `${t.applied_layer}|${t.executor}|${executorHomeFor(t) ?? ''}${t.applied_layer === 'native' ? `|${t.setting}` : ''}`
   const groups = new Map<string, ProbeTarget[]>()
   for (const t of targets) groups.set(groupKey(t), [...(groups.get(groupKey(t)) ?? []), t])
   const results = await Promise.all(

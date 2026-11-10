@@ -33,6 +33,7 @@ import {
   execCodexHome,
   prepareReadCodexHome,
   readCodexHome,
+  writeLeaseTokenFile,
 } from '../src/index.ts'
 import { bench } from './harness.ts'
 import { processStopped } from './process.ts'
@@ -911,8 +912,8 @@ describe('外层 seatbelt（worker-credential-isolation 4.3）', () => {
 
   test.each([
     ['开关关闭', false, 'danger-full-access'],
-    ['开关打开但沙箱为 read-only（native，未实现）', true, 'read-only'],
-    ['开关打开但沙箱为 workspace-write（native，未实现）', true, 'workspace-write'],
+    ['开关关闭（read-only）', false, 'read-only'],
+    ['开关关闭（workspace-write）', false, 'workspace-write'],
   ] as const)('%s：spawn 参数不变，不生成配置', async (_name, enforce, sandbox) => {
     const s = setup('send(resumed)', { permissions: { sandbox } })
     const fake = fakeSandboxExec(s.dir)
@@ -1023,13 +1024,17 @@ send(resumed)
     })
   })
 
-  test('开关打开时能力声明只保留已实现的施加层（native 未实现，声明为 none）', () => {
+  test('开关打开时能力声明保留已实现的施加层（seatbelt 与 native）', () => {
     const s = setup('send(resumed)', dfa)
     expect(
       createCodexExecExecutor({ ...s.options, isolation: isolation(s) }).adapterCapabilities
         .credential_isolation,
     ).toEqual({
-      layers: { 'danger-full-access': 'seatbelt', 'workspace-write': 'none', 'read-only': 'none' },
+      layers: {
+        'danger-full-access': 'seatbelt',
+        'workspace-write': 'native',
+        'read-only': 'native',
+      },
       enforced: true,
     })
   })
@@ -1078,4 +1083,145 @@ send(resumed)
       expect(readFileSync(join(plain.dir, 'hub-read.txt'), 'utf8')).toBe('readable')
     },
   )
+})
+
+describe('native：Codex permissions profile（worker-credential-isolation 5.1）', () => {
+  const hubUrl = 'http://127.0.0.1:7477'
+  const NAME = 'raindown-test'
+  const isolation = (s: ReturnType<typeof setup>, enforce = true) => ({
+    enforce,
+    platform: 'darwin' as const,
+    userHome: join(s.dir, 'user'),
+    env: {},
+  })
+  const withToken = async (s: ReturnType<typeof setup>) => ({
+    ...s.ctx,
+    hubUrl,
+    leaseTokenFile: await writeLeaseTokenFile(s.home, 't-test', 'l-1', 'lease-token'),
+  })
+  /** argv 中 `-c` 的值。 */
+  const configs = (args: string[]) =>
+    args.flatMap((a, i) => (args[i - 1] === '-c' && i > 0 ? [a] : []))
+
+  test('read-only：不传 -s，改传 profile 与 default_permissions；profile 拒绝 raindown-home、CODEX_HOME 与 auth.json 源文件，放行本任务令牌', async () => {
+    const s = setup('send(resumed)', { permissions: { sandbox: 'read-only' } })
+    const ctx = await withToken(s)
+    const { outcome } = await collect(
+      s.run(ctx, { ...s.options, isolation: isolation(s), nativeProfileName: NAME }),
+    )
+    expect(outcome.outcome).toBe('done')
+    const args = s.report().args
+    expect(args).not.toContain('-s')
+    const c = configs(args)
+    const def = c.find((v) => v.startsWith(`permissions.${NAME}=`)) as string
+    expect(def).toBeDefined()
+    expect(c).toContain(`default_permissions="${NAME}"`)
+    expect(c).toContain('approval_policy="never"')
+    const home = realpathSync(s.home)
+    const codexHome = realpathSync(readCodexHome(s.home))
+    expect(def).toStartWith(`permissions.${NAME}={extends=":read-only",filesystem={`)
+    expect(def).toContain(`"${home}"="deny"`)
+    // CODEX_HOME 位于 raindown-home 内，已被整体拒绝覆盖（省略被覆盖的子路径），只有 tmp/ 重新放行为只读。
+    expect(def).not.toContain(`"${codexHome}"=`)
+    expect(def).toContain(`"${join(codexHome, 'tmp')}"="read"`)
+    expect(def).toContain(`"${join(realpathSync(s.dir), 'codex-src', 'auth.json')}"="deny"`)
+    expect(def).toContain(`"${realpathSync(ctx.leaseTokenFile)}"="read"`)
+    // 受保护项（私钥目录、Orca 运行时目录、LaunchAgents）。
+    expect(def).toContain(`"${join(realpathSync(s.dir), 'user', '.config', 'sops', 'age')}"="deny"`)
+    expect(def).toContain(
+      `unix_sockets={"${join(realpathSync(s.dir), 'user', 'Library', 'Application Support', 'orca')}"="deny"}`,
+    )
+    // 没有打开网络：不写 enabled（沿用 :read-only 的缺省）。
+    expect(def).not.toContain('enabled=')
+    // CODEX_HOME 仍是执行器级的只读目录（profile 每次经 -c 传入，不写进它的 config.toml）。
+    expect(s.report().codexHome).toBe(readCodexHome(s.home))
+    expect(readFileSync(join(readCodexHome(s.home), 'config.toml'), 'utf8')).not.toContain(
+      'permissions',
+    )
+    // 不生成 seatbelt 配置。
+    expect(existsSync(join(s.home, 'state/tasks/t-test/isolation.sb'))).toBe(false)
+  })
+
+  test('workspace-write：config.sandbox_mode 被去掉，network_access 映射为 network.enabled；恢复会话同样施加', async () => {
+    const s = setup('send(question)', {
+      permissions: {
+        sandbox: 'workspace-write',
+        config: {
+          sandbox_mode: '"workspace-write"',
+          'sandbox_workspace_write.network_access': true,
+        },
+      },
+    })
+    const ctx = await withToken(s)
+    const opts = { ...s.options, isolation: isolation(s), nativeProfileName: NAME }
+    await collect(s.run(ctx, opts))
+    for (const args of [s.report().args]) {
+      expect(args).not.toContain('-s')
+      const c = configs(args)
+      expect(c.some((v) => v.startsWith('sandbox_mode='))).toBe(false)
+      const def = c.find((v) => v.startsWith(`permissions.${NAME}=`)) as string
+      expect(def).toStartWith(`permissions.${NAME}={extends=":workspace",`)
+      expect(def).toContain('network={enabled=true,unix_sockets={')
+    }
+    // 恢复：resume 也带同一 profile 定义。
+    await collect(
+      s.run(
+        {
+          ...ctx,
+          resume: {
+            session: SID,
+            reply: { reply_id: 'r1', kind: 'text', by: 'user', text: '继续' },
+          },
+        },
+        opts,
+      ),
+    )
+    const resumedArgs = s.report().args
+    expect(resumedArgs).toContain('resume')
+    expect(resumedArgs).not.toContain('-s')
+    expect(configs(resumedArgs)).toContain(`default_permissions="${NAME}"`)
+  })
+
+  test('profile 名缺省每次随机（raindown-<hex>）', async () => {
+    const s = setup('send(resumed)', { permissions: { sandbox: 'read-only' } })
+    await collect(s.run(await withToken(s), { ...s.options, isolation: isolation(s) }))
+    const def = configs(s.report().args).find((v) => v.startsWith('default_permissions='))
+    expect(def).toMatch(/^default_permissions="raindown-[0-9a-f]{12}"$/)
+  })
+
+  test('无法施加（没有中枢地址、工作目录在受保护目录内）时不启动 Codex，结果带原因', async () => {
+    const s = setup('send(resumed)', { permissions: { sandbox: 'read-only' } })
+    const { outcome } = await collect(
+      s.run(s.ctx, { ...s.options, isolation: isolation(s), nativeProfileName: NAME }),
+    )
+    expect(outcome).toMatchObject({
+      outcome: 'failed',
+      result: { reason: 'isolation_hub_url_missing' },
+    })
+    expect(s.launched()).toBe(false)
+    const inside = join(s.home, 'state', 'work')
+    mkdirSync(inside, { recursive: true })
+    const s2 = { ...s }
+    const { outcome: o2 } = await collect(
+      s2.run(
+        { ...(await withToken(s)), cwd: inside },
+        { ...s.options, isolation: isolation(s), nativeProfileName: NAME },
+      ),
+    )
+    expect(o2).toMatchObject({ outcome: 'failed', result: { reason: 'isolation_allow_in_deny' } })
+    expect(s.launched()).toBe(false)
+  })
+
+  test('开关打开但非 macOS：不施加，参数与关闭时相同', async () => {
+    const s = setup('send(resumed)', { permissions: { sandbox: 'read-only' } })
+    await collect(
+      s.run(await withToken(s), {
+        ...s.options,
+        isolation: { ...isolation(s), platform: 'linux' as const },
+      }),
+    )
+    const args = s.report().args
+    expect(args.slice(-4, -2)).toEqual(['-s', 'read-only'])
+    expect(configs(args).some((v) => v.startsWith('default_permissions='))).toBe(false)
+  })
 })

@@ -18,6 +18,8 @@ import { type ProbeSystem, runProbeItems } from '../src/isolation-probe/checks.t
 import {
   cleanProbeLeftovers,
   findOrcaSockets,
+  isolationProbeLaunchWrapper,
+  nativeProbeLaunchWrapper,
   probeTargets,
   runIsolationProbe,
   seatbeltProbeLaunchWrapper,
@@ -607,20 +609,26 @@ describe('探针联动（worker-credential-isolation 4.1–4.4）', () => {
     expect(readdirSync(join(cacheDir, 'mds'))).toEqual([])
   })
 
-  test('开关打开时的能力声明：native 未实现，声明为 none，不探测', () => {
+  test('开关打开时的能力声明：seatbelt 与 native 都已实现，按声明探测', () => {
     const declared = effectiveCredentialIsolation(
       {
         layers: {
           'danger-full-access': 'seatbelt',
           'workspace-write': 'native',
           'read-only': 'native',
+          other: 'separate_user',
         },
         enforced: false,
       },
       { enforce: true, platform: 'darwin' },
     )
     expect(declared).toEqual({
-      layers: { 'danger-full-access': 'seatbelt', 'workspace-write': 'none', 'read-only': 'none' },
+      layers: {
+        'danger-full-access': 'seatbelt',
+        'workspace-write': 'native',
+        'read-only': 'native',
+        other: 'none',
+      },
       enforced: true,
     })
     const targets = probeTargets([
@@ -629,13 +637,10 @@ describe('探针联动（worker-credential-isolation 4.1–4.4）', () => {
         adapter_capabilities: { ...NO_ADAPTER_CAPABILITIES, credential_isolation: declared },
       },
     ])
-    expect(targets).toEqual([
-      {
-        executor: 'codex-exec',
-        setting: 'danger-full-access',
-        declared_layer: 'seatbelt',
-        applied_layer: 'seatbelt',
-      },
+    expect(targets.map((t) => [t.setting, t.applied_layer])).toEqual([
+      ['danger-full-access', 'seatbelt'],
+      ['read-only', 'native'],
+      ['workspace-write', 'native'],
     ])
     // 开关关闭或非 macOS：原样返回。
     const original = { layers: { x: 'native' }, enforced: false }
@@ -719,4 +724,192 @@ describe('探针联动（worker-credential-isolation 4.1–4.4）', () => {
       expect(run?.passed).toBe(false)
     },
   )
+})
+
+describe('native 探针（worker-credential-isolation 5.1）', () => {
+  const nativeExec = (): ExecutorInfo => ({
+    type: 'codex-exec',
+    adapter_capabilities: {
+      ...NO_ADAPTER_CAPABILITIES,
+      credential_isolation: {
+        layers: { 'workspace-write': 'native', 'read-only': 'native' },
+        enforced: true,
+      },
+    },
+  })
+  /**
+   * 假的 codex 可执行文件（sh 脚本，**不运行真实 codex**）：记录参数与 CODEX_HOME；`--version` 打印给定版本；
+   * `sandbox … -- <cmd>` 时去掉 `--` 之前的参数后直接运行探针程序（不施加任何沙箱，所以受保护项可读、探针不通过）。
+   */
+  async function fakeCodex(root: string, version = '0.167.0') {
+    const script = join(root, 'fake-codex.sh')
+    // 每次调用写一个文件（探针按设置并行运行，追加同一文件会交错）。
+    const reports = join(root, 'fake-codex-argv')
+    await mkdir(reports)
+    await writeFile(
+      script,
+      [
+        '#!/bin/sh',
+        `printf '%s\\n' "CODEX_HOME=$CODEX_HOME" "$@" > '${reports}/'$$.txt`,
+        `if [ "$1" = "--version" ]; then echo "codex-cli ${version}"; exit 0; fi`,
+        'while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done',
+        'shift',
+        'exec "$@"',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    )
+    const calls = async () =>
+      Promise.all(
+        readdirSync(reports).map(async (f) =>
+          (await readFile(join(reports, f), 'utf8')).trimEnd().split('\n'),
+        ),
+      )
+    return { script, calls }
+  }
+
+  test('以 codex sandbox -c <profile> -P <名> -- <探针程序> 启动；profile 与 worker 同源；native 专有的跳过项', async () => {
+    const s = await setup()
+    const fake = await fakeCodex(s.root)
+    const report = await runIsolationProbe({
+      ...probeOptions(s, [nativeExec()]),
+      launchWrapper: nativeProbeLaunchWrapper({
+        codexBin: fake.script,
+        codexAuthSource: join(s.userHome, '.codex'),
+        userHome: s.userHome,
+        profileName: 'raindown-probe',
+      }),
+    })
+    expect(report.runs.map((r) => [r.setting, r.applied_layer])).toEqual([
+      ['read-only', 'native'],
+      ['workspace-write', 'native'],
+    ])
+    const calls = await fake.calls()
+    // 每个设置：一次 --version，一次 sandbox（native 按设置分别运行，不复用）。
+    expect(calls.filter((c) => c[1] === '--version')).toHaveLength(2)
+    const sandboxes = calls.filter((c) => c[1] === 'sandbox')
+    expect(sandboxes).toHaveLength(2)
+    const home = realpathSync(s.home)
+    for (const c of sandboxes) {
+      // 探针用自己临时任务目录下的 CODEX_HOME，不用执行器或用户的 CODEX_HOME。
+      expect(c[0]).toMatch(
+        /^CODEX_HOME=.*\/run\/tasks\/isolation-probe-self-[0-9a-f]+\/codex-home$/,
+      )
+      expect(c.slice(1, 3)).toEqual(['sandbox', '-c'])
+      const def = c[3] as string
+      expect(def).toStartWith('permissions.raindown-probe={extends=')
+      expect(def).toContain(`"${home}"="deny"`)
+      expect(def).toContain(`"${join(realpathSync(s.userHome), '.codex', 'auth.json')}"="deny"`)
+      expect(def).toMatch(/dispatch-tokens\/isolation-probe\.token"="read"/)
+      expect(c.slice(4, 7)).toEqual(['-P', 'raindown-probe', '--'])
+      expect(c[8]).toEndWith('child.ts')
+    }
+    expect(sandboxes.map((c) => /extends=":([\w-]+)"/.exec(c[3] as string)?.[1]).sort()).toEqual([
+      'read-only',
+      'workspace',
+    ])
+    const ws = report.runs.find((r) => r.setting === 'workspace-write')
+    const by = Object.fromEntries((ws?.items ?? []).map((i) => [i.item, i]))
+    for (const id of [
+      'write.own_profile',
+      'write.git_hooks',
+      'write.git_commondir',
+      'write.registered_git',
+      'write.git_objects',
+      'write.shared_tmp',
+      'connect.hub',
+    ])
+      expect({ id, actual: by[id]?.actual }).toEqual({ id, actual: 'skipped' })
+    expect(by['write.own_profile']?.detail).toContain('native')
+    // 假 codex 不施加沙箱：受保护项可读，探针如实不通过。
+    expect(by['read.hub_token']?.actual).toBe('allow')
+    expect(ws?.passed).toBe(false)
+    const ro = report.runs.find((r) => r.setting === 'read-only')
+    const roBy = Object.fromEntries((ro?.items ?? []).map((i) => [i.item, i]))
+    expect(roBy['write.workdir']?.expected).toBe('deny')
+    expect(by['write.workdir']?.expected).toBe('allow')
+    expect(JSON.stringify(report)).not.toContain(MARKER)
+    // 临时任务目录（含探针的 CODEX_HOME）全部删除。
+    const tasks = runTasksDir(s.home)
+    expect(existsSync(tasks) ? readdirSync(tasks) : []).toEqual([])
+  })
+
+  test('native 的通过判定：与 seatbelt 相同的读拒绝项为必过项；seatbelt 专有的项缺失或跳过不影响', () => {
+    const item = (id: string, actual: 'deny' | 'allow' | 'skipped', expected = 'deny') => ({
+      item: id,
+      expected: expected as 'deny' | 'allow',
+      actual,
+      ok: null,
+    })
+    const items = [
+      item('read.hub_token', 'deny'),
+      item('read.ledger_db', 'deny'),
+      item('read.other_task_token', 'deny'),
+      item('write.config', 'deny'),
+      item('rename.protected_ancestor', 'deny'),
+      item('write.shell_startup', 'deny'),
+      item('write.own_profile', 'skipped'),
+      item('write.workdir', 'deny'),
+    ]
+    expect(probeRunPassed({ items, applied_layer: 'native' })).toBe(true)
+    // 同样的结果按 seatbelt 判定不通过（缺 seatbelt 的必过项）。
+    expect(probeRunPassed({ items, applied_layer: 'seatbelt' })).toBe(false)
+    const leaky = items.map((i) =>
+      i.item === 'read.hub_token' ? { ...i, actual: 'allow' as const } : i,
+    )
+    expect(probeRunPassed({ items: leaky, applied_layer: 'native' })).toBe(false)
+    const missing = items.filter((i) => i.item !== 'write.shell_startup')
+    expect(probeRunPassed({ items: missing, applied_layer: 'native' })).toBe(false)
+  })
+
+  test('Codex 版本过低：不运行 sandbox，探针失败并提示（native_codex_unsupported）', async () => {
+    const s = await setup()
+    const fake = await fakeCodex(s.root, '0.144.4')
+    const report = await runIsolationProbe({
+      ...probeOptions(s, [nativeExec()]),
+      launchWrapper: isolationProbeLaunchWrapper(
+        {},
+        {
+          codexBin: fake.script,
+          codexAuthSource: join(s.userHome, '.codex'),
+          userHome: s.userHome,
+        },
+      ),
+    })
+    expect(report.runs).toHaveLength(2)
+    for (const run of report.runs) {
+      expect(run.passed).toBe(false)
+      expect(run.error?.code).toBe('native_codex_unsupported')
+      expect(run.error?.message).toContain('0.144.4')
+      expect(run.error?.message).toContain('0.167.0')
+    }
+    expect((await fake.calls()).some((c) => c[1] === 'sandbox')).toBe(false)
+  })
+
+  test('codex sandbox 非零退出：探针失败，原因提示可能不支持 permissions profile', async () => {
+    const s = await setup()
+    const script = join(s.root, 'fake-codex-fail.sh')
+    await writeFile(
+      script,
+      [
+        '#!/bin/sh',
+        'if [ "$1" = "--version" ]; then echo "codex-cli 0.170.1"; exit 0; fi',
+        'echo "error: unexpected argument -P" >&2',
+        'exit 2',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    )
+    const report = await runIsolationProbe({
+      ...probeOptions(s, [nativeExec()]),
+      launchWrapper: nativeProbeLaunchWrapper({
+        codexBin: script,
+        codexAuthSource: join(s.userHome, '.codex'),
+        userHome: s.userHome,
+      }),
+    })
+    const run = report.runs[0]
+    expect(run?.error?.code).toBe('probe_failed')
+    expect(run?.error?.message).toContain('permissions profile')
+  })
 })

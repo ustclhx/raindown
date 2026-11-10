@@ -33,7 +33,10 @@
 节点为每次派工生成 `IsolationSpec{deny_read[], deny_write[], allow_read[], allow_write[], allow_unix_sockets[], allow_local_ports[]}`。写入是白名单（4.6，见 D2）：`allow_write`（子树）、`allow_write_literals`（单个文件）与 `allow_write_regex` 就是全部可写位置，`write_carve_outs*` 在其中再挖掉登记仓库的 git 目录与 harness 配置，`allow_write_git` 再放行本任务独立 clone 的 `.git`；`deny_*` 受保护项与 `deny_write_except`（持久化位置）最后写入，白名单不能重新放开它们。路径一律规范化为 realpath，这是正确性前提而不只是整洁：seatbelt 按真实路径匹配，未规范化的规则（例如 `/var/…` 而真实路径是 `/private/var/…`）会静默不生效。规范化在生成配置时做，不存在的路径按其最近的已存在祖先规范化后拼回。适配器把它落到三种施加层之一：
 - **外层 seatbelt**：用于 harness 自带 OS 沙箱关闭的情况（danger-full-access、bypass）。节点生成 SBPL 配置，用 `sandbox-exec -f` 启动 harness。配置以 `allow default` 为基础（读、网络、进程等不改变），紧接着 `(deny file-write*)` 把写入改为白名单（4.6），显式 deny 受保护资源。
 - **harness 原生的读限制**：用于 harness 自带沙箱开启、无法嵌套的情况。1.1 实测结论：
-  - Codex 支持：Raindown 在其管理的 CODEX_HOME 中生成 permissions profile，受保护路径写 `"deny"`，启动时不传 `-s`，改传 `-c default_permissions=<name>`。声明为 `native`。
+  - Codex 支持：Raindown 生成 permissions profile，受保护路径写 `"deny"`，启动时不传 `-s`，改传 `-c default_permissions=<name>`。声明为 `native`。
+    5.1 实现：profile 由同一个 `IsolationSpec` 生成（raindown-home 整体拒绝，派工令牌写 `"read"`；Codex 进程不在沙箱内，额外拒绝该执行器的 CODEX_HOME 与 `auth.json` 源文件），
+    **每次启动经 `-c` 以 TOML 内联表传入**，不写进共享 CODEX_HOME 的 `config.toml`（多个任务共享同一 CODEX_HOME，按任务的条目写文件会竞态）；profile 名带随机后缀，
+    防止被同名表合并追加条目。探针以 `codex sandbox -P` 运行同源 profile；授权请求按 D5 标注并交给用户。见 `docs/executors.md`「`native`」。
   - Claude Code 不支持可靠的原生读限制（`denyRead` 只覆盖 Bash）。claude-sdk 开启 bash 沙箱时声明为 `none`；需要隔离的角色应关闭 bash 沙箱，改由外层 seatbelt 施加。
 - **独立系统用户**：最稳妥的退路，与 harness 沙箱完全正交。worker 以专用用户运行，受保护资源仍由主用户持有（0700）。代价有三：需要用户批准系统级改动（新建用户、sudoers 规则）；harness 凭证需要为该用户单独登录或经 Raindown 注入；worktree 需要共享组权限。只在前两层都不可行时启用，并且需要用户在实施时明确同意。
 - 适配器能力 `credential_isolation` 取值为 `seatbelt | native | separate_user | none`，按角色的沙箱设置分别声明。中枢按能力派送。按 1.1 的结论：
@@ -124,6 +127,8 @@ seatbelt 的规则后者优先，允许项写得最窄（具体文件，而不�
 - `isolation` 默认 `preferred`。任务 1.1 的实测通过后，升级说明建议把 dev 类角色改为 `required`。之后的版本在 doctor 通过时把写类角色的默认值改为 `required`。
 - `required` 不满足时，任务以 `blocked(other)` 并带原因 `isolation_unavailable` 停下，不启动 harness。
 - 施加层为 `native` 的 `required` 角色：越出 harness 沙箱的授权请求会让该命令脱离隔离。这类请求在收件箱与 supervisor 代回复输入中标注“批准将脱离隔离”，supervisor 不得代批，只能转给用户。
+  5.1 实现：native 下 codex-orca 的授权弹窗不做策略预检、不自动放行，卡住说明标注“【批准即解除本次命令的隔离】”，节点以 `no_delegate` 上报（不论角色的 `isolation` 取值）；
+  策略层对 `escapesIsolation` 的请求同样直接交给用户。codex-exec 没有交互审批通道，native 下固定 `approval_policy="never"`。
 
 ### D6. 自检探针
 探针与 worker 走同一个施加层，运行节点自带的检查程序，逐项尝试：

@@ -6,8 +6,8 @@ import {
   findProbeRun,
   type IsolationProbeReport,
   type IsolationProbeRun,
-  PROBE_REQUIRED_DENY_ITEMS,
   probeItemOk,
+  probeRequiredDenyItems,
   probeRunPassed,
 } from '../ledger/isolation-probe.ts'
 import { credentialIsolationFor } from './capability.ts'
@@ -117,7 +117,27 @@ export interface ProbePlanInput {
   gitCommondirFile?: string
   /** 共享的系统临时目录（`TMPDIR`）：拒绝（审查第一轮 M2，worker 改用按任务私有的临时目录）。 */
   sharedTmp?: string
+  /**
+   * 探针实际运行的施加层。`native`（Codex permissions profile，tasks 5.1）时：
+   * - 读拒绝项、`write.config`、`rename.protected_ancestor`、`write.shell_startup` 与 seatbelt 相同；
+   * - `write.own_profile` 跳过：profile 经命令行 `-c` 传入，没有可改写的配置文件；
+   * - `write.git_hooks`、`write.git_commondir`、`write.registered_git`、`write.git_objects`、`write.shared_tmp` 跳过：
+   *   这些位置能否写入由 Codex 沙箱语义决定（`:workspace` 放行工作区与临时目录），不是 Raindown 的写白名单；
+   * - `connect.hub` 跳过：native 下 worker 经沙箱外的 Raindown MCP 访问中枢，沙箱内命令的网络按角色设置；
+   * - `write.workdir` 按读写类别（read-only 下工作目录不可写不算失败）。
+   */
+  layer?: string
 }
+
+/** native 下按 Codex 沙箱语义判定、不属于 Raindown 写白名单的写入项的跳过原因。 */
+export const PROBE_NATIVE_CODEX_WRITE_SKIP =
+  'native：能否写入由 Codex 沙箱语义决定（:workspace 放行工作区与临时目录，:read-only 全部拒绝），不属于 Raindown 的写白名单'
+/** native 下 `write.own_profile` 的跳过原因。 */
+export const PROBE_NATIVE_PROFILE_SKIP =
+  'native：permissions profile 每次启动经命令行 -c 传入，没有可改写的配置文件'
+/** native 下 `connect.hub` 的跳过原因。 */
+export const PROBE_NATIVE_HUB_SKIP =
+  'native：worker 经沙箱外的 Raindown MCP 访问中枢；沙箱内命令的网络按角色设置（缺省不联网）'
 
 const isWithinPath = (parent: string, child: string) =>
   child === parent || child.startsWith(parent.endsWith('/') ? parent : `${parent}/`)
@@ -318,7 +338,31 @@ export function buildProbePlan(input: ProbePlanInput): ProbePlan {
       target: `${input.hubUrl.replace(/\/+$/, '')}/v1/health`,
     },
   )
-  return { workdir: input.cwd, items, connect_timeout_ms: 3_000 }
+  return {
+    workdir: input.cwd,
+    items: input.layer === 'native' ? items.map(nativeItem) : items,
+    connect_timeout_ms: 3_000,
+  }
+}
+
+const NATIVE_CODEX_WRITE_ITEMS: ReadonlySet<string> = new Set([
+  'write.git_hooks',
+  'write.git_commondir',
+  'write.registered_git',
+  'write.git_objects',
+  'write.shared_tmp',
+])
+
+/** native 下改为跳过的项（见 `ProbePlanInput.layer`）：只保留项名、种类与预期，不尝试。 */
+function nativeItem(i: ProbePlanItem): ProbePlanItem {
+  const skip = NATIVE_CODEX_WRITE_ITEMS.has(i.item)
+    ? PROBE_NATIVE_CODEX_WRITE_SKIP
+    : i.item === 'write.own_profile'
+      ? PROBE_NATIVE_PROFILE_SKIP
+      : i.item === 'connect.hub'
+        ? PROBE_NATIVE_HUB_SKIP
+        : undefined
+  return skip === undefined ? i : { item: i.item, kind: i.kind, expected: i.expected, skip }
 }
 
 /** 探针运行前造的假令牌内容：明显为假，便于在输出中断言不出现。 */
@@ -352,9 +396,9 @@ export function probeRunSummary(run: IsolationProbeRun): {
         ),
       ...(run.error
         ? []
-        : PROBE_REQUIRED_DENY_ITEMS.filter(
-            (id) => !run.items.some((i) => i.item === id && i.expected === 'deny'),
-          ).map((id) => `${id}：缺少核心受保护项`)),
+        : probeRequiredDenyItems(run.applied_layer)
+            .filter((id) => !run.items.some((i) => i.item === id && i.expected === 'deny'))
+            .map((id) => `${id}：缺少核心受保护项`)),
     ],
     skipped: run.items
       .filter((i) => i.actual === 'skipped')

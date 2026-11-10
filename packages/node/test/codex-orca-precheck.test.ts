@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdirSync, rmSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { type Activity, fail, ok, type Result, taskContract } from '@raindown/core'
-import { approvalForPrecheck, CODEX_ORCA_PRECHECK_TOOL } from '../src/codex-orca/classify.ts'
+import {
+  approvalForPrecheck,
+  CODEX_ORCA_PRECHECK_TOOL,
+  classifyCodexOrca,
+} from '../src/codex-orca/classify.ts'
 import { createCodexOrcaExecutor } from '../src/codex-orca/executor.ts'
 import type { OrcaTerminalRead } from '../src/codex-orca/orca.ts'
 import {
@@ -14,6 +18,7 @@ import {
   type PrecheckRequest,
   type PrecheckVerdict,
 } from '../src/index.ts'
+import { needsUserText } from '../src/precheck.ts'
 import { FakeGh, FakeOrca, type OrcaHome, orcaHome, tuiFixture } from './codex-orca-helpers.ts'
 import { type Bench, bench, ManualClock } from './harness.ts'
 import { waitFor as until } from './wait.ts'
@@ -46,10 +51,19 @@ const replaceLine = (from: string, to: string) => (tail: string[]) =>
 async function start(
   reads: OrcaTerminalRead[],
   precheck?: Precheck,
-  extra: Partial<Pick<ExecutorContext, 'reportBranch' | 'confirmApproval'>> = {},
+  extra: Partial<
+    Pick<ExecutorContext, 'reportBranch' | 'confirmApproval' | 'hubUrl' | 'leaseTokenFile'>
+  > = {},
   onOrca?: (orca: FakeOrca) => void,
+  native?: boolean,
 ) {
   h = orcaHome()
+  if (native)
+    // native（tasks 5.1）：workspace-write + on-request 的角色，开关打开（只在临时目录中计算 profile，不运行 codex）。
+    writeFileSync(
+      join(h.home, 'config/roles/dev.yaml'),
+      'name: dev\nexecutor: codex-orca\nprompt: dev.md\npermissions:\n  approval: on-request\n  sandbox: workspace-write\n',
+    )
   const clock = new ManualClock()
   const orca = new FakeOrca(h.worktree)
   onOrca?.(orca)
@@ -62,6 +76,16 @@ async function start(
     gh: new FakeGh(),
     baseBranch: async () => 'origin/main',
     waitForSetup: async () => ok(undefined),
+    ...(native
+      ? {
+          isolation: {
+            enforce: true,
+            platform: 'darwin' as const,
+            userHome: join(h.root, 'user'),
+            env: {},
+          },
+        }
+      : {}),
   })
   const contract = taskContract.parse({
     goal: '修正 README',
@@ -658,5 +682,75 @@ describe('codex-orca + 真实 policy/check', () => {
     await until(() => s.enters().length > 0, '回车')
     expect(s.idles()).toHaveLength(0)
     await s.run.cancel()
+  })
+})
+
+describe('native：批准即解除本次命令的隔离（worker-credential-isolation 5.1，design D4/D5）', () => {
+  test('授权弹窗不预检、不自动放行（策略判定为 auto 也不行）；停下时 hint 带 isolation_escape，classify 标注', async () => {
+    const { precheck, calls } = stub(ALLOW)
+    const s = await start(
+      [APPROVAL],
+      precheck,
+      { hubUrl: 'http://127.0.0.1:7477' },
+      undefined,
+      true,
+    )
+    await s.poll(3)
+    expect(calls).toEqual([])
+    expect(s.enters()).toHaveLength(0)
+    expect(s.texts().some((t) => t.includes('批准即解除本次命令的隔离'))).toBe(true)
+    const [idle] = s.idles()
+    const hint = idle?.data?.hint as Record<string, unknown>
+    expect(hint.isolation_escape).toBe(true)
+    expect(hint).not.toHaveProperty('decision_id')
+    const verdict = classifyCodexOrca({
+      trigger: 'idle',
+      tail: [],
+      idle_ms: 0,
+      hint,
+      contract: taskContract.parse({
+        goal: 'x',
+        workspace: 'ws/product-res',
+        role: 'dev',
+        executor: 'codex-orca',
+      }),
+    })
+    expect(verdict).toMatchObject({ reason: 'awaiting_approval' })
+    expect(verdict?.message).toStartWith('【批准即解除本次命令的隔离】')
+    await s.run.cancel()
+  })
+
+  test('对照：未施加 native 时同一弹窗照常预检并放行', async () => {
+    const { precheck, calls } = stub(ALLOW)
+    const s = await start([APPROVAL, APPROVAL, tuiFixture('working')], precheck)
+    await s.poll(1)
+    expect(calls).toHaveLength(1)
+    expect(s.enters()).toHaveLength(1)
+    await s.run.cancel()
+  })
+
+  test('策略层：带 escapesIsolation 的请求不送中枢判定，直接交给用户（supervisor 档位也不委托）', async () => {
+    let called = 0
+    const precheck = createPolicyPrecheck({
+      client: {
+        policyCheck: async () => {
+          called++
+          return ok({
+            level: 'auto',
+            actions: [{ action: 'tool:CodexCommand', level: 'auto' }],
+            matched_rules: [],
+          } as never)
+        },
+      },
+      taskId: 't-1',
+    })
+    const v = await precheck({
+      tool: CODEX_ORCA_PRECHECK_TOOL,
+      command: 'ls',
+      escapesIsolation: true,
+    })
+    expect(called).toBe(0)
+    expect(v).toEqual({ allow: false, level: 'user', escapes_isolation: true })
+    expect(needsUserText(v as never)).toContain('批准即解除本次命令的隔离')
   })
 })

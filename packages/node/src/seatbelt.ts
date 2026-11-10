@@ -31,8 +31,11 @@ import { recordMdsBaseline } from './mds.ts'
 
 export const SANDBOX_EXEC = '/usr/bin/sandbox-exec'
 
-/** 本阶段已实现的施加层：只有外层 seatbelt。`native`（Codex permissions profile）留给 tasks 5.1。 */
-export const IMPLEMENTED_ISOLATION_LAYERS: readonly IsolationLayer[] = ['seatbelt']
+/**
+ * 已实现的施加层：外层 seatbelt（tasks 4.1–4.4）与 `native`（Codex permissions profile，tasks 5.1，见 `codex-native.ts`）。
+ * `separate_user` 未实现（tasks 5.2）。
+ */
+export const IMPLEMENTED_ISOLATION_LAYERS: readonly IsolationLayer[] = ['seatbelt', 'native']
 
 export interface SeatbeltOptions {
   /** `config/node.yaml` 的 `isolation.enforce`；缺省 false。 */
@@ -72,7 +75,7 @@ export const seatbeltActive = (o?: SeatbeltOptions): o is SeatbeltOptions =>
 
 /**
  * 适配器上报的凭证隔离声明。开关未生效时原样返回（只声明、`enforced: false`）；
- * 生效时只保留已实现的施加层，其余（`native` 等）改为 `none` 并标记 `enforced: true`：未实现的施加层不能显示为已施加。
+ * 生效时只保留已实现的施加层（seatbelt、native），其余（`separate_user` 等）改为 `none` 并标记 `enforced: true`：未实现的施加层不能显示为已施加。
  */
 export function effectiveCredentialIsolation(
   declared: CredentialIsolation,

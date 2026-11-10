@@ -35,6 +35,13 @@ import {
   SEALED_CODEX_HOME,
   sealedCodexHome,
 } from './codex-home.ts'
+import {
+  NATIVE_DROPPED_CONFIG_KEYS,
+  nativeApplies,
+  nativeFailureMessage,
+  prepareCodexNative,
+  roleNetworkEnabled,
+} from './codex-native.ts'
 import { questionMessage } from './codex-orca/classify.ts'
 import { resolveContext } from './codex-orca/spec.ts'
 import { executorRoleEnv } from './env.ts'
@@ -108,6 +115,8 @@ export interface CodexExecOptions {
    * 打开后，角色 `permissions.sandbox` 为 danger-full-access 时子进程经 `sandbox-exec -f <配置> codex …` 启动。
    */
   isolation?: SeatbeltOptions
+  /** native 的 permissions profile 名（测试固定）；缺省每次启动随机（`codexNativeProfileName`）。 */
+  nativeProfileName?: string
 }
 
 const safe = (text: string, max = 16_000) => clipText(redactSecrets(text), max)
@@ -370,6 +379,39 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
         if (finished) return
         let seatbelt: string[] = []
         let scratchEnv: Record<string, string> = {}
+        // native（tasks 5.1）：开关打开且角色沙箱为 workspace-write / read-only 时，以 Codex permissions profile 拒绝受保护路径；
+        // 失败时不启动 Codex。profile 每次启动经 -c 传入（不写共享 CODEX_HOME 的 config.toml），不再传 -s。
+        let native: string[] | undefined
+        const nativeSandbox = nativeApplies(credentialIsolation, role.data, options.isolation)
+        if (nativeSandbox && options.isolation) {
+          const prepared = await prepareCodexNative(options.isolation, {
+            home: options.home,
+            taskId: ctx.taskId,
+            executor: 'codex-exec',
+            codexHome: isolated.data,
+            authSource: source,
+            cwd,
+            access: readRole ? 'read' : 'write',
+            sandbox: nativeSandbox,
+            ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
+            ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
+            ...(roleNetworkEnabled(perms.data.config) ? { networkEnabled: true } : {}),
+            ...(options.nativeProfileName !== undefined
+              ? { profileName: options.nativeProfileName }
+              : {}),
+          })
+          if (finished) return
+          if (!prepared.ok) {
+            finish(
+              ok({
+                outcome: 'failed',
+                result: result(nativeFailureMessage(prepared.error.message), prepared.error.code),
+              }),
+            )
+            return
+          }
+          native = prepared.data.args
+        }
         if (applies && options.isolation) {
           scratchApplied = true
           const common = {
@@ -438,8 +480,11 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
         if (finished) return
         // exec 无 -a 选项、不走交互审批，无需默认覆盖 reviewer。
         const args = [...command.slice(1), 'exec', '--json']
-        for (const [key, value] of Object.entries(perms.data.config))
+        for (const [key, value] of Object.entries(perms.data.config)) {
+          // native：沙箱由 permissions profile 决定，不与 sandbox_mode 混用。
+          if (native && NATIVE_DROPPED_CONFIG_KEYS.includes(key)) continue
           args.push('-c', `${key}=${value}`)
+        }
         args.push(
           '-c',
           codexTaskMcpConfig({ home: options.home, role: role.data.name, taskId: ctx.taskId }),
@@ -447,8 +492,13 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
         for (const value of codexShellEnvPolicyConfig(perms.data.config)) args.push('-c', value)
         if (role.data.model) args.push('-m', role.data.model)
         if (role.data.effort) args.push('-c', `model_reasoning_effort=${role.data.effort}`)
+        if (native) {
+          // native：profile 与选中它的 default_permissions 代替 -s（exec 层的 -c 对 resume 同样生效）。
+          // codex exec 没有交互审批通道；固定 approval_policy=never（纵深防御），不会出现越出沙箱的授权请求（design D4/D5）。
+          args.push(...native, '-c', 'approval_policy="never"')
+        }
         // exec 层的 -s 对 resume 同样生效，且优先于 permissions.config 中的 sandbox_mode。
-        args.push('-s', perms.data.sandbox)
+        else args.push('-s', perms.data.sandbox)
         const start = async (resumeSession?: string) => {
           let prompt =
             resumeSession && ctx.resume

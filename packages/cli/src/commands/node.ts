@@ -20,11 +20,11 @@ import {
   createCodexOrcaExecutor,
   createFakeExecutor,
   createPrMergeExecutor,
+  isolationProbeLaunchWrapper,
   nodeHubClientFromHome,
   resolveOrcaPorts,
   type SeatbeltOptions,
   seatbeltActive,
-  seatbeltProbeLaunchWrapper,
   startNode,
 } from '@raindown/node'
 import { defineCommand } from '../command.ts'
@@ -45,7 +45,7 @@ export const nodeStartCommand = defineCommand({
       return fail('retryable', 'log_rotated', '日志已轮转，等待 launchd 重新启动节点')
     }
     // 外层 seatbelt 开关（config/node.yaml 的 isolation.enforce，缺省 false；worker-credential-isolation 4.1–4.4）。
-    // 关闭时各执行器的启动方式与之前一致、探针以恒等包裹运行；打开时（仅 macOS）探针与 worker 用同一 SBPL 生成函数。
+    // 关闭时各执行器的启动方式与之前一致、探针以恒等包裹运行；打开时（仅 macOS）探针与 worker 用同一 SBPL / permissions profile 生成函数。
     const nodeConfig = await loadNodeConfig(home)
     if (!nodeConfig.ok) return nodeConfig
     // Orca 本机端口只读解析（目录项名 + lsof，不连接 Orca）；未解析时不生成端口规则，探针记为失败（审查第一轮 M2）。
@@ -92,8 +92,9 @@ export const nodeStartCommand = defineCommand({
         ...(isolation.darwinUserCacheDir !== undefined
           ? { darwinUserCacheDir: isolation.darwinUserCacheDir }
           : {}),
+        // seatbelt 目标以 sandbox-exec 运行，native 目标以 `codex sandbox -P` 运行（profile 与 worker 同源，tasks 5.1）。
         ...(seatbeltActive(isolation)
-          ? { launchWrapper: seatbeltProbeLaunchWrapper(isolation) }
+          ? { launchWrapper: isolationProbeLaunchWrapper(isolation) }
           : {}),
       },
     })

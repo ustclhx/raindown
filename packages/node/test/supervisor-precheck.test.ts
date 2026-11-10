@@ -51,6 +51,8 @@ interface Script {
   untrusted?: boolean
   /** 预检两次，却在 hint 里报告第一次（较旧）的判定。 */
   staleDecision?: boolean
+  /** 像 native 下的 codex-orca 一样：请求批准即脱离隔离（预检带 escapesIsolation，hint 带 isolation_escape）。 */
+  isolationEscape?: boolean
   verdicts: PrecheckVerdict[]
   delivered: Array<{ reply_id: string; by: string; kind: string }>
   dropped: string[]
@@ -84,6 +86,7 @@ function scriptedExecutor(s: Omit<Script, 'verdicts' | 'delivered' | 'dropped' |
         command: script.command,
         cwd: worktree,
         ...(script.untrusted ? {} : { workdirTrusted: true }),
+        ...(script.isolationEscape ? { escapesIsolation: true } : {}),
       }
       const message = `等待授权：${script.command}`
       let waiting = false
@@ -92,6 +95,7 @@ function scriptedExecutor(s: Omit<Script, 'verdicts' | 'delivered' | 'dropped' |
           idleSignal(new Date().toISOString(), message, {
             message,
             ...(decisionId === undefined ? {} : { decision_id: decisionId }),
+            ...(script.isolationEscape ? { isolation_escape: true } : {}),
           }),
         )
       void (async () => {
@@ -268,6 +272,18 @@ describe('precheck 与卡住上报', () => {
     expect(bb.task(id).blocked).not.toHaveProperty('no_delegate')
     // 任务分支只上报一次。
     expect(bb.types(id).filter((t) => t === 'task.branch_reported')).toHaveLength(1)
+  })
+
+  test('批准即脱离隔离（native，design D4/D5）：不送中枢判定、不委托 supervisor，以 no_delegate 卡住', async () => {
+    const {
+      bench: bb,
+      id,
+      script,
+    } = await blockedWithDecision({ branch: true, command: PUSH, isolationEscape: true })
+    expect(script.verdicts).toEqual([{ allow: false, level: 'user', escapes_isolation: true }])
+    expect(decisions(bb, id)).toEqual([])
+    expect(bb.task(id).blocked).toMatchObject({ reason: 'awaiting_approval', no_delegate: true })
+    expect(bb.task(id).blocked).not.toHaveProperty('decision_id')
   })
 
   test('执行目录不可信（codex-orca 现状）：不上报环境字段，push_to 不满足，交给用户', async () => {

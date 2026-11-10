@@ -38,6 +38,11 @@ export interface PrecheckRequest {
   workdirTrusted?: boolean
   /** 请求的理由（例如 Codex 弹窗的 Reason 一行）：不送去判定，只随 blocked 的请求文本上报。 */
   reason?: string
+  /**
+   * 批准会让这条命令脱离隔离（native 施加层下 Codex 请求在沙箱之外执行，design D4/D5）：不送中枢判定、不自动放行，
+   * 也不产生 supervisor 判定（没有 decision_id，不能委托），一律交给用户。
+   */
+  escapesIsolation?: boolean
 }
 
 /** 预检结论：allow 表示可在本地放行；否则交给用户。 */
@@ -54,6 +59,8 @@ export type PrecheckVerdict =
       decision_id?: number
       /** 调用失败的原因（错误码与说明），用于活动与日志。 */
       error?: string
+      /** 请求带 `escapesIsolation`：没有送中枢判定，直接交给用户。 */
+      escapes_isolation?: true
     }
 
 /** 绑定了任务 id 的预检函数，经执行器上下文交给执行器。 */
@@ -146,6 +153,9 @@ export function createPolicyPrecheck(o: PolicyPrecheckOptions): Precheck {
   const timeoutMs = o.timeoutMs ?? PRECHECK_TIMEOUT_MS
   return async (req) => {
     if (o.signal?.aborted) return { allow: false, error: 'aborted：任务已取消' }
+    // 越出隔离的请求：策略层不得自动批准（supervisor 档位也不行），不送中枢判定，直接交给用户（design D4/D5）。
+    if (req.escapesIsolation === true)
+      return { allow: false, level: 'user', escapes_isolation: true }
     const controller = new AbortController()
     const onAbort = () => controller.abort()
     o.signal?.addEventListener('abort', onAbort, { once: true })
@@ -213,7 +223,13 @@ export function autoApprovedText(what: string, v: { level: string; actions: stri
 }
 
 /** 预检未放行时写进活动的一句话。 */
-export function needsUserText(v: { level?: string; error?: string }): string {
+export function needsUserText(v: {
+  level?: string
+  error?: string
+  escapes_isolation?: true
+}): string {
+  if (v.escapes_isolation)
+    return '批准即解除本次命令的隔离（native：命令将在 Codex 沙箱之外执行），策略不自动放行，交给用户审批'
   if (v.error) return redactSecrets(`策略预检失败，按需要用户处理：${v.error}`)
   return `策略判定为 ${v.level ?? 'user'}，交给用户审批`
 }

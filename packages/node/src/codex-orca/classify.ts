@@ -1,4 +1,5 @@
 import { redactSecrets } from '@raindown/core'
+import { ISOLATION_ESCAPE_NOTE } from '../codex-native.ts'
 import type { StuckSnapshot, StuckVerdict } from '../executor.ts'
 
 /**
@@ -479,7 +480,14 @@ export function classifyCodexOrca(snapshot: StuckSnapshot): StuckVerdict | null 
   const a = analyzeTail(snapshotTail(snapshot))
   switch (a.kind) {
     case 'awaiting_approval':
-      return { reason: 'awaiting_approval', message: a.message }
+      // native：Codex 的授权请求是在沙箱之外执行，批准即脱离隔离（执行器在 hint 中标注，design D4/D5）。
+      return {
+        reason: 'awaiting_approval',
+        message:
+          snapshot.hint?.isolation_escape === true
+            ? `【${ISOLATION_ESCAPE_NOTE}】${a.message}`
+            : a.message,
+      }
     case 'trust_prompt':
       return {
         reason: 'awaiting_approval',

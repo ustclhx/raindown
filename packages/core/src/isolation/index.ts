@@ -1,4 +1,5 @@
 export * from './capability.ts'
+export * from './codex-profile.ts'
 export * from './orca-setup.ts'
 export * from './paths.ts'
 export * from './probe.ts'

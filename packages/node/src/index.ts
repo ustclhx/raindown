@@ -62,6 +62,14 @@ export {
   sameCodexHome,
 } from './codex-home.ts'
 export {
+  CODEX_NATIVE_MIN_VERSION,
+  checkCodexNativeSupport,
+  codexNativeProfileFromSpec,
+  ISOLATION_ESCAPE_NOTE,
+  nativeApplies,
+  prepareCodexNative,
+} from './codex-native.ts'
+export {
   analyzeTail,
   BUSY_RE,
   classifyCodexOrca,
@@ -157,6 +165,9 @@ export {
   findOrcaSockets,
   type IsolationProbeOptions,
   identityLaunchWrapper,
+  isolationProbeLaunchWrapper,
+  type NativeProbeOptions,
+  nativeProbeLaunchWrapper,
   PROBE_CHILD_SCRIPT,
   type ProbeLaunch,
   type ProbeLaunchWrapper,

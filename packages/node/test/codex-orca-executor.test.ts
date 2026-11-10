@@ -90,6 +90,7 @@ async function start(
     directoryStat?: (path: string) => { isDirectory(): boolean }
     isolation?: SeatbeltOptions
     hubUrl?: string
+    nativeProfileName?: string
   } = {},
 ) {
   h = extra.home ?? orcaHome()
@@ -107,6 +108,7 @@ async function start(
     waitForSetup: async () => ok(undefined),
     ...(extra.directoryStat ? { directoryStat: extra.directoryStat } : {}),
     ...(extra.isolation ? { isolation: extra.isolation } : {}),
+    ...(extra.nativeProfileName ? { nativeProfileName: extra.nativeProfileName } : {}),
   })
   const contract = taskContract.parse({
     goal: '修正 README',
@@ -2460,21 +2462,124 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
     expect(existsSync(join(mds, 'planted.db'))).toBe(false)
   })
 
-  test('开关打开但角色为 workspace-write（native 未实现）：命令不变', async () => {
-    const home = orcaHome()
+  const nativeRole = (home: OrcaHome, extra = '') =>
     writeFileSync(
       join(home.home, 'config/roles/dev.yaml'),
-      'name: dev\nexecutor: codex-orca\nprompt: dev.md\npermissions:\n  approval: on-request\n  sandbox: workspace-write\n',
+      `name: dev\nexecutor: codex-orca\nprompt: dev.md\npermissions:\n  approval: on-request\n  sandbox: workspace-write\n${extra}`,
     )
+  const NATIVE = 'raindown-test'
+
+  test('native 开关关闭：workspace-write 角色的终端命令与之前逐字节一致（快照）', async () => {
+    const home = orcaHome()
+    nativeRole(home)
+    const leaseTokenFile = await token(home, 'l-1')
+    const s = await start({}, (o) => o.show('working'), { home, leaseTokenFile, hubUrl: HUB })
+    await ready(s)
+    const [command] = created(s)
+    expect(norm(command, home)).toMatchSnapshot()
+    expect(command).toContain(' -s workspace-write ')
+    expect(command).not.toContain('default_permissions')
+    await s.run.cancel()
+  })
+
+  test('native（tasks 5.1）：workspace-write 角色不传 -s，改传 permissions profile 与 default_permissions；不包 sandbox-exec', async () => {
+    const home = orcaHome()
+    nativeRole(home, '  config:\n    sandbox_mode: workspace-write\n')
+    const leaseTokenFile = await token(home, 'l-1')
     const s = await start({}, (o) => o.show('working'), {
       home,
+      leaseTokenFile,
       hubUrl: HUB,
+      isolation: on(home),
+      nativeProfileName: NATIVE,
+    })
+    await ready(s)
+    expect(s.outcome()).toBeUndefined()
+    const [command] = created(s)
+    expect(norm(command, home)).toMatchSnapshot()
+    expect(command).not.toContain('sandbox-exec')
+    expect(command).not.toContain(' -s ')
+    expect(command).not.toContain('sandbox_mode=')
+    expect(command).toContain(` -a on-request -c 'permissions.${NATIVE}={extends=":workspace",`)
+    expect(command).toContain(`-c 'default_permissions="${NATIVE}"'`)
+    const realHome = realpathSync(home.home)
+    expect(command).toContain(`"${realHome}"="deny"`)
+    expect(command).toContain(`"${realpathSync(leaseTokenFile)}"="read"`)
+    expect(command).toContain(
+      `"${join(realpathSync(home.root), 'user-codex', 'auth.json')}"="deny"`,
+    )
+    // 执行器级的 CODEX_HOME（不是 seatbelt 的按任务目录），Orca worktree 即工作目录（不建独立 clone）。
+    expect(command).toContain(
+      `CODEX_HOME=${join(home.home, 'run/executors/codex-orca/codex-home')} `,
+    )
+    expect(command).toStartWith(`cd ${home.worktree} && exec env `)
+    expect(existsSync(cloneOf(home))).toBe(false)
+    expect(existsSync(join(home.home, 'state/tasks/t-orca-1/isolation.sb'))).toBe(false)
+    const state = JSON.parse(
+      readFileSync(join(home.home, 'state/tasks/t-orca-1/orca.json'), 'utf8'),
+    )
+    expect(state.isolation_layer).toBe('native')
+    expect(state).not.toHaveProperty('layout')
+    await s.run.cancel()
+  })
+
+  test('native：已施加 native 的终端照常重挂接；未施加的旧终端不重挂接（isolation_not_applied）', async () => {
+    const home = orcaHome()
+    nativeRole(home)
+    const leaseTokenFile = await token(home, 'l-1')
+    const plain = await start({}, (o) => o.show('question'), { home, leaseTokenFile, hubUrl: HUB })
+    await ready(plain)
+    const refused = await start({}, (o) => o.show('question'), {
+      home,
+      leaseTokenFile,
+      hubUrl: HUB,
+      isolation: on(home),
+      nativeProfileName: NATIVE,
+    })
+    await ready(refused)
+    expect(refused.outcome()).toMatchObject({
+      ok: true,
+      data: { outcome: 'failed', result: { reason: 'isolation_not_applied' } },
+    })
+    expect(refused.orca.ops('terminalClose')).toHaveLength(1)
+    const launched = await start({}, (o) => o.show('question'), {
+      home,
+      leaseTokenFile,
+      hubUrl: HUB,
+      isolation: on(home),
+      nativeProfileName: NATIVE,
+    })
+    await ready(launched)
+    expect(created(launched)[0]).toContain('default_permissions')
+    const same = await start({}, (o) => o.show('question'), {
+      home,
+      leaseTokenFile,
+      hubUrl: HUB,
+      isolation: on(home),
+      nativeProfileName: NATIVE,
+    })
+    await ready(same)
+    expect(same.orca.ops('terminalCreate')).toEqual([])
+    expect(same.activity.some((a) => a.text?.includes('接着使用已有的终端'))).toBe(true)
+    await plain.run.cancel()
+    await launched.run.cancel()
+    await same.run.cancel()
+  })
+
+  test('native：无法计算隔离清单（没有中枢地址）时不启动 Codex', async () => {
+    const home = orcaHome()
+    nativeRole(home)
+    const s = await start({}, (o) => o.show('working'), {
+      home,
+      leaseTokenFile: await token(home, 'l-1'),
       isolation: on(home),
     })
     await ready(s)
-    expect(created(s)[0]).not.toContain('sandbox-exec')
-    expect(existsSync(join(home.home, 'state/tasks/t-orca-1/isolation.sb'))).toBe(false)
-    await s.run.cancel()
+    expect(s.outcome()).toMatchObject({
+      ok: true,
+      data: { outcome: 'failed', result: { reason: 'isolation_hub_url_missing' } },
+    })
+    expect(s.orca.ops('terminalCreate')).toEqual([])
   })
 
   test('开关打开：升级前（共享 worktree、未隔离）启动的终端关闭，迁移到独立 clone 后以隔离方式重启', async () => {

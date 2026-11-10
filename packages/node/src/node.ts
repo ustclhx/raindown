@@ -1092,6 +1092,7 @@ class LeaseRunner {
   /**
    * 这次卡住的代回复字段（D15）：
    * - supervisor 的批准刚被拒收：`no_delegate: true`，不带 decision_id；
+   * - 执行器标注批准即脱离隔离（hint 的 `isolation_escape`，native 施加层）：`no_delegate: true`；
    * - 授权卡住且执行器在 hint 中给出 `decision_id`，并且它确实来自本租约的预检：带上 decision_id 与
    *   节点记录的请求文本（工具、命令来自节点发出的预检，不取执行器的说法）；
    * - 其他：不带。
@@ -1105,6 +1106,8 @@ class LeaseRunner {
       this.noDelegateNext = false
       return { no_delegate: true }
     }
+    // 批准即脱离隔离的授权（native，design D5）：supervisor 不得代批，只能转给用户。
+    if (hint?.isolation_escape === true) return { no_delegate: true }
     if (reason !== 'awaiting_approval') return {}
     const id = hint?.decision_id
     if (typeof id !== 'number' || !Number.isInteger(id)) return {}
