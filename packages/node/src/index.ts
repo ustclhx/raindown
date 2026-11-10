@@ -186,6 +186,7 @@ export {
   type MdsVerification,
   mdsBaselineHeld,
   mdsBaselinePath,
+  mdsKnownGoodPath,
   mdsNoticesDir,
   queueMdsNotice,
   recordMdsBaseline,

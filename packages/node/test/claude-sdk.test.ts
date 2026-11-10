@@ -2175,6 +2175,32 @@ describe('外层 seatbelt（worker-credential-isolation 4.4）', () => {
     expect(out.join('')).toBe('hello-arg\n')
   })
 
+  test('seatbeltSpawner（审查第四轮）：会话进程正常结束时结束整个进程组，后台子进程不比会话活得更久', async () => {
+    const s = seatbeltHome()
+    const fake = join(s.root, 'fake-sandbox-exec.sh')
+    writeFileSync(fake, '#!/bin/sh\nshift 2\nexec "$@"\n', { mode: 0o755 })
+    const pidFile = join(s.root, 'bg.pid')
+    const spawnFn = seatbeltSpawner([fake, '-f', '/x/isolation.sb'])
+    const child = spawnFn({
+      command: '/bin/sh',
+      args: ['-c', `/bin/sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '${pidFile}'; exit 0`],
+      cwd: s.root,
+      env: { PATH: process.env.PATH },
+      signal: new AbortController().signal,
+    })
+    const code = await new Promise<number | null>((resolve) => child.once('exit', resolve))
+    expect(code).toBe(0)
+    const pid = Number(readFileSync(pidFile, 'utf8'))
+    await waitFor(() => {
+      try {
+        process.kill(pid, 0)
+        return false
+      } catch {
+        return true
+      }
+    }, '后台子进程被结束')
+  })
+
   test('seatbeltSpawner：sandbox-exec 不存在时只发出 error，原因写入 stderr 回调（审查第一轮 L2）', async () => {
     const errs: string[] = []
     const spawnFn = seatbeltSpawner(['/nonexistent/sandbox-exec', '-f', '/x.sb'], (d) =>

@@ -178,6 +178,11 @@ export interface StartNodeOptions {
   isolationProbe?: IsolationProbeNodeOptions
   /** 待送达的 mds 重置通知的重试间隔；缺省 `MDS_NOTICE_RETRY_MS`（5 分钟）。 */
   mdsNoticeRetryMs?: number
+  /**
+   * 外层 seatbelt 是否在本机生效（`isolation.enforce` 打开且在 macOS 上）。只有生效或启动时已有待送达的通知时才启动
+   * mds 通知的定期重试（审查第四轮：开关关闭时行为严格不变）。
+   */
+  isolationActive?: boolean
 }
 
 export interface IsolationProbeNodeOptions
@@ -2155,7 +2160,8 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
     if (hasPendingMdsNotices(home)) void deliverPendingMdsNotices({ home, nodeId, client, logger })
     cancelMdsRetry = clock.setTimeout(retryMdsNotices, mdsRetryMs)
   }
-  cancelMdsRetry = clock.setTimeout(retryMdsNotices, mdsRetryMs)
+  if (options.isolationActive || hasPendingMdsNotices(home))
+    cancelMdsRetry = clock.setTimeout(retryMdsNotices, mdsRetryMs)
 
   // 执行器的启动清理（例如移除审查任务残留的 worktree）在领取任务之前完成。
   const prepared = (async () => {

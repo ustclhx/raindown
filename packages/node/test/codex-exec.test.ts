@@ -924,6 +924,42 @@ describe('外层 seatbelt（worker-credential-isolation 4.3）', () => {
     expect(existsSync(join(s.home, 'state/tasks/t-test/isolation.sb'))).toBe(false)
   })
 
+  test('审查第四轮：施加外层 seatbelt 时 Codex 正常结束也结束整个进程组（后台子进程不比 harness 活得更久）；开关关闭时不变', async () => {
+    for (const enforce of [true, false]) {
+      const body = `
+const bg = spawn('/bin/sleep', ['30'], { stdio: 'ignore' })
+bg.unref()
+fs.writeFileSync(${JSON.stringify('PIDFILE')}, String(bg.pid))
+send(resumed)
+`
+      const s0 = setup('send(resumed)', dfa)
+      const pidFile = join(s0.dir, `bg-${enforce}.pid`)
+      const s = setup(body.replace('PIDFILE', pidFile), dfa)
+      const fake = fakeSandboxExec(s.dir)
+      const { outcome } = await collect(
+        s.run(
+          { ...s.ctx, hubUrl },
+          { ...s.options, isolation: isolation(s, fake.script, enforce) },
+        ),
+      )
+      expect(outcome.outcome).toBe('done')
+      const pid = Number(readFileSync(pidFile, 'utf8'))
+      const alive = () => {
+        try {
+          process.kill(pid, 0)
+          return true
+        } catch {
+          return false
+        }
+      }
+      if (enforce) await waitFor(() => !alive(), '后台子进程被结束')
+      else {
+        expect(alive()).toBe(true)
+        process.kill(pid, 'SIGKILL')
+      }
+    }
+  })
+
   test('开关打开、danger-full-access：子进程经 sandbox-exec -f <配置> codex … 启动，配置 0600', async () => {
     const s = setup('send(resumed)', dfa)
     const fake = fakeSandboxExec(s.dir)

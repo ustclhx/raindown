@@ -149,7 +149,7 @@ test('mds 重置通知在租约结束之后仍送达（审查第一轮）：已�
   expect(events).toHaveLength(1)
   expect(events[0]?.payload).toMatchObject({ kind: 'mds_reset', files: ['mdsDirectory.db'] })
   expect(b.events(second).filter((event) => event.type === 'task.out_of_band')).toHaveLength(0)
-  expect(hasPendingMdsNotices(b.home)).toBe(false)
+  await waitFor(() => !hasPendingMdsNotices(b.home), '送达后删除通知')
 })
 
 test('中枢暂时不可达（审查第二轮）：执行照常结束，通知保留到下一次送达', async () => {
@@ -178,7 +178,7 @@ test('中枢暂时不可达（审查第二轮）：执行照常结束，通知�
 
 test('审查第三轮：待送达的通知定期重试，节点空闲时中枢恢复后也能送达', async () => {
   let down = true
-  const b = await bench({ mdsNoticeRetryMs: 60_000 }, 60, (url) => {
+  const b = await bench({ mdsNoticeRetryMs: 60_000, isolationActive: true }, 60, (url) => {
     if (!url.includes('/isolation-notices') || !down) return undefined
     return new Response(
       JSON.stringify({
@@ -202,5 +202,21 @@ test('审查第三轮：待送达的通知定期重试，节点空闲时中枢�
     () => b.events(first).some((event) => event.type === 'task.out_of_band'),
     '定期重试送达',
   )
-  expect(hasPendingMdsNotices(b.home)).toBe(false)
+  await waitFor(() => !hasPendingMdsNotices(b.home), '送达后删除通知')
+})
+
+test('审查第四轮：外层 seatbelt 未生效、启动时没有待送达通知时不启动定期重试', async () => {
+  let sent = 0
+  const b = await bench({ mdsNoticeRetryMs: 60_000 }, 60, (url) => {
+    if (url.includes('/isolation-notices')) sent++
+    return undefined
+  })
+  current = b
+  const first = await b.create()
+  await b.until(first, (task) => task.status === 'done')
+  await queueMdsNotice(b.home, first, ['mdsDirectory.db'])
+  for (let i = 0; i < 3; i++) await b.clock.advance(60_000)
+  await new Promise((r) => setTimeout(r, 50))
+  expect(sent).toBe(0)
+  expect(hasPendingMdsNotices(b.home)).toBe(true)
 })

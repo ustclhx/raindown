@@ -24,6 +24,7 @@ import {
   type MdsNotice,
   mdsBaselineHeld,
   mdsBaselinePath,
+  mdsKnownGoodPath,
   mdsNoticesDir,
   prepareSeatbelt,
   queueMdsNotice,
@@ -394,5 +395,69 @@ describe('审查第三轮：基线只保存已知良好的哈希，通知去重'
         repeats: { 'mdsObject.db': MDS_REPEAT_ESCALATE + 1 },
       },
     ])
+  })
+})
+
+describe('审查第四轮：节点级的已知良好快照', () => {
+  test('审查者的序列：B 结束校验之后，B 逃出的子进程写入 EVIL；A 启动时重置，只有一条通知（记在 B 名下）', async () => {
+    const e = await env()
+    const file = join(e.mds, 'mdsDirectory.db')
+    await recordMdsBaseline(e.home, 't-b', e.mds)
+    // 第一次记录基线时建立已知良好快照。
+    expect(existsSync(mdsKnownGoodPath(e.home))).toBe(true)
+    expect((await verifyMdsBaseline(e.home, 't-b'))?.reset).toEqual([])
+    // B 已没有基线；它用 setsid / nohup 逃出的子进程此时写入。
+    await writeFile(file, 'EVIL')
+    await recordMdsBaseline(e.home, 't-a', e.mds)
+    expect(existsSync(file)).toBe(false)
+    expect(await notices(e.home)).toEqual([{ task: 't-b', files: ['mdsDirectory.db'] }])
+    // A 的基线复制已知良好的哈希，不会把 EVIL 当作已知良好。
+    const kg = JSON.parse(readFileSync(mdsKnownGoodPath(e.home), 'utf8'))
+    const a = JSON.parse(readFileSync(mdsBaselinePath(e.home, 't-a'), 'utf8'))
+    expect(a.entries).toEqual(kg.entries)
+    // macOS 以原内容重建：A 结束时没有变化。
+    await writeFile(file, 'DIRECTORY-v1')
+    expect((await verifyMdsBaseline(e.home, 't-a'))?.reset).toEqual([])
+    expect((await notices(e.home)).length).toBe(1)
+  })
+
+  test('启动竞争（第四轮 3）：新基线用已知良好的哈希，记录前后被写入的内容在结束校验时重置', async () => {
+    const e = await env()
+    const file = join(e.mds, 'mdsObject.db')
+    await recordMdsBaseline(e.home, 't-seed', e.mds)
+    await verifyMdsBaseline(e.home, 't-seed')
+    await recordMdsBaseline(e.home, 't-a', e.mds)
+    // 模拟：比较与记录之间（或刚记录后）worker 写入。
+    await writeFile(file, 'written-mid-launch')
+    expect((await verifyMdsBaseline(e.home, 't-a'))?.reset).toEqual(['mdsObject.db'])
+  })
+
+  test('节点启动：没有基线时也按已知良好快照比较并重置', async () => {
+    const e = await env()
+    await recordMdsBaseline(e.home, 't-b', e.mds)
+    await verifyMdsBaseline(e.home, 't-b')
+    await writeFile(join(e.mds, 'planted.db'), 'x')
+    await writeFile(join(e.mds, 'mdsObject.db'), 'tampered')
+    await sweepStaleMdsBaselines(e.home)
+    expect((await readdir(e.mds)).sort()).toEqual(['mds.lock', 'mdsDirectory.db'])
+    expect(await notices(e.home)).toEqual([{ task: 't-b', files: ['mdsObject.db', 'planted.db'] }])
+  })
+
+  test('已知良好快照只在没有任何基线、且校验无差异时更新；有基线运行时不更新', async () => {
+    const e = await env()
+    await recordMdsBaseline(e.home, 't-a', e.mds)
+    await recordMdsBaseline(e.home, 't-b', e.mds, { hold: true })
+    const before = readFileSync(mdsKnownGoodPath(e.home), 'utf8')
+    await verifyMdsBaseline(e.home, 't-a')
+    // t-b 仍 hold：快照内容不变（只记下最近结束的任务）。
+    const mid = JSON.parse(readFileSync(mdsKnownGoodPath(e.home), 'utf8'))
+    expect(mid.entries).toEqual(JSON.parse(before).entries)
+    expect(mid.updated_at).toBe(JSON.parse(before).updated_at)
+    expect(mid.last_task).toBe('t-a')
+    await setMdsBaselineHold(e.home, 't-b', false)
+    await verifyMdsBaseline(e.home, 't-b')
+    const after = JSON.parse(readFileSync(mdsKnownGoodPath(e.home), 'utf8'))
+    expect(after.last_task).toBe('t-b')
+    expect(after.entries).toEqual(mid.entries)
   })
 })

@@ -81,6 +81,8 @@ export const nodeStartCommand = defineCommand({
         // 不调用模型，按确定性条件合并 PR（add-m1-supervisor D10）。
         createPrMergeExecutor({ home }),
       ],
+      // 外层 seatbelt 生效时才定期重试 mds 重置通知（开关关闭时不启动定时器）。
+      isolationActive: seatbeltActive(isolation),
       // 隔离自检探针：启动时、每 6 小时、macOS 版本变化时运行，结果随注册上报（worker-credential-isolation 3.1）。
       // 探针只判断受保护文件能否打开，不读取内容。
       isolationProbe: {

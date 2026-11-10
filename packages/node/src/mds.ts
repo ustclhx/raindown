@@ -69,6 +69,39 @@ const baselineSchema = z.strictObject({
 })
 type MdsEntry = z.infer<typeof entrySchema>
 type MdsBaseline = z.infer<typeof baselineSchema>
+const counterSchema = z.strictObject({
+  resets: z.record(z.string(), z.number().int().min(1)).optional(),
+  escalated: z.boolean().optional(),
+})
+type ResetCounter = z.infer<typeof counterSchema>
+/**
+ * 节点级的已知良好快照（审查第四轮）：`state/mds-known-good.json`（worker 读写都被拒绝）。由第一次记录的基线建立；
+ * 每次记录新基线、节点启动时先把当前的 mds 与它比较并重置差异；新基线直接复制它的哈希（不取当前内容）。
+ * 只在没有任何基线（运行中或 hold）时、且一次校验没有任何差异时更新。`last_task`：最近结束的基线所属任务——
+ * 之后才发现的差异（例如逃出进程组的子进程在基线结束后写入）记在它名下。`counters`：按任务的通知去重计数。
+ */
+const knownGoodSchema = z.strictObject({
+  version: z.literal(1),
+  dir: z.string().min(1),
+  updated_at: z.string(),
+  entries: z.record(z.string(), entrySchema),
+  last_task: z.string().optional(),
+  counters: z.record(z.string(), counterSchema).optional(),
+})
+type KnownGood = z.infer<typeof knownGoodSchema>
+export const mdsKnownGoodPath = (home: string) =>
+  join(raindownPaths(home).state, 'mds-known-good.json')
+
+async function readKnownGood(home: string, dir: string): Promise<KnownGood | undefined> {
+  try {
+    const path = mdsKnownGoodPath(home)
+    if (!(await lstat(path)).isFile()) return undefined
+    const parsed = knownGoodSchema.safeParse(JSON.parse(await readFile(path, 'utf8')))
+    return parsed.success && parsed.data.dir === dir ? parsed.data : undefined
+  } catch {
+    return undefined
+  }
+}
 const noticeSchema = z.strictObject({ task_id: z.string().min(1), signal: mdsResetSignal })
 export type MdsNotice = z.infer<typeof noticeSchema>
 
@@ -267,12 +300,12 @@ export async function queueMdsNotice(
  * 记下一次重置（审查第三轮）：累计本基线各文件的重置次数；第一次重置的文件发一条通知，之后只计数；
  * 有文件超过 `MDS_REPEAT_ESCALATE` 次且本基线还没升级过时，另发一条“反复重置”通知。返回更新后的基线。
  */
-async function countResets(
+async function countResets<T extends ResetCounter>(
   home: string,
   taskId: string,
-  baseline: MdsBaseline,
+  baseline: T,
   names: readonly string[],
-): Promise<MdsBaseline> {
+): Promise<T> {
   if (names.length === 0) return baseline
   const resets = { ...(baseline.resets ?? {}) }
   const first: string[] = []
@@ -396,24 +429,46 @@ async function dirIntact(dir: string): Promise<boolean> {
  * 启动新 harness 前（审查第一轮）：把当前的 `mds/` 与全部已有基线（任何任务，含本任务）比较，有变化的条目先重置，
  * 并按基线记下重置（通知去重，见 `countResets`）。基线的已知良好哈希不变（审查第三轮）。返回被重置的条目名。
  */
-async function crossCheck(home: string, mdsDir: string): Promise<string[]> {
+async function crossCheck(home: string, mdsDir: string, launchingTask?: string): Promise<string[]> {
   const baselines = (await allBaselines(home)).filter((b) => b.baseline.dir === mdsDir)
-  if (baselines.length === 0 || !(await dirIntact(mdsDir))) return []
+  const kg = await readKnownGood(home, mdsDir)
+  if ((baselines.length === 0 && !kg) || !(await dirIntact(mdsDir))) return []
   const current = await snapshotMds(mdsDir)
   const perTask = baselines.map((b) => ({
     ...b,
     changed: compareEntries(current, b.baseline.entries),
   }))
-  const union = [...new Set(perTask.flatMap((p) => p.changed))].sort()
+  // 已知良好快照（审查第四轮）：没有基线覆盖的时间段里（例如逃出进程组的子进程在基线结束后写入）发生的改动也能发现。
+  const kgChanged = kg ? compareEntries(current, kg.entries) : []
+  const union = [...new Set([...perTask.flatMap((p) => p.changed), ...kgChanged])].sort()
   if (union.length === 0) return []
   const { reset, failed } = await resetEntries(mdsDir, union)
+  const done = (n: string) => reset.includes(n) || failed.includes(n)
   for (const p of perTask) {
-    const files = p.changed.filter((n) => reset.includes(n) || failed.includes(n))
+    const files = p.changed.filter(done)
     if (files.length === 0) continue
     const next = await countResets(home, p.taskId, p.baseline, files)
     await writeState(home, mdsBaselinePath(home, p.taskId), next)
   }
+  // 只有已知良好快照发现的差异：记在最近结束的基线所属任务名下（没有时记在正要启动的任务名下）。
+  const attributed = new Set(perTask.flatMap((p) => p.changed))
+  const kgOnly = kgChanged.filter((n) => !attributed.has(n) && done(n))
+  const owner = kg?.last_task ?? launchingTask
+  if (kg && kgOnly.length > 0 && owner) await countKnownGood(home, kg, owner, kgOnly)
   return reset
+}
+
+/** 已知良好快照发现的重置：按任务去重计数（与基线相同的规则）。 */
+async function countKnownGood(
+  home: string,
+  kg: KnownGood,
+  taskId: string,
+  names: readonly string[],
+): Promise<void> {
+  const fresh = (await readKnownGood(home, kg.dir)) ?? kg
+  const counters = { ...(fresh.counters ?? {}) }
+  counters[taskId] = await countResets(home, taskId, counters[taskId] ?? {}, names)
+  await writeState(home, mdsKnownGoodPath(home), { ...fresh, counters })
 }
 
 /**
@@ -429,23 +484,34 @@ export async function recordMdsBaseline(
 ): Promise<void> {
   if (!SAFE_SEGMENT.test(taskId)) throw new Error('任务 id 不合法')
   if (!isAbsolute(mdsDir)) throw new Error(`mds 目录不是绝对路径：${mdsDir}`)
-  await crossCheck(home, mdsDir)
+  await crossCheck(home, mdsDir, taskId)
   const path = mdsBaselinePath(home, taskId)
   const existing = await readBaseline(path).catch(() => undefined)
   if (existing && existing.dir === mdsDir) {
     if (o.hold && !existing.hold) await writeState(home, path, { ...existing, hold: true })
     return
   }
-  const entries = await snapshotMds(mdsDir)
-  for (const { baseline } of await allBaselines(home)) {
-    if (baseline.dir !== mdsDir) continue
-    for (const [name, entry] of Object.entries(baseline.entries))
-      if (entry.type === 'file' && entries[name] === undefined) entries[name] = entry
+  const now = (o.now ?? (() => new Date()))().toISOString()
+  const kg = await readKnownGood(home, mdsDir)
+  let entries: Record<string, MdsEntry>
+  if (kg) {
+    // 新基线复制已知良好的哈希，不取当前内容（审查第四轮：比较之后、记录之前被写入的内容不会被当作已知良好）。
+    entries = { ...kg.entries }
+  } else {
+    entries = await snapshotMds(mdsDir)
+    for (const { baseline } of await allBaselines(home)) {
+      if (baseline.dir !== mdsDir) continue
+      for (const [name, entry] of Object.entries(baseline.entries))
+        if (entry.type === 'file' && entries[name] === undefined) entries[name] = entry
+    }
+    // 第一次记录基线：同时建立已知良好快照。
+    const seed: KnownGood = { version: 1, dir: mdsDir, updated_at: now, entries }
+    await writeState(home, mdsKnownGoodPath(home), seed)
   }
   const baseline: MdsBaseline = {
     version: 1,
     dir: mdsDir,
-    recorded_at: (o.now ?? (() => new Date()))().toISOString(),
+    recorded_at: now,
     ...(o.hold ? { hold: true } : {}),
     entries,
   }
@@ -530,8 +596,35 @@ export async function verifyMdsBaseline(
     if (!o.keep) {
       await summarizeRepeats(home, taskId, current).catch(() => {})
       await rm(path, { force: true }).catch(() => {})
+      const clean = !result.dirReplaced && result.reset.length === 0 && result.failed.length === 0
+      await afterBaselineEnded(home, dir, taskId, clean).catch(() => {})
     }
   }
+}
+
+/**
+ * 基线结束后（审查第四轮）：已知良好快照记下最近结束的任务；这次校验没有差异、且本 home 上已没有任何基线（运行中或 hold）时，
+ * 再与已知良好快照比较一次，仍没有差异才更新它（加入新出现、内容一致的条目；缺失的保留原哈希）。
+ */
+async function afterBaselineEnded(
+  home: string,
+  dir: string,
+  taskId: string,
+  clean: boolean,
+): Promise<void> {
+  const kg = await readKnownGood(home, dir)
+  if (!kg) return
+  let next: KnownGood = { ...kg, last_task: taskId }
+  if (
+    clean &&
+    (await allBaselines(home)).every((b) => b.baseline.dir !== dir) &&
+    (await dirIntact(dir))
+  ) {
+    const live = await snapshotMds(dir)
+    if (compareEntries(live, kg.entries).length === 0)
+      next = { ...next, entries: { ...kg.entries, ...live }, updated_at: new Date().toISOString() }
+  }
+  await writeState(home, mdsKnownGoodPath(home), next)
 }
 
 /**
@@ -540,6 +633,14 @@ export async function verifyMdsBaseline(
  */
 export async function sweepStaleMdsBaselines(home: string): Promise<string[]> {
   const done: string[] = []
+  // 先按已知良好快照比较并重置（审查第四轮）：节点停止期间或基线结束之后的改动。
+  const kgPath = mdsKnownGoodPath(home)
+  try {
+    const raw = knownGoodSchema.safeParse(JSON.parse(await readFile(kgPath, 'utf8')))
+    if (raw.success) await crossCheck(home, raw.data.dir)
+  } catch {
+    // 没有已知良好快照：只校验基线。
+  }
   for (const { taskId, baseline } of await allBaselines(home)) {
     await verifyMdsBaseline(home, taskId, { force: true, keep: baseline.hold === true })
     done.push(taskId)
