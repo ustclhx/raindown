@@ -156,7 +156,7 @@ seatbelt 的规则后者优先，允许项写得最窄（具体文件，而不�
 - [写白名单内仍可被利用的位置（4.6 与审查第一轮后的残留）]
   - **auth.json**：worker 可以经链接改写用户的 `~/.codex/auth.json`（换成攻击者账号的凭证）。Codex 在进程内刷新凭证且刷新令牌会轮换，改由节点刷新目前不可行。
   - **登录钥匙串**：claude-sdk 下 worker 可以损坏或替换 `login.keychain-db`。
-  - **pnpm 锁目录**：`/private/tmp/pnpm-*-locks-<uid>` 与沙箱外的 pnpm 共用。worker 可以在其中预埋文件或符号链接，造成锁竞争（沙箱外的 pnpm 等待或失败），或经符号链接让沙箱外的 pnpm 在别处创建空的锁文件。不能借此执行代码，记为低风险并接受。
+  - **pnpm 锁目录**：`/private/tmp/pnpm-*-locks-<uid>` 与沙箱外的 pnpm 共用。锁文件名可由 store 路径推算（`store-operation-locks-<uid>/sha256(<storeDir>/v11).lock` 等），worker 可以在其中预埋文件、符号链接或硬链接，或把锁目录换成符号链接。pnpm 12.8.1 实测拒绝符号链接与非本人普通文件的锁、拒绝非真实目录的锁目录，不经链接写入或截断目标；后果只是沙箱外的 pnpm 等待或失败（拒绝服务），持续到删除 `/private/tmp/pnpm-*-locks-<uid>` 中的异常条目为止。不能借此写文件或执行代码，记为低风险并接受。
   - **偏好设置**：经 cfprefsd 的偏好设置写入拦不住，例如终端应用的启动命令（`user-preference-write` 实测无效）；拒绝 cfprefsd 的 mach-lookup 可能影响 `security`，未验证。
   - **会话记录**：独立 CODEX_HOME 与按任务的 Claude 配置目录中的会话记录可被改写（提示注入，不是命令执行）。
   - **Codex 项目配置**：预置信任后，Codex 会加载 clone 内的 `.codex/config.toml`。`notify`、`model_provider` 用命令行固定，`.codex/` 出现即停下，但 `model_providers` 表、`mcp_servers` 等覆盖不了的项，在出现到下一次检查之间可能生效；它们只在外层 seatbelt 内生效（审查第二轮 L2）。

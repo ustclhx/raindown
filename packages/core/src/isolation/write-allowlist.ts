@@ -81,7 +81,7 @@ export const PNPM_LOCK_DIR_NAMES = ['dir', 'store-operation', 'verify-deps-insta
  * pnpm 12 的锁目录（`/private/tmp/pnpm-(dir|store-operation|verify-deps-install)-locks-<uid>` 及其内容）：
  * 不放行时 `pnpm install` 报 `ERR_PNPM_STORE_DIR_OPEN_OPERATION_LOCK`。只放行这三个目录，`/private/tmp` 其余位置仍拒绝。
  * uid 只接受非负整数（来自 `process.getuid()`），不接受外部字符串。
- * 残留风险：这些目录与沙箱外的 pnpm 共用，worker 可以在其中预埋文件或符号链接（锁竞争、经链接创建空文件），见 design Risks。
+ * 残留风险：这些目录与沙箱外的 pnpm 共用，worker 可以在其中预埋文件或符号链接（只能造成沙箱外 pnpm 等待或失败；pnpm 12 拒绝链接形式的锁，不经链接写入），见 design Risks。
  */
 export function pnpmLockWriteRegex(uid: number): string {
   if (!Number.isSafeInteger(uid) || uid < 0) throw new Error(`uid 不合法：${JSON.stringify(uid)}`)
