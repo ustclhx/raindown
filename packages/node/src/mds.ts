@@ -32,6 +32,7 @@ import { z } from 'zod'
  *   重置只删除这些条目本身（不跟随符号链接；目录条目递归删除也不跟随其中的链接；`mds/` 目录本身保留），macOS 会自动重建。
  * - 通知只含文件名：先写进 `state/mds-notices/`（worker 不可写），再由节点经 `POST /v1/nodes/:id/isolation-notices` 送达中枢
  *   （不依赖租约；失败的保留到下一次送达），中枢写任务事件与 Digest 收件箱条目。
+ * - 重置后同一目录的全部基线把这些条目标记为 `reset`（审查第二轮）：之后 macOS 重建的普通文件被采纳为新的基线内容，不再反复重置。
  * 沙箱外的进程在此期间合法更新这些文件同样会触发重置（重建无害）。
  */
 
@@ -49,6 +50,8 @@ const NOTICE_FILE = /^[0-9a-f-]{36}\.json$/
 const entrySchema = z.union([
   z.strictObject({ type: z.literal('file'), sha256: z.string().regex(/^[0-9a-f]{64}$/) }),
   z.strictObject({ type: z.literal('other') }),
+  // 节点重置过的条目（审查第二轮）：之后出现的普通文件视为 macOS 重建，比较时采纳为新的基线，不再重置。
+  z.strictObject({ type: z.literal('reset') }),
 ])
 const baselineSchema = z.strictObject({
   version: z.literal(1),
@@ -126,23 +129,46 @@ export async function snapshotMds(dir: string): Promise<Record<string, MdsEntry>
   return out
 }
 
-/** 相对基线有变化的条目名：内容变化、新增、非普通文件或过大。 */
-function changedEntries(
+/**
+ * 与基线比较：`changed` 为内容变化、新增、非普通文件或过大的条目名；`adopted` 为基线中标记为已重置（`reset`）、
+ * 现在又出现的普通文件——macOS 重建的结果，采纳为新的基线条目，不视为变化（审查第二轮）。
+ */
+function compareEntries(
   current: Record<string, MdsEntry>,
   baseline: Record<string, MdsEntry>,
-): string[] {
-  return Object.entries(current)
-    .filter(([name, entry]) => {
-      const before = baseline[name]
-      return (
-        entry.type !== 'file' ||
-        before === undefined ||
-        before.type !== 'file' ||
-        before.sha256 !== entry.sha256
-      )
-    })
-    .map(([name]) => name)
+): { changed: string[]; adopted: Record<string, MdsEntry> } {
+  const changed: string[] = []
+  const adopted: Record<string, MdsEntry> = {}
+  for (const [name, entry] of Object.entries(current)) {
+    const before = baseline[name]
+    if (entry.type === 'file' && before?.type === 'reset') {
+      adopted[name] = entry
+      continue
+    }
+    if (
+      entry.type !== 'file' ||
+      before === undefined ||
+      before.type !== 'file' ||
+      before.sha256 !== entry.sha256
+    )
+      changed.push(name)
+  }
+  return { changed, adopted }
 }
+
+/** 更新后的基线条目：采纳重建的文件，并把这次重置（或删除失败）的条目标记为 `reset`。 */
+function refreshedEntries(
+  entries: Record<string, MdsEntry>,
+  adopted: Record<string, MdsEntry>,
+  resetNames: readonly string[],
+): Record<string, MdsEntry> {
+  const next: Record<string, MdsEntry> = { ...entries, ...adopted }
+  for (const name of resetNames) next[name] = { type: 'reset' }
+  return next
+}
+
+const sameEntries = (a: Record<string, MdsEntry>, b: Record<string, MdsEntry>) =>
+  JSON.stringify(Object.entries(a).sort()) === JSON.stringify(Object.entries(b).sort())
 
 /**
  * 删除条目本身：外层 seatbelt 只允许在 `mds/` 中新建普通文件，非普通条目只可能来自沙箱外；仍按类型处理且从不跟随链接——
@@ -321,8 +347,27 @@ async function dirIntact(dir: string): Promise<boolean> {
 }
 
 /**
+ * 把一次重置同步到同一 mds 目录的全部基线（审查第二轮）：重置的条目标记为 `reset`（之后 macOS 重建的文件被采纳、不再重置），
+ * 并写入各基线自己采纳的重建文件。`except` 的基线由调用方处理（例如马上删除）。
+ */
+async function refreshBaselines(
+  home: string,
+  mdsDir: string,
+  resetNames: readonly string[],
+  adoptedByTask: ReadonlyMap<string, Record<string, MdsEntry>> = new Map(),
+  except?: string,
+): Promise<void> {
+  for (const { taskId, baseline } of await allBaselines(home)) {
+    if (baseline.dir !== mdsDir || taskId === except) continue
+    const next = refreshedEntries(baseline.entries, adoptedByTask.get(taskId) ?? {}, resetNames)
+    if (!sameEntries(next, baseline.entries))
+      await writeState(home, mdsBaselinePath(home, taskId), { ...baseline, entries: next })
+  }
+}
+
+/**
  * 启动新 harness 前（审查第一轮）：把当前的 `mds/` 与全部已有基线（任何任务，含本任务）比较，有变化的条目先重置，
- * 并为每个看到变化的基线所属任务记一条通知。返回被重置的条目名。
+ * 并为每个看到变化的基线所属任务记一条通知；随后刷新全部基线（审查第二轮）。返回被重置的条目名。
  */
 async function crossCheck(home: string, mdsDir: string): Promise<string[]> {
   const baselines = (await allBaselines(home)).filter((b) => b.baseline.dir === mdsDir)
@@ -330,20 +375,30 @@ async function crossCheck(home: string, mdsDir: string): Promise<string[]> {
   const current = await snapshotMds(mdsDir)
   const perTask = baselines.map((b) => ({
     taskId: b.taskId,
-    changed: changedEntries(current, b.baseline.entries),
+    ...compareEntries(current, b.baseline.entries),
   }))
   const union = [...new Set(perTask.flatMap((p) => p.changed))].sort()
-  if (union.length === 0) return []
-  const { reset, failed } = await resetEntries(mdsDir, union)
+  const { reset, failed } = union.length
+    ? await resetEntries(mdsDir, union)
+    : { reset: [], failed: [] }
   for (const p of perTask) {
     const files = p.changed.filter((n) => reset.includes(n) || failed.includes(n))
     if (files.length > 0) await queueMdsNotice(home, p.taskId, files)
   }
+  // 重置的条目从各基线的采纳中去掉（它们已被删除）。
+  const adopted = new Map(
+    perTask.map((p) => [
+      p.taskId,
+      Object.fromEntries(Object.entries(p.adopted).filter(([n]) => !union.includes(n))),
+    ]),
+  )
+  await refreshBaselines(home, mdsDir, [...reset, ...failed], adopted)
   return reset
 }
 
 /**
  * harness 启动前记录 `mds/` 的基线（见模块说明）：先与全部已有基线比较并重置，再记录本任务的基线（已有时保留，`hold` 只会被打开）。
+ * 新基线沿用其他基线中仍未重建的 `reset` 标记：这些条目之后由 macOS 重建时同样被采纳（审查第二轮）。
  * `mdsDir` 必须是绝对路径（节点由已校验的 `DARWIN_USER_CACHE_DIR` 得到，测试注入）。
  */
 export async function recordMdsBaseline(
@@ -361,12 +416,18 @@ export async function recordMdsBaseline(
     if (o.hold && !existing.hold) await writeState(home, path, { ...existing, hold: true })
     return
   }
+  const entries = await snapshotMds(mdsDir)
+  for (const { baseline } of await allBaselines(home)) {
+    if (baseline.dir !== mdsDir) continue
+    for (const [name, entry] of Object.entries(baseline.entries))
+      if (entry.type === 'reset' && entries[name] === undefined) entries[name] = { type: 'reset' }
+  }
   const baseline: MdsBaseline = {
     version: 1,
     dir: mdsDir,
     recorded_at: (o.now ?? (() => new Date()))().toISOString(),
     ...(o.hold ? { hold: true } : {}),
-    entries: await snapshotMds(mdsDir),
+    entries,
   }
   await writeState(home, path, baseline)
 }
@@ -383,6 +444,11 @@ export async function setMdsBaselineHold(
   if (!existing || (existing.hold ?? false) === hold) return
   const { hold: _drop, ...rest } = existing
   await writeState(home, path, hold ? { ...rest, hold: true } : rest)
+}
+
+/** 被 `hold` 的基线所属任务（codex-orca 启动时检查其终端是否仍在运行）。 */
+export async function heldMdsBaselines(home: string): Promise<string[]> {
+  return (await allBaselines(home)).filter((b) => b.baseline.hold === true).map((b) => b.taskId)
 }
 
 /** 本任务的基线是否被 `hold`（同步，供执行结束出口判断是否需要 await）。 */
@@ -432,11 +498,18 @@ export async function verifyMdsBaseline(
       await queueMdsNotice(home, taskId, ['mds'])
       return result
     }
-    const changed = changedEntries(await snapshotMds(dir), baseline.entries)
+    const { changed, adopted } = compareEntries(await snapshotMds(dir), baseline.entries)
     const { reset, failed } = await resetEntries(dir, changed)
     result.reset = reset
     result.failed = failed
     await queueMdsNotice(home, taskId, [...reset, ...failed])
+    // 刷新（审查第二轮）：其他基线标记这次重置的条目；保留本基线时（节点启动时 hold 的基线）同样采纳重建并标记。
+    await refreshBaselines(home, dir, [...reset, ...failed], new Map(), taskId)
+    if (o.keep) {
+      const next = refreshedEntries(baseline.entries, adopted, [...reset, ...failed])
+      if (!sameEntries(next, baseline.entries))
+        await writeState(home, path, { ...baseline, entries: next })
+    }
     return result
   } finally {
     if (!o.keep) await rm(path, { force: true }).catch(() => {})

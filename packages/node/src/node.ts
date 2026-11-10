@@ -1484,7 +1484,8 @@ class LeaseRunner {
         )
           await this.checkMds()
         // 待送达的 mds 重置通知（本任务的，或其他任务启动前比较基线时记下的）：经隔离事实接口送达，不依赖本租约。
-        if (hasPendingMdsNotices(this.env.home)) await deliverPendingMdsNotices(this.env)
+        // 后台送达，不等待：中枢不可达时不拖延执行结束（审查第二轮）；失败的保留到下一次。
+        if (hasPendingMdsNotices(this.env.home)) void deliverPendingMdsNotices(this.env)
         // 外层 seatbelt 配置只在启动 harness 时读取（4.1），执行结束即删除。
         await removeSeatbeltProfile(this.env.home, this.grant.task_id).catch(() => {})
         // 任务私有目录变空时一并删除（审查目录由执行器在会话结束时清理）。
@@ -1740,8 +1741,29 @@ class LeaseRunner {
   }
 }
 
-/** 送达 `state/mds-notices/` 中的通知（`POST /v1/nodes/:id/isolation-notices`）。不抛出。 */
-async function deliverPendingMdsNotices(env: {
+/** 正在进行的送达（按 raindown-home）：同一时间只有一轮，避免多个执行槽并发重复发送。 */
+const mdsDeliveries = new Map<string, Promise<void>>()
+
+/**
+ * 送达 `state/mds-notices/` 中的通知（`POST /v1/nodes/:id/isolation-notices`）。不抛出。
+ * 已有一轮在进行时等它结束后再送一轮（期间新写入的通知不会漏掉）。
+ */
+function deliverPendingMdsNotices(env: {
+  home: string
+  nodeId: string
+  client: NodeHubClient
+  logger: Pick<Env['logger'], 'warn'>
+}): Promise<void> {
+  const prev = mdsDeliveries.get(env.home) ?? Promise.resolve()
+  const next = prev.then(() => deliverOnce(env))
+  mdsDeliveries.set(env.home, next)
+  void next.finally(() => {
+    if (mdsDeliveries.get(env.home) === next) mdsDeliveries.delete(env.home)
+  })
+  return next
+}
+
+async function deliverOnce(env: {
   home: string
   nodeId: string
   client: NodeHubClient

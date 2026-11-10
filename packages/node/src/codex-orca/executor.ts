@@ -47,7 +47,7 @@ import {
   idleSignal,
   resumedSignal,
 } from '../executor.ts'
-import { setMdsBaselineHold } from '../mds.ts'
+import { heldMdsBaselines, mdsBaselineHeld, setMdsBaselineHold, verifyMdsBaseline } from '../mds.ts'
 import { autoApprovedText, needsUserText } from '../precheck.ts'
 import { prepareSealedWorkdir, rollbackSealedClone, type SealedWorkdir } from '../sealed-workdir.ts'
 import {
@@ -503,6 +503,43 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
       credential_isolation: credentialIsolation,
     },
     classify: classifyCodexOrca,
+    /**
+     * 节点启动时：hold 住 mds 基线的任务（外层 seatbelt 内的终端曾在运行），终端已不存在时做最后一次校验、解除并删除基线
+     * （4.5，审查第二轮）。Orca 不可用（无法确认）时保留，之后的启动前比较仍覆盖它。
+     */
+    async prepare() {
+      for (const taskId of await heldMdsBaselines(options.home)) {
+        let alive: boolean | undefined
+        try {
+          const parsed = stateSchema.safeParse(
+            JSON.parse(
+              await readFile(join(taskStateDir(options.home, taskId), 'orca.json'), 'utf8'),
+            ),
+          )
+          const st = parsed.success ? parsed.data : undefined
+          if (!st?.handle || st.isolation_layer !== 'seatbelt') alive = false
+          else {
+            const list = await orca.terminalList({ worktreePath: hostOf(st) })
+            if (list.ok) {
+              const t = list.data.find((x) => x.handle === st.handle)
+              if (!t) alive = false
+              else {
+                const read = await orca.terminalRead({ handle: st.handle, limit: 1 })
+                if (read.ok) alive = read.data.status === 'running'
+              }
+            }
+          }
+        } catch {
+          alive = false
+        }
+        if (alive === false) {
+          await verifyMdsBaseline(options.home, taskId, { force: true }).catch(() => {})
+          logger?.info(
+            `任务 ${taskId} 的外层 seatbelt 终端已不存在：已对 mds 做最后一次校验并删除基线`,
+          )
+        }
+      }
+    },
     run(contract: TaskContract, ctx: ExecutorContext): ExecutorRun {
       const queue = new ActivityQueue()
       let settle: (r: Result<ExecutorOutcome>) => void = () => {}
@@ -1790,6 +1827,15 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
             await saveState()
           }
           if (!(await requireWorkdir())) return
+          if (isolation && mdsBaselineHeld(options.home, ctx.taskId)) {
+            // 要启动新终端：上一个外层 seatbelt 内的终端已不存在（退出或已关闭）。对它 hold 的 mds 基线做最后一次校验并删除，
+            // 再为新终端记录基线（4.5，审查第二轮）。
+            await verifyMdsBaseline(options.home, ctx.taskId, { force: true }).catch(() => {})
+            const baseline = await recordSeatbeltMdsBaseline(isolation, options.home, ctx.taskId)
+            if (finished || stopping) return
+            if (!baseline.ok)
+              return failed(baseline.error.code, seatbeltFailureMessage(baseline.error.message))
+          }
           let seatbelt: string[] | undefined
           let scratchEnv: Record<string, string> | undefined
           if (sealedLaunch) {

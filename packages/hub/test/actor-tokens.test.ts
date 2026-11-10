@@ -395,6 +395,28 @@ describe('节点身份的权限范围', () => {
     expect(events.events.filter((e) => e.type === 'task.out_of_band')).toMatchObject([
       { actor: 'node:n1', payload: { kind: 'mds_reset' } },
     ])
+    // 不合法的百分号编码：拒绝而不是 500（审查第二轮）。
+    for (const path of ['/v1/nodes/%E0%A4%A/isolation-notices', '/v1/tasks/%E0%A4%A']) {
+      const bad = await call(path, {
+        ...as,
+        ...(path.endsWith('notices') ? { body: body(mine.taskId, 'x-bad') } : {}),
+      })
+      expect({ path, status: bad.status }).toMatchObject({ path })
+      expect(bad.status === 400 || bad.status === 403).toBe(true)
+    }
+    // 每个任务最多 50 条（审查第二轮）：已记 1 条，再记 49 条后拒绝。
+    for (let i = 0; i < 49; i++) {
+      const r = await call('/v1/nodes/n1/isolation-notices', {
+        ...as,
+        body: body(mine.taskId, `cap-${i}`),
+      })
+      expect(r.status).toBe(200)
+    }
+    const over = await call('/v1/nodes/n1/isolation-notices', {
+      ...as,
+      body: body(mine.taskId, 'cap-over'),
+    })
+    expect(over.body).toMatchObject({ error: { code: 'isolation_notice_limit' } })
   })
 
   test('本机节点：user token 不声明身份，注册与租约事件记为 node:<id>', async () => {

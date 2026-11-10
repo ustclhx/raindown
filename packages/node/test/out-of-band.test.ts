@@ -18,6 +18,7 @@ import {
   recordMdsBaseline,
 } from '../src/mds.ts'
 import { type Bench, bench } from './harness.ts'
+import { waitFor } from './wait.ts'
 
 let current: Bench | undefined
 afterEach(async () => {
@@ -113,6 +114,10 @@ test('mds（worker-credential-isolation 4.5）：harness 结束后节点按基�
     home = b.home
     const id = await b.create({ executor: 'probe' })
     await b.until(id, (task) => task.status === 'blocked')
+    await waitFor(
+      () => b.events(id).some((event) => event.type === 'task.out_of_band'),
+      'mds 重置通知送达',
+    )
     const events = b.events(id).filter((event) => event.type === 'task.out_of_band')
     expect(events).toHaveLength(1)
     const payload = events[0]?.payload as { kind?: string; files?: string[] }
@@ -135,9 +140,38 @@ test('mds 重置通知在租约结束之后仍送达（审查第一轮）：已�
   expect(hasPendingMdsNotices(b.home)).toBe(true)
   const second = await b.create()
   await b.until(second, (task) => task.status === 'done')
+  // 后台送达（审查第二轮：不拖延执行结束）。
+  await waitFor(
+    () => b.events(first).some((event) => event.type === 'task.out_of_band'),
+    'mds 重置通知送达',
+  )
   const events = b.events(first).filter((event) => event.type === 'task.out_of_band')
   expect(events).toHaveLength(1)
   expect(events[0]?.payload).toMatchObject({ kind: 'mds_reset', files: ['mdsDirectory.db'] })
   expect(b.events(second).filter((event) => event.type === 'task.out_of_band')).toHaveLength(0)
   expect(hasPendingMdsNotices(b.home)).toBe(false)
+})
+
+test('中枢暂时不可达（审查第二轮）：执行照常结束，通知保留到下一次送达', async () => {
+  let notices = 0
+  const b = await bench({}, 60, (url) => {
+    if (!url.includes('/isolation-notices')) return undefined
+    notices++
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        error: { kind: 'retryable', code: 'hub_unavailable', message: '稍后重试' },
+      }),
+      { status: 503 },
+    )
+  })
+  current = b
+  const first = await b.create()
+  await b.until(first, (task) => task.status === 'done')
+  await queueMdsNotice(b.home, first, ['mdsDirectory.db'])
+  const second = await b.create()
+  await b.until(second, (task) => task.status === 'done')
+  await waitFor(() => notices > 0, '尝试送达')
+  expect(hasPendingMdsNotices(b.home)).toBe(true)
+  expect(b.events(first).filter((event) => event.type === 'task.out_of_band')).toHaveLength(0)
 })

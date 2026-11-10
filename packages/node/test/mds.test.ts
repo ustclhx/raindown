@@ -212,7 +212,12 @@ describe('审查第一轮', () => {
       { task: 't-a', files: ['mdsDirectory.db', 'planted.db'] },
     ])
     const b = JSON.parse(readFileSync(mdsBaselinePath(e.home, 't-b'), 'utf8'))
-    expect(Object.keys(b.entries).sort()).toEqual(['mds.lock', 'mdsObject.db'])
+    // 新基线沿用重置标记（审查第二轮）：之后 macOS 重建这些条目时被采纳。
+    expect(b.entries).toMatchObject({
+      'mdsDirectory.db': { type: 'reset' },
+      'planted.db': { type: 'reset' },
+      'mdsObject.db': { type: 'file' },
+    })
     // 同一任务重新挂接：已有基线保留，但仍先比较。
     await writeFile(join(e.mds, 'again.db'), 'x')
     await recordMdsBaseline(e.home, 't-a', e.mds, { hold: true })
@@ -279,5 +284,56 @@ describe('审查第一轮', () => {
     expect(describeMdsVerification({ dir: e.mds, reset: ['x\ny'], failed: [] })).toContain(
       '"x\\ny"',
     )
+  })
+})
+
+describe('审查第二轮：重置后刷新基线', () => {
+  test('hold 的基线 + 3 次模拟重建：只重置一次、只记一条通知；重建的文件被采纳', async () => {
+    const e = await env()
+    await recordMdsBaseline(e.home, 't-a', e.mds, { hold: true })
+    await writeFile(join(e.mds, 'mdsDirectory.db'), 'tampered-while-blocked')
+    for (let i = 1; i <= 3; i++) {
+      // macOS 在重置后重建（内容与原来不同），之后又有任务启动。
+      if (!existsSync(join(e.mds, 'mdsDirectory.db')))
+        await writeFile(join(e.mds, 'mdsDirectory.db'), `DIRECTORY-rebuilt-${i}`)
+      await recordMdsBaseline(e.home, `t-${i}`, e.mds)
+    }
+    // 第一次启动前重置；之后 macOS 重建的文件在每次比较时被采纳，不再重置。
+    expect(readFileSync(join(e.mds, 'mdsDirectory.db'), 'utf8')).toBe('DIRECTORY-rebuilt-2')
+    expect(await notices(e.home)).toEqual([{ task: 't-a', files: ['mdsDirectory.db'] }])
+    // 采纳后各基线记录的是重建后的内容：解除 hold 后结束校验没有变化。
+    await setMdsBaselineHold(e.home, 't-a', false)
+    expect((await verifyMdsBaseline(e.home, 't-a'))?.reset).toEqual([])
+    for (const t of ['t-1', 't-2', 't-3'])
+      expect((await verifyMdsBaseline(e.home, t))?.reset).toEqual([])
+    expect((await notices(e.home)).length).toBe(1)
+  })
+
+  test('启动时扫描（force + keep）同样刷新被保留的基线：之后的重建不再重置', async () => {
+    const e = await env()
+    await recordMdsBaseline(e.home, 't-a', e.mds, { hold: true })
+    await writeFile(join(e.mds, 'mdsObject.db'), 'tampered')
+    await sweepStaleMdsBaselines(e.home)
+    expect(existsSync(join(e.mds, 'mdsObject.db'))).toBe(false)
+    await writeFile(join(e.mds, 'mdsObject.db'), 'OBJECT-rebuilt')
+    await sweepStaleMdsBaselines(e.home)
+    await recordMdsBaseline(e.home, 't-b', e.mds)
+    expect(readFileSync(join(e.mds, 'mdsObject.db'), 'utf8')).toBe('OBJECT-rebuilt')
+    expect(await notices(e.home)).toEqual([{ task: 't-a', files: ['mdsObject.db'] }])
+  })
+
+  test('采纳只针对重建：采纳之后再被改动仍是变化，照样重置', async () => {
+    const e = await env()
+    await recordMdsBaseline(e.home, 't-a', e.mds, { hold: true })
+    await writeFile(join(e.mds, 'planted.db'), 'x')
+    await recordMdsBaseline(e.home, 't-b', e.mds)
+    expect(existsSync(join(e.mds, 'planted.db'))).toBe(false)
+    await writeFile(join(e.mds, 'planted.db'), 'rebuilt')
+    await recordMdsBaseline(e.home, 't-c', e.mds)
+    expect(existsSync(join(e.mds, 'planted.db'))).toBe(true)
+    await writeFile(join(e.mds, 'planted.db'), 'tampered-again')
+    await recordMdsBaseline(e.home, 't-d', e.mds)
+    expect(existsSync(join(e.mds, 'planted.db'))).toBe(false)
+    expect((await notices(e.home)).length).toBeGreaterThanOrEqual(2)
   })
 })
