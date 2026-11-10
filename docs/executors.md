@@ -113,8 +113,9 @@ supervisor 是否代答提问看的是卡住的 `basis`（见下文「上报与�
 
 `workdirTrusted` 为 true 时节点才计算并上报 `command_cwd`、`push_env_ok`、`gh_env_ok`，带 `push_to` / `gh_scope` 条件的规则才可能命中。
 
-批准即脱离隔离的请求（`escapesIsolation`，native 施加层下 Codex 请求在沙箱之外执行，design D4/D5）不送中枢判定、不自动放行，
-卡住以 `no_delegate` 上报并标注“批准即解除本次命令的隔离”，supervisor 不能代批。见「外层 seatbelt 施加」中的「`native`」。
+批准即脱离隔离的请求（`escapesIsolation`，native 施加层下 codex-orca 的授权弹窗，design D4/D5）不送中枢判定、不自动放行，
+卡住以 `no_delegate` 上报并标注“批准即解除本次命令的隔离”，supervisor 不能代批；native 下 codex-orca 的其他卡住同样不委托（`ExecutorRun.noDelegate`）。
+见「外层 seatbelt 施加」中的「`native`」。
 codex-orca 拿不到 Codex 提权命令的实际目录，claude-sdk 的 Bash 会在调用之间保留 cwd，二者都不设置，所以推送与开 PR 目前不会委托给 supervisor。
 
 ### 上报与推断的合并
@@ -1336,7 +1337,8 @@ isolation:
 开关 `isolation.enforce` 打开（仅 macOS，与外层 seatbelt 相同）且角色沙箱设置为 `workspace-write` / `read-only` 时，codex-orca 与 codex-exec
 由 Codex 自己的 permissions profile 拒绝沙箱内命令读取受保护路径。不能套外层 seatbelt：harness 自带沙箱在其内嵌套会失败（「隔离实测」第 1 点）。
 开关关闭时启动命令逐字节不变（`codex-orca-executor.test.ts` 的「native 开关关闭」快照、codex-exec 的“开关关闭”测试锁定）。
-当前真实环境里用到这一层的只有 triage（codex-exec，`read-only`）。实现：core 的 `codex-profile.ts`（生成），node 的 `codex-native.ts`（施加与版本检查）。
+当前真实环境里用到这一层的只有 triage（codex-exec，`read-only`）。实现：core 的 `codex-profile.ts`（生成），node 的 `codex-native.ts`（施加）、
+`isolation-gate.ts`（启动闸门），探针在 `isolation-probe/run.ts`。
 
 **profile 内容**（由与 seatbelt 同一个 `computeIsolationSpec` 结果生成，路径全部是 realpath 的具体目录或文件，不用 glob）：
 
@@ -1350,9 +1352,12 @@ extends = ":workspace"            # read-only 角色为 ":read-only"
 "~/Library/LaunchAgents" = "deny"
 "~/Library/Application Support/orca" = "deny"
 "<遗留 home、raindown-home 之外的节点锁与日志>" = "deny"
-"<auth.json 链接的源文件，例如 ~/.codex/auth.json>" = "deny"
+"<auth.json 链接的源目录，例如 ~/.codex>" = "deny"            # 用户的 Codex 目录整体拒绝（审查第一轮）
 "<raindown-home>/run/tasks/<任务>/dispatch-tokens/<租约>.token" = "read"   # 本任务派工令牌（deny 目录内写 read，1.1 实测有效）
-"<CODEX_HOME>/tmp" = "read"       # Codex 的 arg0 别名（apply_patch 等）在沙箱内执行，见下文“未验证”
+"<CODEX_HOME>/tmp" = "read"       # Codex 的 arg0 别名（apply_patch 等）在沙箱内执行
+"<codex 可执行文件所在目录>" = "read"                         # 只在它位于拒绝目录内时（例如 ~/.codex/packages/standalone/…）
+"<工作目录所属仓库>/.git/hooks" = "read"                      # 写类角色：可写工作区内收回为只读（审查第一轮 M3）
+"<工作目录所属仓库>/.git/config" = "read"                     # 同上；另有 config.worktree、info、commondir、gitdir 与 .git 指针文件（存在时）
 
 [permissions.raindown-<随机后缀>.network]
 # enabled = true                  # 只在角色原本打开了 sandbox_workspace_write.network_access 时写，否则沿用 extends 的缺省（不联网）
@@ -1363,10 +1368,12 @@ extends = ":workspace"            # read-only 角色为 ":read-only"
 
 - seatbelt 中“只保留 `run/`、本执行器、本任务”的 `deny_children_except` 在 native 下一律收为 raindown-home 整体拒绝：worker 的命令不需要读取其中任何内容
   （任务绑定的 MCP 在沙箱外运行），只对派工令牌单独放行。允许项不在拒绝目录内的（工作目录）不写条目，`:workspace` / `:read-only` 下本来可读。
-- **Codex 进程本身不在沙箱内**，所以 profile 可以额外拒绝该执行器的 CODEX_HOME（会话记录 `sessions/`、`auth.json` 链接）与链接的源文件
-  （用户的 `~/.codex/auth.json`），harness 照常读写它们，沙箱内的命令读不到。外层 seatbelt 做不到这一点（harness 与命令在同一个沙箱里）。
-- 写入不另设白名单：由 Codex 沙箱决定（`:workspace` 只放行工作区与临时目录，`:read-only` 全部拒绝）。CODEX_HOME 在 profile 中整体拒绝，
-  worker 的命令写不了其中的 `config.toml` 等。
+- **Codex 进程本身不在沙箱内**，所以 profile 可以额外拒绝该执行器的 CODEX_HOME（会话记录 `sessions/`、`auth.json` 链接）与用户的 Codex 目录
+  （`~/.codex`，含 `auth.json` 源文件、用户自己的会话与配置），harness 照常读写它们，沙箱内的命令读不到。外层 seatbelt 做不到这一点。
+- **只读例外的检查（审查第一轮 H2）**：每个 `"read"` 例外都必须是规范化后的真实路径、不是符号链接、是普通文件或目录；`CODEX_HOME/tmp` 必须是真实目录
+  （不存在时节点创建为 0700 目录）。否则（例如 `tmp` 被换成指向 `state/` 的链接）不生成 profile、不启动，错误码 `codex_profile_unsafe_read`。
+- 写入不另设白名单：由 Codex 沙箱决定（`:workspace` 只放行工作区与临时目录，`:read-only` 全部拒绝）；写类角色工作目录 `.git` 中会在沙箱外被执行或加载的
+  hooks、config 等以 `"read"` 收回为只读（更具体的条目优先）。`.git/objects`、refs 等仍可写（commit 需要）。不存在的指针（例如 `commondir`）无法预先声明。
 - 路径写成 TOML 基本字符串，严格转义反斜杠、引号与全部控制字符（换行、回车、NUL、DEL、C1 都写成 `\uXXXX`），不能改变内联表结构
   （`packages/core/test/isolation-codex-profile.test.ts` 的注入测试用 TOML 解析器还原比对）；不是绝对路径时返回 `codex_profile_invalid_path`。
 
@@ -1376,49 +1383,71 @@ profile 名带每次启动的随机后缀（`raindown-<12 位十六进制>`）�
 固定的名字可能被预先写好的同名表（例如可信项目的 `.codex/config.toml`）追加 `"read"` 条目；随机名无法预知。
 profile 内容只来自节点与角色配置，worker 写不了：它不落盘，CODEX_HOME 在 profile 中拒绝，`:workspace` 的可写根不含 CODEX_HOME。
 
+**启动闸门（审查第一轮 H1）。** native 启动前节点要求：
+
+1. 该执行器 × 沙箱设置最近一次探针**以 native 运行且通过**，结果未过期（12 小时）；
+2. 这次启动用的 codex 与探针用的是**同一个可执行文件**：节点按 worker 的 PATH（codex-exec 为 spawn 的环境，codex-orca 为 worker 环境的 PATH）
+   把 codex 解析为真实路径，按真实路径 + mtime + 大小 + inode 比较；启动命令改用这个绝对路径（codex-orca 的终端命令同样，不再依赖终端 shell 的 PATH）；
+3. 角色打开了网络时，探针也是以打开网络的 profile 运行的。
+
+任何一项不满足都不启动（fail closed），任务以 `failed`、原因 `isolation_not_applied` 结束并写明哪一项；可执行文件变化（例如 Codex 升级）时节点同时请求立刻重新自检，
+通过后重试即可。没有配置探针（`SeatbeltOptions.nativeGate` 缺省）时 native 一律不启动。
+
 **启动参数。** 施加时不再传 `-s <mode>`，改传（官方要求 `default_permissions` 不与 `sandbox_mode` 混用）：
 
 ```text
--c 'permissions.raindown-<后缀>={extends=":workspace",filesystem={…},network={unix_sockets={…}}}' -c 'default_permissions="raindown-<后缀>"'
+<codex 绝对路径> … -c 'permissions.raindown-<后缀>={extends=":workspace",filesystem={…},network={unix_sockets={…}}}' -c 'default_permissions="raindown-<后缀>"'
 ```
 
 - 角色经 `permissions.config.sandbox_mode` 指定沙箱时，该键同样不再传；`sandbox_workspace_write.network_access` 原样传入并映射为 `network.enabled = true`。
-- codex-orca：`… -a <approval> -c permissions… -c default_permissions…`，其余（`approvals_reviewer`、MCP、shell 环境排除项、任务说明）不变；
-  CODEX_HOME 仍是执行器级的 `run/executors/codex-orca/codex-home/`，工作目录仍是 Orca worktree（独立 clone 只用于外层 seatbelt 的写类角色）。
-  `orca.json` 记录 `isolation_layer: native`：开关打开时，派工绑定相同、但不是以 native 启动的存活终端不重新挂接（关闭后以 `isolation_not_applied` 失败，
-  重试即以 native 重启）；以 native 启动的终端照常重挂接。会话恢复、派工绑定变化后重启的新终端同样施加。
-- codex-exec：`codex exec --json … -c permissions… -c default_permissions… -c approval_policy="never"`，`exec resume` 用同一组参数。
-- 任何一步失败（没有中枢地址、工作目录在受保护目录内、派工令牌不在任务私有目录、profile 不合法）都不启动 Codex，任务以 `failed` 结束并带原错误码。
+- codex-orca：`<codex 绝对路径> -c approvals_reviewer=user … -a <approval> -c permissions… -c default_permissions…`。native 下**固定 `approvals_reviewer=user`**，
+  忽略角色的 `approvals_reviewer`（审查第一轮 M4：例如 `auto_review` 会代批越出沙箱的请求）。CODEX_HOME 仍是执行器级的 `run/executors/codex-orca/codex-home/`，
+  工作目录仍是 Orca worktree（独立 clone 只用于外层 seatbelt 的写类角色）。
+  `orca.json` 记录 `isolation_layer: native`：开关打开时，派工绑定相同、但不是以 native 启动的存活终端不重新挂接：关闭成功时以 `isolation_not_applied` 失败，
+  重试即以 native 重启；**关闭失败时不以 failed 结束**（该终端可能仍在未隔离地运行），改为 `blocked(other)` 交给用户手动关闭，handle 保留，下次运行再次尝试关闭。
+  以 native 启动的终端照常重挂接。会话恢复、派工绑定变化后重启的新终端同样施加。
+- codex-exec：`<codex 绝对路径> exec --json … -c permissions… -c default_permissions… -c approval_policy="never"`，`exec resume` 用同一组参数。
+- 任何一步失败（闸门不通过、没有中枢地址、工作目录在受保护目录内、派工令牌不在任务私有目录、只读例外不安全、profile 不合法）都不启动 Codex，任务以 `failed` 结束并带原错误码。
 
 **审批越出沙箱（design D4/D5）。** profile 只约束沙箱内的命令。native 下 Codex 的授权弹窗（`on-request`、`untrusted` 等）都是请求在沙箱之外执行
 （或越出 profile），批准即让这条命令脱离隔离：
 
-- codex-orca 以 native 启动（或重挂接 native 终端）时，授权弹窗**不做策略预检、不自动放行**（判定为 `auto` 也不行），活动写“批准即解除本次命令的隔离……交给用户审批”；
-- 卡住的 hint 带 `isolation_escape: true`，classify 把卡住说明标成 `【批准即解除本次命令的隔离】<原说明>`（收件箱条目与 supervisor 看到的输入都带这个标注）；
-  节点据此以 `no_delegate: true` 上报，不带 `decision_id`，supervisor 档位不能委托，一律交给用户；
-- 策略层另有兜底：`PrecheckRequest.escapesIsolation` 为 true 时 `createPolicyPrecheck` 不送中枢判定，直接返回 `level: user`；
+- codex-orca 以 native 启动（或重挂接 native 终端）时，授权弹窗以 `PrecheckRequest.escapesIsolation: true` 交给策略层：`createPolicyPrecheck` 不送中枢判定，
+  直接返回 `level: user`；执行器即使拿到放行结论也不发回车。活动写“批准即解除本次命令的隔离……交给用户审批”；
+- 卡住的 hint 带 `isolation_escape: true`，classify 把授权卡住的说明标成 `【批准即解除本次命令的隔离】<原说明>`（收件箱条目与 supervisor 看到的输入都带这个标注）；
+- 保守起见，native 下 codex-orca 这次运行的**所有卡住**（awaiting_approval、question、other：无法识别的授权界面也可能被归为后两者）都以 `no_delegate: true` 上报
+  （执行器的 `ExecutorRun.noDelegate()`），不带 `decision_id`，supervisor 不能代回复，一律交给用户；
 - codex-exec 没有交互审批通道（`approval_requests: none`），native 下固定 `approval_policy="never"`，不会产生越出沙箱的授权请求。
 
-**探针。** native 组合（执行器 × `workspace-write` / `read-only`）按设置分别运行（profile 随设置变化，不复用）：
+**探针。** native 组合（执行器 × `workspace-write` / `read-only`）按设置分别运行（profile 随设置变化，不复用），启动方式与 worker 一致（审查第一轮 M3）：
 
-1. 先运行 `codex --version`（不调用模型），版本低于 0.167.0 或无法识别时该组合失败，错误码 `native_codex_unsupported`，doctor 提示升级 Codex；
-2. 用与 worker 启动相同的 `codexNativeProfileFromSpec` 从同一份隔离清单生成 profile，以
-   `env CODEX_HOME=<探针临时任务目录>/codex-home codex sandbox -c 'permissions.<名>=<内联表>' -P <名> -- <bun> child.ts` 启动探针子进程。
-   探针用自己的临时 CODEX_HOME（随临时任务目录删除），profile 中拒绝的仍是执行器实际使用的 CODEX_HOME 与 `auth.json` 源文件；
-3. `codex sandbox` 非零退出时该组合失败，原因提示“Codex 可能不支持 permissions profile 或拒绝了生成的 profile”。
+1. 按节点的 PATH 把 codex 解析为绝对路径，运行 `<codex> --version`（不调用模型；按真实路径 + mtime 等身份缓存），版本低于 0.167.0、无法识别或找不到时失败，
+   错误码 `native_codex_unsupported`，doctor 提示升级 Codex；
+2. CODEX_HOME 是该执行器实际使用的目录（与 worker 相同地 `prepareCodexHome`）；profile 用与 worker 启动相同的 `codexNativeProfileFromSpec` 从同一份隔离清单生成，
+   带上该执行器 × 沙箱设置下角色的网络设置（任一角色打开网络即以打开网络的 profile 运行）与 `sandbox_workspace_write.*` 配置；
+3. 以 `env CODEX_HOME=<执行器的 CODEX_HOME> <codex 绝对路径> sandbox [-c 角色配置…] -c 'permissions.<名>=<内联表>' -c 'default_permissions="<名>"' -- <bun> child.ts`
+   启动探针子进程（与 worker 相同用 `default_permissions` 选中 profile）；所用 codex 的身份与网络设置记入启动闸门；
+4. 探针工作目录放在 `/var/tmp` 下（`nativeTmpDir`），不在 `$TMPDIR` 或 `/tmp` 下：`:workspace` 本来就放行那两处，在那里可写证明不了工作目录可写；
+5. `write.shell_startup`（探针自建的模拟 home）与 `rename.protected_ancestor`（探针自建的改名目录）位于 raindown-home 内，探针的 profile 把这两个目录声明为 `"read"`，
+   否则它们被 raindown-home 的整体拒绝覆盖，证明不了 Codex 沙箱对工作区之外的写限制；
+6. `codex sandbox` 非零退出时该组合失败，原因提示“Codex 可能不支持 permissions profile 或拒绝了生成的 profile”。
 
 判定：与 seatbelt 相同的读拒绝项为必过项（`read.hub_token`、`read.ledger_db`、`read.other_task_token`），另加 `write.config`、
-`rename.protected_ancestor`、`write.shell_startup`（`PROBE_NATIVE_REQUIRED_DENY_ITEMS`）。写类项按 Codex 沙箱语义：`write.workdir` 在 read-only 下预期拒绝；
-`write.own_profile`（profile 不落盘）、`write.git_hooks`、`write.git_commondir`、`write.registered_git`、`write.git_objects`、`write.shared_tmp`
-（由 Codex 沙箱决定，不是 Raindown 的写白名单）与 `connect.hub`（worker 经沙箱外的 MCP 访问中枢）记为跳过并写明原因。
-测试用假的 codex 脚本截获参数（`isolation-probe.test.ts`「native 探针」），不运行真实 codex。
+`rename.protected_ancestor`、`write.shell_startup`（`PROBE_NATIVE_REQUIRED_DENY_ITEMS`）。native 另有：`read.codex_home_auth`（读执行器 CODEX_HOME 的 `auth.json`，预期拒绝）、
+`write.git_hooks` 与 `write.git_config`（探针工作目录是模拟仓库，预期拒绝：profile 把它们收回为只读）、`write.git_objects`（按读写类别）、
+`write.workdir`（read-only 下预期拒绝）。跳过并写明原因的：`write.own_profile`（profile 不落盘）、`write.git_commondir`（不存在的指针无法预先声明）、
+`write.registered_git`（native 的写类角色直接在登记仓库中工作，由 git_hooks / git_config 覆盖）、`write.shared_tmp`（`:workspace` 放行 TMPDIR）、
+`connect.hub`（worker 经沙箱外的 MCP 访问中枢）。测试用假的 codex 脚本截获参数（`isolation-probe.test.ts`「native 探针」），不运行真实 codex。
+
+**网络打开的角色。** profile 不能按端口拒绝本机 TCP：角色打开了 `sandbox_workspace_write.network_access` 时，探针以打开网络的 profile 运行，
+Orca 端口已解析时 `connect.orca_port.*` 可连，探针不通过，`enforced` 为 false，doctor 提示“native 挡不住本机 TCP，按未施加处理”；闸门因此不放行这类启动。
 
 **局限。**
 - Codex 进程本身及其内置工具、MCP 服务器（任务绑定的 raindown MCP 是可信代码）、经审批越出沙箱的命令都不受 profile 约束；
-- 角色打开了 `sandbox_workspace_write.network_access` 时，profile 不能按端口拒绝，Orca 的本机 TCP 端口对沙箱内命令可达（探针按缺省不联网运行，覆盖不到这种角色）；
 - 预置信任的项目里，worker 在运行期间新建的 `.codex/config.toml` 由 codex-orca 每次派工前的检查拦截（`blockProjectConfig`）；随机 profile 名使其无法向本次 profile 追加条目；
-- **未验证（需要用真实 codex 验收）**：`codex exec` / Codex TUI 不传 `-s`、只传 `-c default_permissions=…` 时是否使用该 profile；`-c` 传入的内联 profile 能否被正确解析；
-  CODEX_HOME 整体拒绝、只放行 `tmp/` 时 `apply_patch` 等 arg0 别名是否正常。验收命令见下。
+- 写类角色工作目录 `.git` 中不存在的指针（`commondir` 等）无法预先收回为只读；
+- **未验证（需要用真实 codex 验收）**：`codex exec` / Codex TUI 只传 `-c default_permissions=…` 时是否使用该 profile；`-c` 传入的内联 profile 能否被正确解析；
+  CODEX_HOME 整体拒绝、只放行 `tmp/` 时 `apply_patch` 等 arg0 别名是否正常；`:workspace` 下 `"read"` 能否把工作区内的 `.git/hooks`、`.git/config` 收回为只读。验收命令见下。
 
 **验收命令（只用临时目录与临时 CODEX_HOME；`codex sandbox` 不调用模型，`codex exec` 与 TUI 会调用模型）。**
 
@@ -1428,16 +1457,22 @@ RH=$R/rh; CH=$RH/run/executors/codex-exec/codex-read-home; TOK=$RH/run/tasks/t-1
 mkdir -p "$RH/state" "$RH/config" "$CH/tmp" "$(dirname "$TOK")" "$R/work" "$R/user-codex"
 echo FAKE-HUB-TOKEN-not-a-secret > "$RH/state/hub.token"; echo FAKE-LEASE > "$TOK"; echo FAKE-AUTH > "$R/user-codex/auth.json"
 ln -s "$R/user-codex/auth.json" "$CH/auth.json"
-WS='permissions.raindown-verify={extends=":workspace",filesystem={"'$RH'"="deny","'$R/user-codex/auth.json'"="deny","'$CH/tmp'"="read","'$TOK'"="read"},network={unix_sockets={}}}'
+WS='permissions.raindown-verify={extends=":workspace",filesystem={"'$RH'"="deny","'$R/user-codex'"="deny","'$CH/tmp'"="read","'$TOK'"="read"},network={unix_sockets={}}}'
 RO=${WS/:workspace/:read-only}
 cd "$R/work"
 codex --version                                                                       # ≥ 0.167.0
-CODEX_HOME=$CH codex sandbox -c "$WS" -P raindown-verify -- cat "$RH/state/hub.token"   # 预期 Operation not permitted
-CODEX_HOME=$CH codex sandbox -c "$WS" -P raindown-verify -- cat "$CH/auth.json"         # 预期 Operation not permitted（链接与源文件都拒绝）
-CODEX_HOME=$CH codex sandbox -c "$WS" -P raindown-verify -- cat "$TOK"                  # 预期 FAKE-LEASE
-CODEX_HOME=$CH codex sandbox -c "$WS" -P raindown-verify -- sh -c 'echo x > ok.txt'     # 预期成功
-CODEX_HOME=$CH codex sandbox -c "$RO" -P raindown-verify -- sh -c 'echo x > ro.txt'     # 预期失败（read-only）
-CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"' -- cat "$RH/state/hub.token"  # 预期拒绝（default_permissions 代替 -P）
+CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"' -- cat "$RH/state/hub.token"   # 预期 Operation not permitted
+CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"' -- cat "$CH/auth.json"         # 预期 Operation not permitted
+CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"' -- cat "$TOK"                  # 预期 FAKE-LEASE
+CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x > ok.txt'     # 预期成功
+CODEX_HOME=$CH codex sandbox -c "$RO" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x > ro.txt'     # 预期失败（read-only）
+# .git 收回为只读（审查第一轮 M3）：先看 :workspace 缺省是否保护 .git，再看 "read" 条目
+git -C "$R/work" init -q
+CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x > .git/hooks/post-checkout'   # 缺省行为，记录结果
+GW='permissions.raindown-verify={extends=":workspace",filesystem={"'$RH'"="deny","'$R/user-codex'"="deny","'$CH/tmp'"="read","'$TOK'"="read","'$R/work/.git/hooks'"="read","'$R/work/.git/config'"="read"},network={unix_sockets={}}}'
+CODEX_HOME=$CH codex sandbox -c "$GW" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x > .git/hooks/post-checkout'   # 预期失败
+CODEX_HOME=$CH codex sandbox -c "$GW" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x >> .git/config'               # 预期失败
+CODEX_HOME=$CH codex sandbox -c "$GW" -c 'default_permissions="raindown-verify"' -- sh -c 'git status && touch x && git add x && git -c user.name=t -c user.email=t@t commit -qm t'  # 预期成功
 # 以下调用模型：需要登录，把用户的 auth.json 链接进临时 CODEX_HOME（只建链接，不读取内容）
 ln -sf ~/.codex/auth.json "$CH/auth.json"
 CODEX_HOME=$CH codex exec --json --skip-git-repo-check -c "$RO" -c 'default_permissions="raindown-verify"' -c 'approval_policy="never"' \
@@ -1479,8 +1514,9 @@ claude-sdk 多声明一个沙箱设置 `supervisor-session → none`。探针每
 5.1（`native`）部署后，开关关闭时同样不改变启动方式（快照锁定），探针与能力声明不变。开关打开时：workspace-write / read-only 的 Codex 角色
 （当前只有 triage）改为不传 `-s`、改传 permissions profile；能力声明中这些设置从 `none` 变为 `native`；探针每轮为每个 native 组合多运行一次
 `codex --version` 与一次 `codex sandbox`（不调用模型）；native 下 codex-orca 角色的授权弹窗不再经策略自动放行。
-`orca.json` 的 `isolation_layer` 多一个取值 `native`；旧版本节点读不了带这个取值的记录（当作没有记录，会尝试重新创建 Orca worktree），
-回滚节点版本前先关闭开关并结束这些任务的终端。
+**升级说明：`orca.json` 出现 `isolation_layer: 'native'` 之后，旧版本节点无法读取这条记录**（按 schema 解析失败，当作没有记录，会尝试重新创建 Orca worktree，
+也找不到仍在运行的终端）。回滚节点版本前先把 `isolation.enforce` 改回 false 并结束这些任务的终端（或等任务完成）。
+native 启动另需要节点的隔离自检通过（启动闸门）：开关打开后、首次探针完成前领取的 native 任务会以 `isolation_not_applied` 失败，重试即可。
 
 4.5 修复（CODEX_HOME 整体可写、mds 放行并校验重置）部署后，开关关闭时同样不改变启动方式：节点不运行 `getconf`、不记录 mds 基线；
 每次执行结束多一次检查 `state/tasks/<任务>/mds-baseline.json` 与 `state/mds-notices/`（不存在时什么也不做），节点启动时多一次残留基线扫描。

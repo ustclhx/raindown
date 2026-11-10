@@ -121,12 +121,16 @@ export interface ProbePlanInput {
    * 探针实际运行的施加层。`native`（Codex permissions profile，tasks 5.1）时：
    * - 读拒绝项、`write.config`、`rename.protected_ancestor`、`write.shell_startup` 与 seatbelt 相同；
    * - `write.own_profile` 跳过：profile 经命令行 `-c` 传入，没有可改写的配置文件；
-   * - `write.git_hooks`、`write.git_commondir`、`write.registered_git`、`write.git_objects`、`write.shared_tmp` 跳过：
-   *   这些位置能否写入由 Codex 沙箱语义决定（`:workspace` 放行工作区与临时目录），不是 Raindown 的写白名单；
+   * - `write.git_commondir`、`write.registered_git`、`write.shared_tmp` 跳过（见 `NATIVE_CODEX_WRITE_ITEMS`）；
+   *   `write.git_hooks`、新增的 `write.git_config` 预期拒绝，`write.git_objects` 按读写类别；新增 `read.codex_home_auth` 预期拒绝；
    * - `connect.hub` 跳过：native 下 worker 经沙箱外的 Raindown MCP 访问中枢，沙箱内命令的网络按角色设置；
    * - `write.workdir` 按读写类别（read-only 下工作目录不可写不算失败）。
    */
   layer?: string
+  /** native：探针工作目录 `.git/config`（以读写方式打开，预期拒绝：写类角色的 `.git/config` 在 profile 中收回为只读）。 */
+  gitConfigFile?: string
+  /** native：该执行器 CODEX_HOME 中的 `auth.json`（读取预期拒绝，Codex 进程本身不在沙箱内）。 */
+  codexHomeAuth?: string
 }
 
 /** native 下按 Codex 沙箱语义判定、不属于 Raindown 写白名单的写入项的跳过原因。 */
@@ -338,6 +342,22 @@ export function buildProbePlan(input: ProbePlanInput): ProbePlan {
       target: `${input.hubUrl.replace(/\/+$/, '')}/v1/health`,
     },
   )
+  if (input.layer === 'native') {
+    if (input.gitConfigFile)
+      items.push({
+        item: 'write.git_config',
+        kind: 'open_write',
+        expected: 'deny',
+        target: input.gitConfigFile,
+      })
+    if (input.codexHomeAuth)
+      items.push({
+        item: 'read.codex_home_auth',
+        kind: 'read',
+        expected: 'deny',
+        target: input.codexHomeAuth,
+      })
+  }
   return {
     workdir: input.cwd,
     items: input.layer === 'native' ? items.map(nativeItem) : items,
@@ -345,11 +365,14 @@ export function buildProbePlan(input: ProbePlanInput): ProbePlan {
   }
 }
 
+/**
+ * native 下跳过的写入项：`write.git_commondir`（profile 只能把已存在的 git 指针收回为只读）、`write.registered_git`
+ * （native 的写类角色直接在登记仓库中工作，由 `write.git_hooks`、`write.git_config` 覆盖）、`write.shared_tmp`（`:workspace` 放行 TMPDIR）。
+ * `write.git_hooks` 与 `write.git_config` 预期拒绝：profile 把工作目录 `.git` 的 hooks、config 收回为只读（审查第一轮 M3）。
+ */
 const NATIVE_CODEX_WRITE_ITEMS: ReadonlySet<string> = new Set([
-  'write.git_hooks',
   'write.git_commondir',
   'write.registered_git',
-  'write.git_objects',
   'write.shared_tmp',
 ])
 

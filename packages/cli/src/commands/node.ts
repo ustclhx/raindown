@@ -20,6 +20,7 @@ import {
   createCodexOrcaExecutor,
   createFakeExecutor,
   createPrMergeExecutor,
+  IsolationProbeGate,
   isolationProbeLaunchWrapper,
   nodeHubClientFromHome,
   resolveOrcaPorts,
@@ -50,7 +51,10 @@ export const nodeStartCommand = defineCommand({
     if (!nodeConfig.ok) return nodeConfig
     // Orca 本机端口只读解析（目录项名 + lsof，不连接 Orca）；未解析时不生成端口规则，探针记为失败（审查第一轮 M2）。
     const orcaPorts = () => resolveOrcaPorts(homedir())
+    // native 施加层的启动闸门（PR #104 审查第一轮 H1）：探针记录所用 codex 与结果，worker 启动 native 前核对。
+    const nativeGate = new IsolationProbeGate()
     const isolation: SeatbeltOptions = {
+      nativeGate,
       enforce: nodeConfig.data.isolation.enforce,
       resolveOrcaPorts: orcaPorts,
       // 写白名单之外追加的可写目录（tasks 4.6）；worker 与探针用同一份。
@@ -86,6 +90,7 @@ export const nodeStartCommand = defineCommand({
       // 隔离自检探针：启动时、每 6 小时、macOS 版本变化时运行，结果随注册上报（worker-credential-isolation 3.1）。
       // 探针只判断受保护文件能否打开，不读取内容。
       isolationProbe: {
+        gate: nativeGate,
         resolveOrcaPorts: orcaPorts,
         extraWrite: nodeConfig.data.isolation.extra_write,
         // 与 worker 相同的 mds 放行（4.5），探针配置与 worker 配置一致。
@@ -94,7 +99,7 @@ export const nodeStartCommand = defineCommand({
           : {}),
         // seatbelt 目标以 sandbox-exec 运行，native 目标以 `codex sandbox -P` 运行（profile 与 worker 同源，tasks 5.1）。
         ...(seatbeltActive(isolation)
-          ? { launchWrapper: isolationProbeLaunchWrapper(isolation) }
+          ? { launchWrapper: isolationProbeLaunchWrapper(isolation, { gate: nativeGate }) }
           : {}),
       },
     })

@@ -50,6 +50,11 @@ export interface CodexNativeProfileInput {
   extraDeny?: readonly string[]
   /** 追加的只读项（realpath），应位于某个拒绝目录内（例如 CODEX_HOME 的 `tmp/`：Codex 的 arg0 别名在沙箱内执行）。 */
   extraRead?: readonly string[]
+  /**
+   * 一律写成 `"read"` 的路径（realpath）：位于可写工作区内、但不能写的位置，例如写类角色工作目录所属仓库的 `.git/hooks`、`.git/config`
+   * （更具体的条目优先，把它们收回为只读）。
+   */
+  readOnly?: readonly string[]
   /** 追加拒绝连接的 unix 套接字（例如 Orca 运行时目录中找到的套接字）。 */
   unixSockets?: readonly string[]
   /** 角色原本打开了 workspace-write 的网络（`sandbox_workspace_write.network_access`）。 */
@@ -117,8 +122,15 @@ export function codexNativeProfile(input: CodexNativeProfileInput): Result<Codex
     ...(input.extraDeny ?? []),
   ])
   // 只读放行只对落在拒绝目录内的允许项有意义（其余路径在 `:workspace` / `:read-only` 下本来就可读）。
-  const read = [...new Set([...spec.allow_read, ...(input.extraRead ?? [])])]
-    .filter((p) => deny.some((d) => isWithin(d, p)))
+  const read = [
+    ...new Set([
+      ...[...spec.allow_read, ...(input.extraRead ?? [])].filter((p) =>
+        deny.some((d) => isWithin(d, p)),
+      ),
+      // 可写工作区内的只读项（例如 `.git/hooks`、`.git/config`）：不论是否在拒绝目录内都写 `"read"`。
+      ...(input.readOnly ?? []),
+    ]),
+  ]
     .filter((p) => !deny.includes(p))
     .sort()
   const sockets = [...new Set([...spec.deny_unix_sockets, ...(input.unixSockets ?? [])])].sort()

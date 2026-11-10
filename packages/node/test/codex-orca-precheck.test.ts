@@ -21,6 +21,7 @@ import {
 import { needsUserText } from '../src/precheck.ts'
 import { FakeGh, FakeOrca, type OrcaHome, orcaHome, tuiFixture } from './codex-orca-helpers.ts'
 import { type Bench, bench, ManualClock } from './harness.ts'
+import { passingNativeGate } from './native-helpers.ts'
 import { waitFor as until } from './wait.ts'
 
 /**
@@ -64,6 +65,12 @@ async function start(
       join(h.home, 'config/roles/dev.yaml'),
       'name: dev\nexecutor: codex-orca\nprompt: dev.md\npermissions:\n  approval: on-request\n  sandbox: workspace-write\n',
     )
+  // 假的 codex 可执行文件（只解析路径与身份，从不运行）与探针通过的闸门。
+  const codexBin = join(h.root, 'bin', 'codex')
+  if (native) {
+    mkdirSync(join(h.root, 'bin'), { recursive: true })
+    writeFileSync(codexBin, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  }
   const clock = new ManualClock()
   const orca = new FakeOrca(h.worktree)
   onOrca?.(orca)
@@ -83,7 +90,9 @@ async function start(
             platform: 'darwin' as const,
             userHome: join(h.root, 'user'),
             env: {},
+            nativeGate: passingNativeGate('codex-orca', ['workspace-write'], codexBin),
           },
+          codexBin,
         }
       : {}),
   })
@@ -696,7 +705,10 @@ describe('native：批准即解除本次命令的隔离（worker-credential-isol
       true,
     )
     await s.poll(3)
-    expect(calls).toEqual([])
+    // 预检带 escapesIsolation 交给策略层（真实的 createPolicyPrecheck 直接返回 user）；桩即使返回放行也不发回车。
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.escapesIsolation).toBe(true)
+    expect(s.run.noDelegate?.()).toBe(true)
     expect(s.enters()).toHaveLength(0)
     expect(s.texts().some((t) => t.includes('批准即解除本次命令的隔离'))).toBe(true)
     const [idle] = s.idles()

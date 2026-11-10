@@ -77,6 +77,11 @@
   - 能力声明：开关打开时 `native` 不再降级为 `none`；`enforced` 仍要求探针通过。探针以 `codex sandbox -c <profile> -P <名>` 运行同源 profile，
     先检查 `codex --version`（低于 0.167.0 时失败并提示），读拒绝项为必过项，写类项按 Codex 沙箱语义判定，doctor 显示原因。
   - D4/D5：native 下 codex-orca 的授权弹窗不预检、不自动放行，标注“批准即解除本次命令的隔离”并以 `no_delegate` 上报；codex-exec 固定 `approval_policy="never"`。
+  - PR #104 第一轮审查：H1 启动闸门（最近一次探针以 native 通过、同一 codex 可执行文件按真实路径 + mtime 等比较、启动命令改用绝对路径，否则 `isolation_not_applied`）；
+    H2 只读例外 lstat 检查（`codex_profile_unsafe_read`）；M3 探针与启动一致（`-c default_permissions`、执行器的 CODEX_HOME、角色网络与配置、`read.codex_home_auth`、
+    `write.git_hooks` / `write.git_config` 预期拒绝并在 profile 中收回 `.git` 的 hooks、config 为只读、模拟 home 与改名目录声明为只读、工作目录不在 $TMPDIR，
+    网络打开的角色按未施加）；M4 native 下固定 `approvals_reviewer=user`；用户 `~/.codex` 整体拒绝；codex-orca 设置 `escapesIsolation`；
+    native 下全部卡住 `no_delegate`；关闭未隔离旧终端失败时 blocked 交给用户；docs 升级说明。
   - claude-sdk 的 bash 沙箱：原生 `denyRead` 只覆盖 Bash，仍声明为 `none`（1.1 结论），需要隔离的角色关闭 bash 沙箱改走 seatbelt。
   - **未验证**（交给真实验收，命令见 `docs/executors.md`「`native`」）：`codex exec` / TUI 只传 `-c default_permissions` 时是否使用该 profile、
     `-c` 内联 profile 能否被正确解析、CODEX_HOME 整体拒绝只放行 `tmp/` 时 arg0 别名（`apply_patch`）是否正常。

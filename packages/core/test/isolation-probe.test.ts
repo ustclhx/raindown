@@ -506,5 +506,18 @@ describe('审查第一轮：开关与 Orca 端口的 doctor 提示', () => {
     expect(leaky.find((x) => x.id === 'isolation.n-1.codex-exec.read-only')?.hint).toContain(
       '已施加 native',
     )
+    // 审查第一轮 M3：角色打开网络，Orca 端口可达：按未施加处理并说明原因。
+    const net = await checksFor([
+      native({
+        ...base,
+        items: [
+          ...run().items,
+          { item: 'connect.orca_port.6000', expected: 'deny', actual: 'allow', ok: false },
+        ],
+      }),
+    ])
+    const n = net.find((x) => x.id === 'isolation.n-1.codex-exec.read-only')
+    expect(n?.message).toContain('未施加')
+    expect(n?.hint).toContain('network_access')
   })
 })

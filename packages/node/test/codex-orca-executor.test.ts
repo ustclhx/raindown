@@ -48,6 +48,7 @@ import {
   tuiFixture,
 } from './codex-orca-helpers.ts'
 import { bench, ManualClock } from './harness.ts'
+import { passingNativeGate } from './native-helpers.ts'
 import { initTestRepo } from './sealed-helpers.ts'
 import { waitFor as until } from './wait.ts'
 
@@ -91,6 +92,7 @@ async function start(
     isolation?: SeatbeltOptions
     hubUrl?: string
     nativeProfileName?: string
+    codexBin?: string
   } = {},
 ) {
   h = extra.home ?? orcaHome()
@@ -109,6 +111,7 @@ async function start(
     ...(extra.directoryStat ? { directoryStat: extra.directoryStat } : {}),
     ...(extra.isolation ? { isolation: extra.isolation } : {}),
     ...(extra.nativeProfileName ? { nativeProfileName: extra.nativeProfileName } : {}),
+    ...(extra.codexBin ? { codexBin: extra.codexBin } : {}),
   })
   const contract = taskContract.parse({
     goal: '修正 README',
@@ -2468,6 +2471,26 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
       `name: dev\nexecutor: codex-orca\nprompt: dev.md\npermissions:\n  approval: on-request\n  sandbox: workspace-write\n${extra}`,
     )
   const NATIVE = 'raindown-test'
+  /**
+   * native 开关打开：假的 codex 可执行文件（只用于解析路径与身份，终端由假 Orca 承载，从不运行）与探针通过的闸门。
+   */
+  const nativeOn = (home: OrcaHome, gate: 'pass' | 'none' = 'pass') => {
+    const bin = join(home.root, 'bin', 'codex')
+    if (!existsSync(bin)) {
+      mkdirSync(join(home.root, 'bin'), { recursive: true })
+      writeFileSync(bin, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    }
+    return {
+      codexBin: bin,
+      isolation: {
+        ...on(home),
+        ...(gate === 'pass'
+          ? { nativeGate: passingNativeGate('codex-orca', ['workspace-write', 'read-only'], bin) }
+          : {}),
+      },
+      nativeProfileName: NATIVE,
+    }
+  }
 
   test('native 开关关闭：workspace-write 角色的终端命令与之前逐字节一致（快照）', async () => {
     const home = orcaHome()
@@ -2490,8 +2513,7 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
       home,
       leaseTokenFile,
       hubUrl: HUB,
-      isolation: on(home),
-      nativeProfileName: NATIVE,
+      ...nativeOn(home),
     })
     await ready(s)
     expect(s.outcome()).toBeUndefined()
@@ -2500,14 +2522,16 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
     expect(command).not.toContain('sandbox-exec')
     expect(command).not.toContain(' -s ')
     expect(command).not.toContain('sandbox_mode=')
+    // 终端命令用节点解析出的 codex 绝对路径（审查第一轮 H1）；native 下固定 approvals_reviewer=user（M4）。
+    expect(command).toContain(
+      `${realpathSync(join(home.root, 'bin', 'codex'))} -c approvals_reviewer=user `,
+    )
     expect(command).toContain(` -a on-request -c 'permissions.${NATIVE}={extends=":workspace",`)
     expect(command).toContain(`-c 'default_permissions="${NATIVE}"'`)
     const realHome = realpathSync(home.home)
     expect(command).toContain(`"${realHome}"="deny"`)
     expect(command).toContain(`"${realpathSync(leaseTokenFile)}"="read"`)
-    expect(command).toContain(
-      `"${join(realpathSync(home.root), 'user-codex', 'auth.json')}"="deny"`,
-    )
+    expect(command).toContain(`"${join(realpathSync(home.root), 'user-codex')}"="deny"`)
     // 执行器级的 CODEX_HOME（不是 seatbelt 的按任务目录），Orca worktree 即工作目录（不建独立 clone）。
     expect(command).toContain(
       `CODEX_HOME=${join(home.home, 'run/executors/codex-orca/codex-home')} `,
@@ -2533,8 +2557,7 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
       home,
       leaseTokenFile,
       hubUrl: HUB,
-      isolation: on(home),
-      nativeProfileName: NATIVE,
+      ...nativeOn(home),
     })
     await ready(refused)
     expect(refused.outcome()).toMatchObject({
@@ -2546,8 +2569,7 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
       home,
       leaseTokenFile,
       hubUrl: HUB,
-      isolation: on(home),
-      nativeProfileName: NATIVE,
+      ...nativeOn(home),
     })
     await ready(launched)
     expect(created(launched)[0]).toContain('default_permissions')
@@ -2555,8 +2577,7 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
       home,
       leaseTokenFile,
       hubUrl: HUB,
-      isolation: on(home),
-      nativeProfileName: NATIVE,
+      ...nativeOn(home),
     })
     await ready(same)
     expect(same.orca.ops('terminalCreate')).toEqual([])
@@ -2566,13 +2587,109 @@ describe('外层 seatbelt（worker-credential-isolation 4.2）', () => {
     await same.run.cancel()
   })
 
+  test('审查第一轮 M4：native 下忽略角色的 approvals_reviewer，固定 approvals_reviewer=user', async () => {
+    const home = orcaHome()
+    nativeRole(home, '  config:\n    approvals_reviewer: auto_review\n')
+    const s = await start({}, (o) => o.show('working'), {
+      home,
+      leaseTokenFile: await token(home, 'l-1'),
+      hubUrl: HUB,
+      ...nativeOn(home),
+    })
+    await ready(s)
+    const [command] = created(s)
+    expect(command).toContain('-c approvals_reviewer=user ')
+    expect(command).not.toContain('auto_review')
+    await s.run.cancel()
+    // 对照：开关关闭时角色设置照常生效。
+    const off = orcaHome()
+    nativeRole(off, '  config:\n    approvals_reviewer: auto_review\n')
+    const o2 = await start({}, (o) => o.show('working'), { home: off, hubUrl: HUB })
+    await ready(o2)
+    expect(created(o2)[0]).toContain('approvals_reviewer=auto_review')
+    await o2.run.cancel()
+  })
+
+  test('审查第一轮 H1：没有通过的隔离自检（无闸门）时 fail closed，不启动终端', async () => {
+    const home = orcaHome()
+    nativeRole(home)
+    const s = await start({}, (o) => o.show('working'), {
+      home,
+      leaseTokenFile: await token(home, 'l-1'),
+      hubUrl: HUB,
+      ...nativeOn(home, 'none'),
+    })
+    await ready(s)
+    expect(s.outcome()).toMatchObject({
+      ok: true,
+      data: { outcome: 'failed', result: { reason: 'isolation_not_applied' } },
+    })
+    expect(s.orca.ops('terminalCreate')).toEqual([])
+  })
+
+  test('审查第一轮：native 下本次运行的卡住一律不委托（noDelegate）；开关关闭时不设', async () => {
+    const home = orcaHome()
+    nativeRole(home)
+    const s = await start({}, (o) => o.show('question'), {
+      home,
+      leaseTokenFile: await token(home, 'l-1'),
+      hubUrl: HUB,
+      ...nativeOn(home),
+    })
+    await ready(s)
+    expect(s.run.noDelegate?.()).toBe(true)
+    await s.run.cancel()
+    const off = orcaHome()
+    nativeRole(off)
+    const o2 = await start({}, (o) => o.show('question'), { home: off, hubUrl: HUB })
+    await ready(o2)
+    expect(o2.run.noDelegate?.()).toBe(false)
+    await o2.run.cancel()
+  })
+
+  test('审查第一轮：未隔离的旧终端关闭失败时不以 failed 结束，blocked 交给用户；下次运行再次尝试关闭', async () => {
+    const home = orcaHome()
+    nativeRole(home)
+    const leaseTokenFile = await token(home, 'l-1')
+    const plain = await start({}, (o) => o.show('question'), { home, leaseTokenFile, hubUrl: HUB })
+    await ready(plain)
+    const refused = await start(
+      {},
+      (o) => {
+        o.show('question')
+        o.closeResult = fail('failure', 'orca_error', 'close failed')
+      },
+      { home, leaseTokenFile, hubUrl: HUB, ...nativeOn(home) },
+    )
+    await ready(refused)
+    expect(refused.outcome()).toMatchObject({
+      ok: true,
+      data: { outcome: 'blocked', reason: 'other' },
+    })
+    expect(JSON.stringify(refused.outcome())).toContain('手动关闭')
+    // handle 保留在记录中：下次运行再次尝试关闭。
+    const state = JSON.parse(
+      readFileSync(join(home.home, 'state/tasks/t-orca-1/orca.json'), 'utf8'),
+    )
+    expect(state.handle).toBeDefined()
+    const again = await start({}, (o) => o.show('question'), {
+      home,
+      leaseTokenFile,
+      hubUrl: HUB,
+      ...nativeOn(home),
+    })
+    await ready(again)
+    expect(again.orca.ops('terminalClose')).toHaveLength(1)
+    await plain.run.cancel()
+  })
+
   test('native：无法计算隔离清单（没有中枢地址）时不启动 Codex', async () => {
     const home = orcaHome()
     nativeRole(home)
     const s = await start({}, (o) => o.show('working'), {
       home,
       leaseTokenFile: await token(home, 'l-1'),
-      isolation: on(home),
+      ...nativeOn(home),
     })
     await ready(s)
     expect(s.outcome()).toMatchObject({

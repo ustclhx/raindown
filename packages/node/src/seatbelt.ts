@@ -15,6 +15,7 @@ import {
   renderSeatbeltProfile,
   roleSandboxSetting,
 } from '@raindown/core'
+import type { NativeProbeGate } from './isolation-gate.ts'
 import { writeSeatbeltProfile } from './lease-token.ts'
 import { recordMdsBaseline } from './mds.ts'
 
@@ -67,6 +68,11 @@ export interface SeatbeltOptions {
    * 缺省（解析失败）不放行，doctor 提示。
    */
   darwinUserCacheDir?: string
+  /**
+   * native 施加层的启动闸门（PR #104 审查第一轮 H1）：native 启动前要求最近一次探针以 native 运行且通过、使用同一个 codex 可执行文件。
+   * 缺省没有闸门，native 一律不启动（fail closed）。`raindown node start` 创建并与探针共享。
+   */
+  nativeGate?: NativeProbeGate
 }
 
 /** 开关是否在本机生效：打开且运行在 macOS 上。 */

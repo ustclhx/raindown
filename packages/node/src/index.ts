@@ -158,6 +158,13 @@ export {
   UNTRUSTED_CHECKOUT_ENV,
   untrustedCheckoutConfig,
 } from './github.ts'
+export {
+  type ExecutableIdentity,
+  IsolationProbeGate,
+  type NativeGateResult,
+  type NativeProbeGate,
+  resolveExecutable,
+} from './isolation-gate.ts'
 export { type ProbeSystem, realProbeSystem, runProbeItems } from './isolation-probe/checks.ts'
 export {
   cleanProbeLeftovers,

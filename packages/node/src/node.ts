@@ -66,6 +66,7 @@ import {
   type StuckVerdict,
 } from './executor.ts'
 import { createFakeExecutor } from './fake.ts'
+import type { IsolationProbeGate } from './isolation-gate.ts'
 import {
   cleanProbeLeftovers,
   defaultMacosVersion,
@@ -205,6 +206,11 @@ export interface IsolationProbeNodeOptions
   versionCheckMs?: number
   /** 替换探针实现（测试用）。 */
   run?: (o: IsolationProbeOptions) => Promise<IsolationProbeReport>
+  /**
+   * native 施加层的启动闸门（PR #104 审查第一轮 H1）：每次探针结束（含失败）后传入报告；闸门发现 codex 可执行文件变化时
+   * 请节点重新运行探针。
+   */
+  gate?: IsolationProbeGate
 }
 
 export const ISOLATION_PROBE_INTERVAL_MS = 6 * 60 * 60_000
@@ -1107,7 +1113,9 @@ class LeaseRunner {
       return { no_delegate: true }
     }
     // 批准即脱离隔离的授权（native，design D5）：supervisor 不得代批，只能转给用户。
-    if (hint?.isolation_escape === true) return { no_delegate: true }
+    // native 下执行器声明本次运行的卡住都不委托（无法识别的授权界面也可能被归为 question / other）。
+    if (hint?.isolation_escape === true || this.run?.noDelegate?.() === true)
+      return { no_delegate: true }
     if (reason !== 'awaiting_approval') return {}
     const id = hint?.decision_id
     if (typeof id !== 'number' || !Number.isInteger(id)) return {}
@@ -1586,7 +1594,7 @@ class LeaseRunner {
       // 以 blocked 结束（崩溃、执行器自己判定卡住）时同样附带改动摘要；刚拒收过批准时不委托。
       const diff = await this.diffStat()
       if (this.released) return
-      const noDelegate = this.noDelegateNext
+      const noDelegate = this.noDelegateNext || this.run?.noDelegate?.() === true
       this.noDelegateNext = false
       if (diff || noDelegate) {
         req = {
@@ -2088,7 +2096,7 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
     if (!probeOptions) return Promise.resolve()
     probing ??= (async () => {
       try {
-        const { run, intervalMs: _i, versionCheckMs: _v, ...rest } = probeOptions
+        const { run, intervalMs: _i, versionCheckMs: _v, gate: _g, ...rest } = probeOptions
         latestProbe = await (run ?? runIsolationProbe)({
           ...rest,
           home,
@@ -2115,6 +2123,7 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
         logger.warn(`隔离自检（${why}）失败`, String(err))
       } finally {
         probing = undefined
+        if (latestProbe) probeOptions.gate?.update(latestProbe)
       }
     })()
     return probing
@@ -2127,6 +2136,11 @@ async function startNodeLocked(options: StartNodeOptions): Promise<Result<Runnin
     if (!r.ok) logger.warn('上报隔离自检结果失败', r.error.code)
   }
   if (probeOptions) {
+    // codex 可执行文件变化（例如升级）后 native 启动被闸门拒绝：尽快重新自检并上报。
+    if (probeOptions.gate)
+      probeOptions.gate.onStale = () => {
+        if (!stopper.signal.aborted) void runProbe('codex 可执行文件变化').then(reportProbe)
+      }
     const intervalMs = probeOptions.intervalMs ?? ISOLATION_PROBE_INTERVAL_MS
     const versionCheckMs = probeOptions.versionCheckMs ?? ISOLATION_PROBE_VERSION_CHECK_MS
     const macosVersion = probeOptions.macosVersion ?? defaultMacosVersion

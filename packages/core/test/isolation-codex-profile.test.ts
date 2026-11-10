@@ -140,6 +140,18 @@ describe('Codex permissions profile（native）', () => {
     expect(Object.values(p?.filesystem ?? {}).filter((v) => v === 'read')).toHaveLength(1)
   })
 
+  test('审查第一轮 M3：readOnly 中的路径（可写工作区内的 .git/hooks、.git/config）一律写 read', () => {
+    const r = codexNativeProfile({
+      spec: SPEC,
+      sandbox: 'workspace-write',
+      name: 'raindown-x',
+      readOnly: ['/Users/u/work/.git/hooks', '/Users/u/work/.git/config'],
+    })
+    if (!r.ok) throw new Error(r.error.message)
+    expect(r.data.filesystem).toContainEqual(['/Users/u/work/.git/hooks', 'read'])
+    expect(r.data.filesystem).toContainEqual(['/Users/u/work/.git/config', 'read'])
+  })
+
   test('tomlBasicString：转义反斜杠、引号与全部控制字符', () => {
     expect(tomlBasicString('a\\b"c')).toBe('"a\\\\b\\"c"')
     expect(tomlBasicString('x\ny\u0000\u001f\u007f')).toBe('"x\\u000Ay\\u0000\\u001F\\u007F"')

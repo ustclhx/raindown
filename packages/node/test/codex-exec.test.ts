@@ -31,11 +31,13 @@ import {
   type ExecutorContext,
   type ExecutorRun,
   execCodexHome,
+  type NativeProbeGate,
   prepareReadCodexHome,
   readCodexHome,
   writeLeaseTokenFile,
 } from '../src/index.ts'
 import { bench } from './harness.ts'
+import { passingNativeGate } from './native-helpers.ts'
 import { processStopped } from './process.ts'
 import { initTestRepo } from './sealed-helpers.ts'
 import { waitFor } from './wait.ts'
@@ -1088,11 +1090,21 @@ send(resumed)
 describe('native：Codex permissions profile（worker-credential-isolation 5.1）', () => {
   const hubUrl = 'http://127.0.0.1:7477'
   const NAME = 'raindown-test'
-  const isolation = (s: ReturnType<typeof setup>, enforce = true) => ({
+  /** 探针通过、用的是同一个“codex”（测试中为 bun 本身）的闸门；网络打开的探针结果。 */
+  const gate = () =>
+    passingNativeGate('codex-exec', ['read-only', 'workspace-write'], process.execPath, {
+      network: true,
+    })
+  const isolation = (
+    s: ReturnType<typeof setup>,
+    enforce = true,
+    nativeGate: NativeProbeGate | null = gate(),
+  ) => ({
     enforce,
     platform: 'darwin' as const,
     userHome: join(s.dir, 'user'),
     env: {},
+    ...(nativeGate ? { nativeGate } : {}),
   })
   const withToken = async (s: ReturnType<typeof setup>) => ({
     ...s.ctx,
@@ -1124,7 +1136,8 @@ describe('native：Codex permissions profile（worker-credential-isolation 5.1�
     // CODEX_HOME 位于 raindown-home 内，已被整体拒绝覆盖（省略被覆盖的子路径），只有 tmp/ 重新放行为只读。
     expect(def).not.toContain(`"${codexHome}"=`)
     expect(def).toContain(`"${join(codexHome, 'tmp')}"="read"`)
-    expect(def).toContain(`"${join(realpathSync(s.dir), 'codex-src', 'auth.json')}"="deny"`)
+    // 用户的 Codex 目录（auth.json 源所在目录）整体拒绝（审查第一轮）。
+    expect(def).toContain(`"${join(realpathSync(s.dir), 'codex-src')}"="deny"`)
     expect(def).toContain(`"${realpathSync(ctx.leaseTokenFile)}"="read"`)
     // 受保护项（私钥目录、Orca 运行时目录、LaunchAgents）。
     expect(def).toContain(`"${join(realpathSync(s.dir), 'user', '.config', 'sops', 'age')}"="deny"`)
@@ -1223,5 +1236,102 @@ describe('native：Codex permissions profile（worker-credential-isolation 5.1�
     const args = s.report().args
     expect(args.slice(-4, -2)).toEqual(['-s', 'read-only'])
     expect(configs(args).some((v) => v.startsWith('default_permissions='))).toBe(false)
+  })
+
+  test.each([
+    ['没有闸门（未配置探针）', () => null, '没有隔离自检结果'],
+    [
+      '最近一次探针不通过',
+      () => passingNativeGate('codex-exec', ['read-only'], process.execPath, { passed: false }),
+      '隔离自检不通过',
+    ],
+    [
+      '探针用的是另一个 codex 可执行文件',
+      () => passingNativeGate('codex-exec', ['read-only'], '/bin/sh'),
+      '与隔离自检时不同',
+    ],
+    [
+      '探针结果已过期',
+      () =>
+        passingNativeGate('codex-exec', ['read-only'], process.execPath, {
+          ranAt: '2000-01-01T00:00:00.000Z',
+        }),
+      '已过期',
+    ],
+  ] as Array<[string, () => NativeProbeGate | null, string]>)(
+    '审查第一轮 H1：%s 时 fail closed，不启动 Codex（isolation_not_applied）',
+    async (_n, g, why) => {
+      const s = setup('send(resumed)', { permissions: { sandbox: 'read-only' } })
+      const { outcome } = await collect(
+        s.run(await withToken(s), { ...s.options, isolation: isolation(s, true, g()) }),
+      )
+      expect(outcome).toMatchObject({
+        outcome: 'failed',
+        result: { reason: 'isolation_not_applied' },
+      })
+      expect(JSON.stringify(outcome)).toContain(why)
+      expect(s.launched()).toBe(false)
+    },
+  )
+
+  test('审查第一轮 H1：角色打开网络但探针以不联网的 profile 运行时不启动', async () => {
+    const s = setup('send(resumed)', {
+      permissions: {
+        sandbox: 'workspace-write',
+        config: { 'sandbox_workspace_write.network_access': true },
+      },
+    })
+    const g = passingNativeGate('codex-exec', ['workspace-write'], process.execPath)
+    const { outcome } = await collect(
+      s.run(await withToken(s), { ...s.options, isolation: isolation(s, true, g) }),
+    )
+    expect(outcome).toMatchObject({
+      outcome: 'failed',
+      result: { reason: 'isolation_not_applied' },
+    })
+    expect(JSON.stringify(outcome)).toContain('network_access')
+    expect(s.launched()).toBe(false)
+  })
+
+  test('审查第一轮 H2：CODEX_HOME/tmp 是指向 state/ 的符号链接时不生成 read 例外、不启动', async () => {
+    const s = setup('send(resumed)', { permissions: { sandbox: 'read-only' } })
+    const ctx = await withToken(s)
+    const codexHome = readCodexHome(s.home)
+    mkdirSync(join(s.home, 'state'), { recursive: true })
+    mkdirSync(codexHome, { recursive: true })
+    symlinkSync(join(s.home, 'state'), join(codexHome, 'tmp'))
+    const { outcome } = await collect(
+      s.run(ctx, { ...s.options, isolation: isolation(s), nativeProfileName: NAME }),
+    )
+    expect(outcome).toMatchObject({
+      outcome: 'failed',
+      result: { reason: 'codex_profile_unsafe_read' },
+    })
+    expect(JSON.stringify(outcome)).toContain('符号链接')
+    expect(s.launched()).toBe(false)
+  })
+
+  test('审查第一轮 H2：派工令牌是符号链接时拒绝启动；CODEX_HOME/tmp 不存在时由节点创建为真实目录', async () => {
+    const s = setup('send(resumed)', { permissions: { sandbox: 'read-only' } })
+    const ctx = await withToken(s)
+    rmSync(ctx.leaseTokenFile)
+    writeFileSync(join(s.dir, 'elsewhere.token'), 'x\n')
+    symlinkSync(join(s.dir, 'elsewhere.token'), ctx.leaseTokenFile)
+    const { outcome } = await collect(
+      s.run(ctx, { ...s.options, isolation: isolation(s), nativeProfileName: NAME }),
+    )
+    expect(outcome.outcome).toBe('failed')
+    expect(s.launched()).toBe(false)
+    const s2 = setup('send(resumed)', { permissions: { sandbox: 'read-only' } })
+    await collect(
+      s2.run(await withToken(s2), {
+        ...s2.options,
+        isolation: isolation(s2),
+        nativeProfileName: NAME,
+      }),
+    )
+    const tmp = join(readCodexHome(s2.home), 'tmp')
+    expect(lstatSync(tmp).isDirectory()).toBe(true)
+    expect(lstatSync(tmp).isSymbolicLink()).toBe(false)
   })
 })

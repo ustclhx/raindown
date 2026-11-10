@@ -188,6 +188,11 @@ export interface ExecutorRun {
    * 应当按 `input_seq` 幂等；不解除 blocked，也不能当作授权回复。文字已由中枢包裹，原样送入。
    */
   inject?(input: DeliveredInput): Promise<InjectResult>
+  /**
+   * 为 true 时本次运行的卡住一律以 `no_delegate` 上报（supervisor 不能代回复）：例如 native 施加层下 Codex 的授权即让命令脱离隔离，
+   * 无法识别的授权界面也可能被归为 question / other（PR #104 审查第一轮）。缺省为 false。
+   */
+  noDelegate?(): boolean
 }
 
 export interface ExecutorPlugin {

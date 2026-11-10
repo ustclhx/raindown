@@ -53,6 +53,8 @@ interface Script {
   staleDecision?: boolean
   /** 像 native 下的 codex-orca 一样：请求批准即脱离隔离（预检带 escapesIsolation，hint 带 isolation_escape）。 */
   isolationEscape?: boolean
+  /** 运行声明 noDelegate（native 下 codex-orca 的全部卡住不委托），hint 不带标注。 */
+  runNoDelegate?: boolean
   verdicts: PrecheckVerdict[]
   delivered: Array<{ reply_id: string; by: string; kind: string }>
   dropped: string[]
@@ -117,6 +119,7 @@ function scriptedExecutor(s: Omit<Script, 'verdicts' | 'delivered' | 'dropped' |
       return {
         activity: queue,
         done,
+        ...(script.runNoDelegate ? { noDelegate: () => true } : {}),
         cancel: async () => {
           queue.close()
           settle(ok({ outcome: 'cancelled', message: '已取消' }))
@@ -282,6 +285,16 @@ describe('precheck 与卡住上报', () => {
     } = await blockedWithDecision({ branch: true, command: PUSH, isolationEscape: true })
     expect(script.verdicts).toEqual([{ allow: false, level: 'user', escapes_isolation: true }])
     expect(decisions(bb, id)).toEqual([])
+    expect(bb.task(id).blocked).toMatchObject({ reason: 'awaiting_approval', no_delegate: true })
+    expect(bb.task(id).blocked).not.toHaveProperty('decision_id')
+  })
+
+  test('审查第一轮：运行声明 noDelegate 时，即使预检判为 supervisor，卡住也以 no_delegate 上报', async () => {
+    const { bench: bb, id } = await blockedWithDecision({
+      branch: true,
+      command: PUSH,
+      runNoDelegate: true,
+    })
     expect(bb.task(id).blocked).toMatchObject({ reason: 'awaiting_approval', no_delegate: true })
     expect(bb.task(id).blocked).not.toHaveProperty('decision_id')
   })

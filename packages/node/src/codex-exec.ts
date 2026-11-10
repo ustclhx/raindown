@@ -382,6 +382,7 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
         // native（tasks 5.1）：开关打开且角色沙箱为 workspace-write / read-only 时，以 Codex permissions profile 拒绝受保护路径；
         // 失败时不启动 Codex。profile 每次启动经 -c 传入（不写共享 CODEX_HOME 的 config.toml），不再传 -s。
         let native: string[] | undefined
+        let codexPath: string | undefined
         const nativeSandbox = nativeApplies(credentialIsolation, role.data, options.isolation)
         if (nativeSandbox && options.isolation) {
           const prepared = await prepareCodexNative(options.isolation, {
@@ -393,6 +394,9 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
             cwd,
             access: readRole ? 'read' : 'write',
             sandbox: nativeSandbox,
+            // 与 spawn 时的 PATH 一致；启动改用解析出的绝对路径（与隔离自检同一个文件，审查第一轮 H1）。
+            codexBin: command[0] ?? 'codex',
+            pathEnv: env.data.PATH ?? process.env.PATH,
             ...(ctx.leaseTokenFile ? { leaseTokenFile: ctx.leaseTokenFile } : {}),
             ...(ctx.hubUrl ? { hubUrl: ctx.hubUrl } : {}),
             ...(roleNetworkEnabled(perms.data.config) ? { networkEnabled: true } : {}),
@@ -411,6 +415,7 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
             return
           }
           native = prepared.data.args
+          codexPath = prepared.data.codexPath
         }
         if (applies && options.isolation) {
           scratchApplied = true
@@ -513,7 +518,7 @@ export function createCodexExecExecutor(options: CodexExecOptions): ExecutorPlug
           const processArgs = [...args]
           if (resumeSession) processArgs.push('resume', resumeSession)
           processArgs.push('--', prompt)
-          const argv = [...seatbelt, command[0] ?? 'codex', ...processArgs]
+          const argv = [...seatbelt, codexPath ?? command[0] ?? 'codex', ...processArgs]
           child = spawn(argv[0] as string, argv.slice(1), {
             cwd,
             env: childEnv,
