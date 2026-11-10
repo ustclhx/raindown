@@ -940,8 +940,8 @@ describe('外层 seatbelt（worker-credential-isolation 4.3）', () => {
     expect(lstatSync(profile).mode & 0o777).toBe(0o600)
     const text = readFileSync(profile, 'utf8')
     expect(text).toContain('(version 1)\n(allow default)\n')
-    // 独立的 CODEX_HOME（审查第一轮 H3）：内部也是白名单，只放行运行状态；不与 workspace-write 共用的 codex-home。
-    // 每个任务一个独立的 CODEX_HOME（审查第二轮 M1）。
+    // 独立的 CODEX_HOME（审查第一轮 H3）：不与 workspace-write 共用的 codex-home；每个任务一个（审查第二轮 M1）。
+    // 4.5 实测后整体可写（用户 2026-11-10 决定），只有 auth.json 链接本身拒绝写。
     const sealedHome = join(realpathSync(s.home), 'run/tasks/t-test/codex-home')
     // 任务完成后删除。
     expect(existsSync(sealedHome)).toBe(false)
@@ -949,9 +949,11 @@ describe('外层 seatbelt（worker-credential-isolation 4.3）', () => {
     expect(text).toContain('(deny file-write*)\n')
     const writeBlock =
       text.split('(allow file-write*')[1]?.split('(allow network-outbound')[0] ?? ''
-    expect(writeBlock).not.toContain(`(subpath "${sealedHome}")`)
+    expect(writeBlock).toContain(`(subpath "${sealedHome}")`)
     for (const name of ['sessions', 'log', 'tmp'])
-      expect(text).toContain(`(subpath "${join(sealedHome, name)}")`)
+      expect(text).not.toContain(`(subpath "${join(sealedHome, name)}")`)
+    // 没有配置 darwinUserCacheDir：不放行 mds、不记录基线。
+    expect(text).not.toContain('/mds"')
     // 普通 CODEX_HOME（无外层 seatbelt 的设置共用）没有被创建或放行。
     expect(existsSync(execCodexHome(s.home))).toBe(false)
     // auth.json 链接本身拒绝写（M1）。

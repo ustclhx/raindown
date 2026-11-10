@@ -75,6 +75,12 @@ import {
   removeSeatbeltProfile,
   writeLeaseTokenFile,
 } from './lease-token.ts'
+import {
+  describeMdsVerification,
+  type MdsVerification,
+  mdsBaselinePath,
+  verifyMdsBaseline,
+} from './mds.ts'
 import { acquireNodeLock } from './node-lock.ts'
 import { createPolicyPrecheck, type Precheck, type PrecheckRequest } from './precheck.ts'
 import {
@@ -802,6 +808,38 @@ class LeaseRunner {
     return redactLines(this.tail).slice(-STUCK_TAIL_LINES)
   }
 
+  /**
+   * harness 结束后按启动前记录的基线校验并重置 macOS Security 缓存（`mds.ts`，worker-credential-isolation 4.5）。
+   * 只有施加了外层 seatbelt 且放行了 mds 的启动才有基线；有变化时记一条任务活动，并经带外信号让中枢写 Digest 收件箱条目
+   * （随之后的续约送达，只含文件名）。不抛出。
+   */
+  private async checkMds(): Promise<void> {
+    let v: MdsVerification | undefined
+    try {
+      v = await verifyMdsBaseline(this.env.home, this.grant.task_id)
+    } catch (err) {
+      this.env.logger.warn('无法校验 macOS Security 缓存（mds）', (err as Error).message)
+      return
+    }
+    const text = v ? describeMdsVerification(v) : undefined
+    if (!v || !text) return
+    this.env.logger.warn(`任务 ${this.grant.task_id}：${text}`)
+    this.buffer.push({
+      ts: new Date(this.env.clock.now()).toISOString(),
+      kind: 'status',
+      text,
+      data: { mds_reset: { files: v.reset, failed: v.failed } },
+    })
+    if (this.buffer.length > ACTIVITY_BUFFER_MAX) this.buffer.shift()
+    const files = [...v.reset, ...v.failed]
+    if (files.length > 0 || v.dirReplaced)
+      this.outOfBand.push({
+        id: `mds-reset:${this.grant.lease_id}`.slice(0, 128),
+        kind: 'mds_reset',
+        files: (files.length > 0 ? files : ['mds']).slice(0, 100).map((f) => f.slice(0, 255)),
+      })
+  }
+
   private onActivity(a: Activity) {
     this.buffer.push(a)
     if (this.buffer.length > ACTIVITY_BUFFER_MAX) this.buffer.shift()
@@ -1441,6 +1479,9 @@ class LeaseRunner {
         await this.tokenWrites
         if (wakeTokenFile) await removeWakeTokenFile(wakeTokenFile).catch(() => {})
         if (this.leaseTokenFile) await removeLeaseTokenFile(this.leaseTokenFile).catch(() => {})
+        // 外层 seatbelt 下 harness 结束（正常结束、崩溃、取消、阻塞都经过这里）：按启动前的基线校验并重置 mds（4.5）。
+        // 没有基线（开关关闭、未施加或未放行 mds）时不 await，不改变执行结束时的时序。
+        if (existsSync(mdsBaselinePath(this.env.home, this.grant.task_id))) await this.checkMds()
         // 外层 seatbelt 配置只在启动 harness 时读取（4.1），执行结束即删除。
         await removeSeatbeltProfile(this.env.home, this.grant.task_id).catch(() => {})
         // 任务私有目录变空时一并删除（审查目录由执行器在会话结束时清理）。

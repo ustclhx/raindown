@@ -47,9 +47,6 @@ const SPEC: IsolationSpec = {
   write_carve_out_literals: ['/Users/u/work/.git'],
   allow_write_regex: ['^/Users/u/Library/Keychains/login\\.keychain-db(\\.sb-[^/]+)?$'],
   allow_write_git: ['/Users/u/clone/.git'],
-  allow_write_inside: ['/Users/u/raindown-home/run/tasks/t-1/codex-home/sessions'],
-  allow_write_inside_literals: ['/Users/u/raindown-home/run/tasks/t-1/codex-home/history.jsonl'],
-  allow_write_inside_regex: ['^/Users/u/raindown-home/run/tasks/t-1/codex-home/[^/]+\\.sqlite$'],
   deny_write_except: [
     { path: '/Users/u/.codex', except: ['/Users/u/.codex/auth.json'] },
     { path: '/Users/u/.zshenv', except: [] },
@@ -99,9 +96,6 @@ describe('SBPL 生成', () => {
       write_carve_outs: [],
       write_carve_out_literals: [],
       allow_write_git: [],
-      allow_write_inside: [],
-      allow_write_inside_literals: [],
-      allow_write_inside_regex: [],
       allow_write_regex: [],
       deny_write_except: [],
       deny_read: [],
@@ -144,8 +138,6 @@ describe('SBPL 生成', () => {
       'write_carve_outs',
       'write_carve_out_literals',
       'allow_write_git',
-      'allow_write_inside',
-      'allow_write_inside_literals',
     ] as const) {
       const w = renderSeatbeltProfile({ ...SPEC, [key]: [evil] })
       if (!w.ok) throw new Error(w.error.message)

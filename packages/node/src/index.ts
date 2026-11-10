@@ -176,6 +176,15 @@ export {
   writeSeatbeltProfile,
 } from './lease-token.ts'
 export {
+  describeMdsVerification,
+  MDS_BASELINE_FILE,
+  type MdsVerification,
+  mdsBaselinePath,
+  recordMdsBaseline,
+  snapshotMds,
+  verifyMdsBaseline,
+} from './mds.ts'
+export {
   DELIVER_GIVE_UP_MS,
   DELIVER_TIMEOUT_MS,
   generateNodeId,
@@ -247,6 +256,7 @@ export {
   hubPortOf,
   IMPLEMENTED_ISOLATION_LAYERS,
   prepareSeatbelt,
+  recordSeatbeltMdsBaseline,
   SANDBOX_EXEC,
   type SeatbeltLaunchInput,
   type SeatbeltOptions,

@@ -248,6 +248,41 @@ export function createInboxReactor(o: InboxReactorOptions): InboxReactor {
     const task = ledger.getTask(e.task_id ?? '')
     if (!task) return
     const p = e.payload
+    if (p.kind === 'mds_reset') {
+      // 外层 seatbelt 下 harness 结束后 mds/ 被改动并已重置（worker-credential-isolation 4.5）：Digest 级通知，只列文件名。
+      if (ledger.getInboxItem(outOfBandItemId(e.seq))) return
+      write({
+        type: 'inbox.item_created',
+        task_id: task.id,
+        workspace: task.workspace,
+        payload: {
+          item_id: outOfBandItemId(e.seq),
+          level: resolveInboxLevel(config(), {
+            source: 'isolation',
+            workspace: task.workspace,
+            reason: p.kind,
+          }),
+          source: 'isolation',
+          source_ref: task.id,
+          source_seq: e.seq,
+          reason: p.kind,
+          title: clipText(
+            `[${task.workspace}] 任务结束后重置了 macOS Security 缓存（mds）`,
+            INBOX_TITLE_MAX,
+          ),
+          body: clipText(
+            [
+              `任务 ${task.id} 的 harness 在外层 seatbelt 内运行后，DARWIN_USER_CACHE_DIR/mds 下以下条目有变化或新增，节点已删除（macOS 会自动重建）：`,
+              ...p.files.map((f) => `- ${f}`),
+              '沙箱外的进程同时合法更新这些文件也会触发重置，重建无害。',
+            ].join('\n'),
+            INBOX_BODY_MAX,
+          ),
+          actions: [],
+        },
+      })
+      return
+    }
     const drafts: EventInput[] = []
     if (p.kind === 'approval_outside_raindown') {
       for (const draft of closeTaskDrafts(task, 'handled_externally', {
@@ -657,7 +692,7 @@ export function createInboxReactor(o: InboxReactorOptions): InboxReactor {
    */
   function reconcile() {
     needsReconcile = false
-    for (const kind of ['approval_outside_raindown', 'session_removed']) {
+    for (const kind of ['approval_outside_raindown', 'session_removed', 'mds_reset']) {
       for (const event of ledger.eventsByPayload('task.out_of_band', 'kind', kind)) {
         if (event.type === 'task.out_of_band') onOutOfBand(event)
       }

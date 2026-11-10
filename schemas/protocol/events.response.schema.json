@@ -3566,6 +3566,41 @@
                 "kind"
               ],
               "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "mds_reset"
+                },
+                "files": {
+                  "minItems": 1,
+                  "maxItems": 100,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 255
+                  },
+                  "description": "被删除的 mds/ 条目名（只有文件名）"
+                },
+                "message": {
+                  "type": "string",
+                  "maxLength": 16384
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "files"
+              ],
+              "additionalProperties": false
             }
           ]
         }

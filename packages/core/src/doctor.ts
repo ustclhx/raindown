@@ -13,7 +13,12 @@ import { isRepoRoot } from './git.ts'
 import { type Env, GIT_REPOS, type RaindownHomeSource, raindownPaths } from './home.ts'
 import { roleSandboxInfo } from './isolation/capability.ts'
 import { describeIsolationStatus, isolationStatusRows } from './isolation/probe.ts'
-import { normalizeExtraWrite } from './isolation/write-allowlist.ts'
+import {
+  type DarwinUserCacheDirResolution,
+  mdsDirOf,
+  normalizeExtraWrite,
+  resolveDarwinUserCacheDir,
+} from './isolation/write-allowlist.ts'
 import type { NodeView } from './ledger/protocol.ts'
 import { loadPoliciesConfig } from './policy/config.ts'
 import { policyVersion } from './policy/version.ts'
@@ -91,6 +96,8 @@ export interface DoctorOptions {
    * 缺省不读取；CLI 的 doctor 经中枢读取，测试注入。中枢不可用时只给 info，不影响退出码。
    */
   isolationNodes?: () => Promise<Result<{ nodes: NodeView[] }>>
+  /** `DARWIN_USER_CACHE_DIR` 的解析（外层 seatbelt 放行 mds，4.5）；缺省运行 `getconf`，测试注入。 */
+  resolveDarwinUserCacheDir?: () => Promise<DarwinUserCacheDirResolution>
 }
 
 /** 在 PATH 中查找可执行文件，返回绝对路径。 */
@@ -525,7 +532,12 @@ export async function runDoctor(
   }
 
   checks.push(
-    ...(await isolationSwitchChecks(home, opts.platform ?? process.platform, opts.userHome)),
+    ...(await isolationSwitchChecks(
+      home,
+      opts.platform ?? process.platform,
+      opts.userHome,
+      opts.resolveDarwinUserCacheDir,
+    )),
   )
   if (opts.isolationNodes) checks.push(...(await isolationProbeChecks(opts.isolationNodes)))
 
@@ -553,6 +565,8 @@ export async function isolationSwitchChecks(
   home: string,
   platform: NodeJS.Platform,
   userHome: string = homedir(),
+  /** `DARWIN_USER_CACHE_DIR` 的解析（4.5：放行 mds）；缺省运行 `getconf`，测试注入。 */
+  resolveCacheDir: () => Promise<DarwinUserCacheDirResolution> = () => resolveDarwinUserCacheDir(),
 ): Promise<DoctorCheck[]> {
   const config = await loadNodeConfig(home)
   if (!config.ok) return []
@@ -594,6 +608,7 @@ export async function isolationSwitchChecks(
       },
       ...checks,
     ]
+  const cacheDir = await resolveCacheDir()
   return [
     {
       id: 'isolation.enforce',
@@ -601,6 +616,19 @@ export async function isolationSwitchChecks(
       message:
         'config/node.yaml 的 isolation.enforce 已打开：施加层为 seatbelt 的角色以 sandbox-exec 启动，写入为白名单（是否生效以隔离自检为准）',
     },
+    cacheDir.ok
+      ? {
+          id: 'isolation.mds',
+          ok: true,
+          message: `外层 seatbelt 放行 macOS Security 缓存 ${mdsDirOf(cacheDir.dir)}（harness 结束后节点校验并重置）`,
+        }
+      : {
+          id: 'isolation.mds',
+          ok: false,
+          severity: 'warning',
+          message: `无法解析 DARWIN_USER_CACHE_DIR，外层 seatbelt 不放行 mds：${cacheDir.reason}`,
+          hint: '不放行时 Codex 在沙箱内校验登录会失败（account/read failed during TUI bootstrap）；确认 getconf DARWIN_USER_CACHE_DIR 输出 /var/folders/ 下的路径后重启节点',
+        },
     ...checks,
   ]
 }

@@ -214,3 +214,39 @@ describe('带外上报与收件箱', () => {
     expect(ledger.listInboxItems({ source: 'out_of_band', state: 'open' })).toHaveLength(1)
   })
 })
+
+describe('mds 重置（worker-credential-isolation 4.5）', () => {
+  test('节点上报 mds_reset：写任务事件与 Digest 级收件箱条目（来源 isolation，只列文件名），不改变任务状态；重试与重放不重复', async () => {
+    const { ledger, task, reactor, renew } = await setup()
+    const signal = {
+      id: 'mds-reset:l-1',
+      kind: 'mds_reset',
+      files: ['mdsDirectory.db', 'planted.db'],
+    }
+    must(renew({ out_of_band: [signal] }))
+    must(renew({ out_of_band: [signal] }))
+    await reactor.idle()
+    expect(ledger.getTask(task.id)?.status).toBe('running')
+    expect(ledger.taskEvents(task.id).filter((e) => e.type === 'task.out_of_band')).toMatchObject([
+      { payload: signal },
+    ])
+    const items = ledger.listInboxItems({ source: 'isolation', state: 'open' })
+    expect(items).toHaveLength(1)
+    expect(items[0]).toMatchObject({
+      level: 'digest',
+      source: 'isolation',
+      task_id: task.id,
+      reason: 'mds_reset',
+      actions: [],
+    })
+    expect(items[0]?.body).toContain('mdsDirectory.db')
+    expect(items[0]?.body).toContain('planted.db')
+    expect(ledger.listInboxItems({ source: 'out_of_band' })).toHaveLength(0)
+    reactor.reconcile()
+    await reactor.idle()
+    must(ledger.rebuild())
+    expect(ledger.listInboxItems({ source: 'isolation' })).toHaveLength(1)
+    // 文件名列表不能为空。
+    expect(renew({ out_of_band: [{ id: 'mds-x', kind: 'mds_reset', files: [] }] }).ok).toBe(false)
+  })
+})

@@ -52,6 +52,7 @@ import { prepareSealedWorkdir, rollbackSealedClone, type SealedWorkdir } from '.
 import {
   effectiveCredentialIsolation,
   prepareSeatbelt,
+  recordSeatbeltMdsBaseline,
   type SeatbeltOptions,
   seatbeltApplies,
   seatbeltFailureMessage,
@@ -1755,6 +1756,17 @@ export function createCodexOrcaExecutor(options: CodexOrcaOptions): ExecutorPlug
                 `已有 Codex 终端 ${old} 启动时没有施加外层 seatbelt（升级前或 isolation.enforce 打开前启动），不能重新挂接；${closed.ok ? '已关闭该终端，重试即以隔离方式重启' : '关闭失败，请先手动关闭旧终端后重试'}`,
               )
             } else {
+              if (isolation && st.isolation_layer === 'seatbelt') {
+                // 重新挂接仍在外层 seatbelt 内运行的终端：同样记录 mds 基线，本次执行结束后校验重置（4.5）。
+                const baseline = await recordSeatbeltMdsBaseline(
+                  isolation,
+                  options.home,
+                  ctx.taskId,
+                )
+                if (finished || stopping) return
+                if (!baseline.ok)
+                  return failed(baseline.error.code, seatbeltFailureMessage(baseline.error.message))
+              }
               handle = st.handle
               prevTail = tail
               status(`接着使用已有的终端 ${handle}`)

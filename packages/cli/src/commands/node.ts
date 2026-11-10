@@ -10,6 +10,7 @@ import {
   ok,
   raindownPaths,
   renderTable,
+  resolveDarwinUserCacheDir,
   resolveRaindownHome,
   rotateLog,
 } from '@raindown/core'
@@ -60,6 +61,15 @@ export const nodeStartCommand = defineCommand({
       console.error(
         'config/node.yaml 的 isolation.enforce 已打开，但外层 seatbelt 只支持 macOS，本机不施加',
       )
+    if (seatbeltActive(isolation)) {
+      // macOS Security 框架的 mds/（4.5 实测：Codex 校验登录需要写）：解析失败时不放行，Codex 可能无法校验登录（doctor 提示）。
+      const cacheDir = await resolveDarwinUserCacheDir()
+      if (cacheDir.ok) isolation.darwinUserCacheDir = cacheDir.dir
+      else
+        console.error(
+          `无法解析 DARWIN_USER_CACHE_DIR，外层 seatbelt 不放行 mds：${cacheDir.reason}`,
+        )
+    }
     // fake 用于端到端测试；其余执行器调用本机的 Orca / Codex、Claude Agent SDK 与 gh。
     const started = await startNode({
       home,

@@ -73,7 +73,7 @@ const subpaths = (paths: readonly string[]) => paths.map((p) => `(subpath ${sbpl
 const literals = (paths: readonly string[]) => paths.map((p) => `(literal ${sbplString(p)})`)
 
 /**
- * 正则过滤器（写白名单中的登录钥匙串、harness 运行状态文件）：正则由 core 生成（路径前缀已转义），
+ * 正则过滤器（写白名单中的登录钥匙串、pnpm 12 的锁目录）：正则由 core 生成（路径前缀已转义），
  * 这里再校验一次——必须以 `^/` 开头，不能含双引号与控制字符（SBPL 的 `#"…"` 字面量不能转义双引号）。
  */
 export function sbplRegex(src: string): string {
@@ -168,18 +168,13 @@ export function renderSeatbeltProfile(spec: IsolationSpec): Result<string> {
         spec.allow_unix_sockets.map((p) => `(remote unix-socket (path-literal ${sbplString(p)}))`),
       ),
       '',
-      ';; 1a. 白名单内再拒绝写：登记仓库的 git 目录与 .git 指针文件、harness 目录中会被加载或执行的配置',
+      ';; 1a. 白名单内再拒绝写：登记仓库的 git 目录与 .git 指针文件、harness 目录中的凭证链接与配置、mds 目录节点本身',
       ...rule('deny', 'file-write*', [
         ...subpaths(spec.write_carve_outs),
         ...literals(spec.write_carve_out_literals),
       ]),
       ';; 1b. 本任务独立 clone 的 .git（写类角色）；config、hooks、alternates 等在下面再次拒绝。登记仓库的 .git 整体只读',
-      ...rule('allow', 'file-write*', [
-        ...subpaths(spec.allow_write_git),
-        ...subpaths(spec.allow_write_inside),
-        ...literals(spec.allow_write_inside_literals),
-        ...spec.allow_write_inside_regex.map(sbplRegex),
-      ]),
+      ...rule('allow', 'file-write*', subpaths(spec.allow_write_git)),
       '',
       ';; 2. 受保护资源：读写拒绝（以目录为单位，新增文件自动覆盖）；写在白名单之后，白名单不能重新放开',
       ...rule('deny', 'file-read*', subpaths(spec.deny_read)),

@@ -377,35 +377,17 @@ export async function removeSealedCodexHome(home: string, taskId: string): Promi
 }
 
 /**
- * 独立 CODEX_HOME 内部也是白名单（H3）：只放行运行状态——会话记录、日志、缓存、临时目录（Codex 启动时在 `tmp/arg0/`
- * 建 apply_patch 等别名链接，拒绝会使这些工具不可用；这个目录只被同样受隔离的 Codex 使用，见 docs）、
- * 根目录的 `history.jsonl`、`version.json`、`internal_storage.json` 与 sqlite 状态库。
- * `.env`、`config.toml`、`shell_snapshots/`、`prompts/`、`rules/`、`hooks.json`、`AGENTS*.md`、`skills/`、`plugins/`、
- * `models_cache.json` 等会被加载或执行的文件都不在内。
- */
-export const SEALED_CODEX_HOME_ALLOW = {
-  subpaths: ['sessions', 'archived_sessions', 'log', 'cache', 'tmp'],
-  files: ['history.jsonl', 'version.json', 'internal_storage.json'],
-  fileRegex: '[^/]+\\.sqlite(-wal|-shm|-journal)?',
-} as const
-
-/**
- * 外层 seatbelt 下 Codex 的 harness 目录（独立 CODEX_HOME）：
- * - 内部白名单见 `SEALED_CODEX_HOME_ALLOW`；
- * - `auth.json` 链接本身拒绝写（不能被换成指向别处的链接或普通文件，审查第一轮 M1）；
+ * 外层 seatbelt 下 Codex 的 harness 目录（本任务的独立 CODEX_HOME，用户 2026-11-10 决定，4.5 实测）：
+ * - 目录**整体可写**：Codex 启动时写 `installation_id`、`thread-writer-locks/`、`tui-thread-reference-capabilities/`、
+ *   `.sqlite-maintenance.lock`、`.sandbox_migration`、`config.toml`（TUI 状态）、`models_cache.json`、`plugins/`、`shell_snapshots/`、
+ *   `skills/.system/` 等，内部白名单会使 TUI 启动即退出。该目录只被本任务沙箱内的 Codex 读取（与未施加的设置、其他任务都不共享，
+ *   任务完成或取消时删除），worker 写入的内容只影响本任务，且仍在沙箱内执行；节点每次启动前重新覆盖 `config.toml`、清除扩展；
+ * - `auth.json` 链接本身拒绝写（不能被删除或换成指向别处的链接、普通文件，审查第一轮 M1）；它是拒绝项，所以 `codex-home` 目录本身
+ *   作为其祖先不能改名（`protectedAncestors`）；
  * - 链接目标（用户的 `auth.json`）这一个文件可写：Codex 在进程内刷新登录凭证并经链接写回。worker 因此可以把它换成
  *   攻击者账号的凭证（登记在 design Risks）；改由节点在沙箱外刷新需要 Codex 支持只读凭证，目前不可行（见 docs）。
  */
 export const codexHarnessPaths = (codexHome: string): HarnessPath[] => [
-  {
-    path: codexHome,
-    access: 'write',
-    only: {
-      subpaths: [...SEALED_CODEX_HOME_ALLOW.subpaths],
-      files: [...SEALED_CODEX_HOME_ALLOW.files],
-      fileRegex: SEALED_CODEX_HOME_ALLOW.fileRegex,
-    },
-    denyWrite: ['auth.json'],
-  },
+  { path: codexHome, access: 'write', denyWrite: ['auth.json'] },
   { path: join(codexHome, 'auth.json'), access: 'write', literal: true },
 ]
