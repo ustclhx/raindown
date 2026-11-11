@@ -1500,14 +1500,14 @@ CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"'
 CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"' -- cat "$TOK"                  # 预期 FAKE-LEASE
 CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x > ok.txt'     # 预期成功
 CODEX_HOME=$CH codex sandbox -c "$RO" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x > ro.txt'     # 预期失败（read-only）
-# .git 收回为只读（审查第一轮 M3）。注意：$R 若在 /tmp 下（/tmp 本身是可写根），.git 缺省可写、commit 成功；
-# 在其他位置，:workspace 把工作目录内的 .git 整体收为只读，hooks/config 写入与 commit 都失败（见上文「native」）
+# .git 收回为只读（审查第一轮 M3）。注意：本脚本的 $R 由 mktemp -d 建在 $TMPDIR 下；$TMPDIR 与 /tmp 本身是可写根，其中 .git 缺省可写、commit 成功；
+# 在其他位置（例如 /var/tmp、真实工作目录），:workspace 把工作目录内的 .git 整体收为只读，hooks/config 写入与 commit 都失败（见上文「native」）
 git -C "$R/work" init -q
 CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x > .git/hooks/post-checkout'   # 缺省行为，记录结果
 GW='permissions.raindown-verify={extends=":workspace",filesystem={"'$RH'"="deny","'$R/user-codex'"="deny","'$CH/tmp'"="read","'$TOK'"="read","'$R/work/.git/hooks'"="read","'$R/work/.git/config'"="read"},network={unix_sockets={}}}'
 CODEX_HOME=$CH codex sandbox -c "$GW" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x > .git/hooks/post-checkout'   # 预期失败
 CODEX_HOME=$CH codex sandbox -c "$GW" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x >> .git/config'               # 预期失败
-CODEX_HOME=$CH codex sandbox -c "$GW" -c 'default_permissions="raindown-verify"' -- sh -c 'git status && touch x && git add x && git -c user.name=t -c user.email=t@t commit -qm t'  # /tmp 下成功；其他位置失败（.git 只读）
+CODEX_HOME=$CH codex sandbox -c "$GW" -c 'default_permissions="raindown-verify"' -- sh -c 'git status && touch x && git add x && git -c user.name=t -c user.email=t@t commit -qm t'  # 在 $TMPDIR 或 /tmp 下成功；其他位置失败（.git 只读）
 # 以下调用模型：需要登录，把用户的 auth.json 链接进临时 CODEX_HOME（只建链接，不读取内容）
 ln -sf ~/.codex/auth.json "$CH/auth.json"
 CODEX_HOME=$CH codex exec --json --skip-git-repo-check -c "$RO" -c 'default_permissions="raindown-verify"' -c 'approval_policy="never"' \
