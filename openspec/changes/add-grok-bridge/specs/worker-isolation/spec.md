@@ -6,7 +6,7 @@
 角色配置 SHALL 支持 `isolation: required | preferred | off`。`required` 的角色只派给声明 `credential_isolation` 且隔离自检通过的执行器与节点；无法满足时任务以明确原因卡住或拒绝派工，MUST NOT 在无隔离的情况下运行。`preferred` 在无法隔离时运行并在任务与收件箱中标明"未隔离"。
 
 harness 不在本机运行的执行器（声明 `off_machine: true`，例如 `grok-routine`）没有可隔离的本机 worker 进程，SHALL 如实声明施加层为 `none`：
-- 这类执行器的角色设为 `required` 时 MUST 在加载时报错（`raindown doctor` 报告"不支持隔离"），该角色的任务无法创建，不得视为已满足；
+- 这类执行器的角色设为 `required` 时 MUST 在加载时报错（角色加载看不到节点运行时的声明，按执行器名判定，与 pr-merge、supervisor 唤醒会话相同）（`raindown doctor` 报告"不支持隔离"），该角色的任务无法创建，不得视为已满足；
 - `preferred` 下不标注"未隔离"、不产生未隔离提示，任务标明"外部执行"；
 - 它们触达 Raindown 的范围由远程调用方的凭证与能力限定（见 remote-mcp）。
 
