@@ -38,7 +38,7 @@
     **每次启动经 `-c` 以 TOML 内联表传入**，不写进共享 CODEX_HOME 的 `config.toml`（多个任务共享同一 CODEX_HOME，按任务的条目写文件会竞态）；profile 名带随机后缀，
     防止被同名表合并追加条目。探针以 `codex sandbox -P` 运行同源 profile；授权请求按 D5 标注并交给用户。见 `docs/executors.md`「`native`」。
   - Claude Code 不支持可靠的原生读限制（`denyRead` 只覆盖 Bash）。claude-sdk 开启 bash 沙箱时声明为 `none`；需要隔离的角色应关闭 bash 沙箱，改由外层 seatbelt 施加。
-- **独立系统用户**：最稳妥的退路，与 harness 沙箱完全正交。worker 以专用用户运行，受保护资源仍由主用户持有（0700）。代价有三：需要用户批准系统级改动（新建用户、sudoers 规则）；harness 凭证需要为该用户单独登录或经 Raindown 注入；worktree 需要共享组权限。只在前两层都不可行时启用，并且需要用户在实施时明确同意。
+- **独立系统用户**：最稳妥的退路，与 harness 沙箱完全正交。worker 以专用用户运行，受保护资源仍由主用户持有（0700）。代价有三：需要用户批准系统级改动（新建用户、sudoers 规则）；harness 凭证需要为该用户单独登录或经 Raindown 注入；worktree 需要共享组权限。只在前两层都不可行时启用，并且需要用户在实施时明确同意。（结论，2026-11-11：前两层实测可靠，用户决定不实现此方案，`separate_user` 只保留为能力枚举值。）
 - 适配器能力 `credential_isolation` 取值为 `seatbelt | native | separate_user | none`，按角色的沙箱设置分别声明。中枢按能力派送。按 1.1 的结论：
 
   | 适配器 | 沙箱设置 | 施加层 |

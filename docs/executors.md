@@ -1765,7 +1765,7 @@ isolation: required   # required | preferred | off
 
 ## 隔离实测（worker-credential-isolation 1.1）
 
-2026-11-07 在本机实测，服务于 `openspec/changes/add-worker-credential-isolation` 的 D1、D2、D4、D6。全程不调用模型。
+2026-11-07 在本机实测，服务于 `openspec/changes/archive/2026-11-11-add-worker-credential-isolation` 的 D1、D2、D4、D6。全程不调用模型。
 只用临时目录与临时 `HOME`、`CODEX_HOME`、`RAINDOWN_HOME`、`CLAUDE_CONFIG_DIR`，受保护文件都是伪造的（内容如 `FAKE-HUB-TOKEN-not-a-secret`）。
 只读取了 Orca 运行时的元数据（`orca status --json`、`lsof`），没有连接或操作它。
 外层 seatbelt 配置样例见 [`worker-isolation.sb`](worker-isolation.sb)。配置本身不含路径，路径全部经 `sandbox-exec -D` 传入。
