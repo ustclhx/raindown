@@ -38,6 +38,11 @@
 - [ ] 4.4 `ready` 交付物支持 `raindown:proposal/<id>`：核对提案 `actor` 为上报者、新内容归属一致、`created_at` 不早于本次派工开始（接管时按原派发时间）；`target_hidden` 不参与核对，只记录在产物上并在任务结果、收件箱与 `raindown task show` 中显示；记录提案状态，合入结果产物 `kind: proposal`；测试被标记与未标记的提案得到相同的上报响应；验证 worker-report 的"以提案交付""交付目标不可提案的提案""交付别人的提案"场景
 - [ ] 4.5 执行器：派工正文用 core 模板渲染、请求远程派发、等待上报、`no_progress` 卡住、`deliver` 返回 `not_running` 触发重新派发（回复界面提示旧运行结果将被丢弃）、取消；验证 executor-grok-routine 其余场景（假的 webhook 服务与假的远程上报）
 - [ ] 4.6 `raindown init` 不自动生成 grok 角色；在 executors.md 增加 `grok-research` 示例与提示词模板（交付说明、只用提案交付、不在聊天里贴密钥、提醒派工正文会发往 xAI）
+- [ ] 4.7 计划审查第三轮遗留（实现时处理）：
+  - 暂存上报转到新租约：中枢上报按 `(task, lease_id, attempt)` 存取，节点丢弃 attempt 不符的上报（`packages/node/src/node.ts` `acceptReport`），`reportedCompletion` 也会拒绝旧派工的 `report_seq`；接管时须为新租约与 attempt 重新写入 `task.reported`，并说明暂存期间上报限额计入哪个租约
+  - webhook 返回 2xx 但响应体超限：按成功派发处理（无运行 id），不要记 `dispatch_rejected`，否则 Grok 已开始运行而后续上报全被拒绝
+  - 中枢在派发进行中重启会丢失内存中的幂等记录，节点重发将再次调用 webhook，只能依赖未经验证的 `Idempotency-Key`；在 design 的风险中写明
+  - `kb proposals accept --all` 改为跳过带 `target_hidden` 的提案，对本机用户也是行为变化，写入迁移说明
 
 ## 5. 真实环境上线（用户与协调者）
 
