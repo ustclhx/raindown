@@ -488,6 +488,8 @@ policy:
 
    ② 和 ③ 依赖 ①，④ 依赖 ② 和 ③。
 
+   2026-10-25 追加 ⑤ Grok Bot 接入（`add-grok-bridge`，2026-11-11 按当前 main 更新）：Grok 经 Tailscale 官方插件访问中枢的远程 MCP 入口（独立端口，只经 `tailscale serve` 发布到 tailnet，不用 Funnel），身份固定为 `remote:grok`，只能读白名单 workspace、写提案、为派给它的任务上报；Raindown 经 routine webhook 向 Grok 派活，Grok 用 `raindown_report` 交回结果。Grok 不在本机运行，没有本机 worker 进程可隔离，不能用于 `isolation: required` 的角色。⑤ 依赖 ②、③、add-harness-neutral-coordination 与 add-worker-credential-isolation（均已合并）。
+
    **M1 验收场景**：用户在 Telegram 给 product-res 下一条指令 → supervisor 拆成任务 → Codex 在 worktree 中执行 → 卡住时用户收到推送并回复，worker 继续 → 提 PR → Claude 审查 → 合并 → 验证 main 的发布流水线 → 写 journal。整个过程中用户只操作两次手机。
 
 9. **harness 无关的协调模型**（变更 add-harness-neutral-coordination，2026-11 合并）。中枢与 core 只认与 harness 无关的契约，Codex、Claude 等的差异全部封装在执行器适配器里：
