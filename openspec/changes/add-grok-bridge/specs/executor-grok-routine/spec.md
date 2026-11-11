@@ -25,11 +25,19 @@
 - **THEN** 该执行器显示为"外部执行"，隔离施加层为 `none`
 
 ### Requirement: 由中枢发出 webhook
-每次派工时，节点 SHALL 用 core 的派工模板（恢复提示、待送达输入、原始指令与 supervisor 补充）加角色提示词与固定的交付说明组成正文，经节点协议交给中枢；中枢 SHALL 生成本次派发的 `dispatch_ref` 并填入正文，经密钥脱敏后解密 key，向 webhook 发送 `POST`（带 `Idempotency-Key: <任务 id>:<attempt>`），并记录远程派发事件。webhook key 与 `dispatch_ref` 明文 MUST NOT 出现在节点、账本、活动、结果或日志中（账本只存 `dispatch_ref` 的摘要）。webhook 返回 2xx 时任务保持 `running`；返回 429 或网络错误时重试，仍失败则以 `failed(dispatch_unreachable)` 结束；返回其他非 2xx 时以 `failed(dispatch_rejected)` 结束并记录状态码；key 解密不到时以 `failed(secret_not_found)` 结束，不发出请求。
+每次派工时，节点 SHALL 用 core 的派工模板（恢复提示、待送达输入、原始指令与 supervisor 补充）加角色提示词与固定的交付说明组成正文，经节点协议交给中枢；该请求 MUST 带与任务未过期活动租约匹配的 `lease_token`（或由持有该租约的节点身份发出）。中枢 SHALL 生成本次派发的 `dispatch_ref` 并填入正文，经密钥脱敏后解密 key，向 webhook 发送 `POST`（带 `Idempotency-Key: <任务 id>:<attempt>`，不跟随重定向，响应体有大小上限），并记录远程派发事件。每个租约 MUST 最多派发一次：同一租约的重复请求（含派发仍在进行时）返回同一个结果，不再调用 webhook。webhook key 与 `dispatch_ref` 明文 MUST NOT 出现在节点、账本、活动、结果或日志中（账本只存 `dispatch_ref` 的摘要）。webhook 返回 2xx 时任务保持 `running`；返回 429 或网络错误时重试，仍失败则以 `failed(dispatch_unreachable)` 结束；返回其他非 2xx 时以 `failed(dispatch_rejected)` 结束并记录状态码；key 解密不到时以 `failed(secret_not_found)` 结束，不发出请求。
 
 #### Scenario: 成功派发
 - **WHEN** 节点领取一个角色为 `grok-research` 的任务，webhook 返回 200 和一个运行 id
 - **THEN** 任务保持 `running`，活动记录中出现"已派发到 Grok，运行 id 为 …"，活动与账本中没有 webhook key 与 `dispatch_ref` 明文
+
+#### Scenario: 只有 user token 的进程请求派发
+- **WHEN** 一个读到 `state/hub.token` 的进程以 user 身份调用某个 grok 任务租约的远程派发接口，但没有该租约的 `lease_token`
+- **THEN** 请求被拒绝，不调用 webhook，不产生派发事件
+
+#### Scenario: 节点超时后重发派发请求
+- **WHEN** 中枢正在为某个租约重试 webhook，节点请求超时后对同一租约再次请求远程派发
+- **THEN** webhook 只被调用一轮，两次请求得到同一个结果，账本只有一条派发事件
 
 #### Scenario: key 未配置
 - **WHEN** `grok` 的 `dispatch.key` 引用的 `secret://grok/webhook-key` 不存在
@@ -58,11 +66,15 @@ Grok 侧的运行无法续接。任务卡住后收到回复时，执行器 SHALL
 - **THEN** 任务重新排队并再次派发给 Grok，正文开头包含用户的答复；旧运行此后的上报返回 `not_running`
 
 ### Requirement: 中断后接管
-任务因节点重启或掉线（`crashed`、`node_lost`）被重试时，如果上一次远程派发还没有终态上报、派发时间在 `no_progress_minutes` 之内、且新派工没有新的回复或输入，中枢 SHALL 把上一次的 `dispatch_ref` 转给新派工，不再调用 webhook；否则重新派发。
+任务因节点重启或掉线卡在 `crashed` 或 `node_lost` 期间，中枢 SHALL 接受并暂存当前派发的上报，不改变任务状态。任务被重试时，如果上一次远程派发未被取代、派发时间在 `no_progress_minutes` 之内或已有暂存的上报、且新派工没有新的回复或待送达输入，中枢 SHALL 把上一次的 `dispatch_ref` 转给新派工，不再调用 webhook，并在新租约的第一次续约中下发暂存的上报；否则重新派发。`task_retry` 的 `reason` MUST NOT 被视为新的输入。
 
 #### Scenario: 节点重启后重试
 - **WHEN** Grok 正在运行时节点重启，任务卡在 `crashed`，用户随即 `task_retry`
 - **THEN** 不产生新的 webhook 调用，Grok 原来那次运行之后的 `ready` 上报使任务完成
+
+#### Scenario: 中断期间 Grok 已交回结果
+- **WHEN** 任务卡在 `node_lost` 期间 Grok 以当前 `dispatch_ref` 上报 `ready`，之后用户 `task_retry` 并附 reason
+- **THEN** 上报在卡住期间被接受并暂存；重试不调用 webhook，新派工的第一次续约下发该上报，任务按它完成
 
 ### Requirement: 取消
 任务被取消时，执行器 SHALL 停止等待并以 `cancelled` 结束；之后到达的上报返回 `not_running`。Grok 侧的运行无法被 Raindown 停止，这一点 MUST 在取消结果中注明。

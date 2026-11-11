@@ -26,7 +26,7 @@
 - **THEN** 返回 403 `funnel_denied`，不执行任何工具
 
 ### Requirement: 远程调用方配置
-每个远程调用方 SHALL 在 `config/remote.yaml` 中定义：`id`（其操作者身份为 `remote:<id>`）、`workspaces`（可访问的 workspace 白名单，默认空，最多 8 个）、`include_global`（默认 false）、`capabilities`（`read`、`propose`、`report` 的子集）、`rate_limit_per_minute`（默认 60），以及接派工所需的 `dispatch`（见 executor-grok-routine）。配置不合法时 MUST 报告文件和字段，并只停用出错的调用方。修改后 MUST 在不重启中枢的情况下生效。
+每个远程调用方 SHALL 在 `config/remote.yaml` 中定义：`id`（其操作者身份为 `remote:<id>`）、`workspaces`（可访问的 workspace 白名单，默认空，最多 8 个）、`include_global`（默认 false）、`capabilities`（`read`、`propose`、`report` 的子集）、`rate_limit_per_minute`（默认 60）、接派工所需的 `dispatch`（见 executor-grok-routine），以及 OAuth 分支下的 `oauth.redirect_hosts`（允许的回调主机）。配置不合法时 MUST 报告文件和字段，并只停用出错的调用方。修改后 MUST 在不重启中枢的情况下生效。
 
 #### Scenario: 单个调用方配置错误
 - **WHEN** `remote.yaml` 中有两个调用方，其中一个的 `capabilities` 含未知值 `admin`
@@ -67,7 +67,7 @@
 - **THEN** 返回 `forbidden`，`raw/inbox/` 没有新增文件
 
 ### Requirement: 远程提案
-远程会话的 `kb_propose` SHALL 只接受 `target`、`content`、`reason`，MUST NOT 接受 `file`。新内容的归属 MUST 全部在调用方白名单内，不能为 global，`scope` 不能是 `personal`，否则返回 `workspace_mismatch`。目标条目已存在但对调用方不可见（白名单外、global 而未允许、或 `scope: personal`）时，提案 SHALL 照常保存并标记目标不可见，返回给调用方的结果与目标不存在时相同；用户接受这类提案 MUST 被拒绝。远程响应 MUST NOT 包含 `base_hash` 或其他能反映目标条目当前内容的字段。
+远程会话的 `kb_propose` SHALL 只接受 `target`、`content`、`reason`，MUST NOT 接受 `file`。新内容的归属 MUST 全部在调用方白名单内，不能为 global，`scope` MUST 为 `work`，否则返回 `workspace_mismatch`。目标条目已存在、且对调用方不可见、或是 `decision` / `scope: personal` 条目、或无法解析时，远程调用 MUST NOT 提前返回错误：提案 SHALL 照常保存并标记目标不可提案，返回给调用方的结果与目标不存在时完全相同。远程响应 MUST NOT 包含 `base_hash` 或其他能反映目标条目当前内容的字段。被标记的提案 MUST NOT 能被接受：按 id 接受返回 `remote_target_hidden`，批量接受时跳过它们、照常接受其余提案并列出跳过项；这一约束在 core 的接受逻辑中执行，与入口无关。
 
 #### Scenario: 用 file 读取中枢文件
 - **WHEN** `remote:grok` 调用 `kb_propose`，参数中带 `file: "state/hub.token"`
@@ -79,10 +79,18 @@
 
 #### Scenario: 目标是不可见的已有条目
 - **WHEN** `remote:grok` 对一个已存在、属于 `ws/xuanxue-saas` 的条目路径提交新内容归属 `ws/product-res` 的提案
-- **THEN** 调用方得到与新建条目相同形式的结果 `{id, target}`；用户在提案列表中看到"目标对提议者不可见"，接受时被拒绝
+- **THEN** 调用方得到与新建条目相同形式的结果 `{id, target}`；用户在提案列表中看到"目标对提议者不可见或不可提案"
+
+#### Scenario: 目标是白名单内的个人条目
+- **WHEN** `remote:grok` 对白名单 workspace 中一个 `scope: personal` 的已有条目路径提交提案
+- **THEN** 调用方得到 `{id, target}`，与目标不存在时相同，不返回 `proposal_forbidden`
+
+#### Scenario: 批量接受时遇到被标记的提案
+- **WHEN** 用户运行 `raindown kb proposals accept --all`，待确认的提案中有一个被标记为目标不可提案
+- **THEN** 其余提案照常写入 brain，被标记的提案保持待确认，结果中列出它被跳过及原因
 
 ### Requirement: 远程会话的可见范围
-远程会话的知识读取 SHALL 只返回白名单 workspace 内的条目与 journal 记录；不属于任何 workspace 的条目、`ws/global` 与未标 workspace 的 journal 记录只有在调用方配置了 `include_global: true` 时才返回；`scope: personal` 的条目 MUST NOT 返回给任何远程调用方。过滤 MUST 在检索与读取之前完成，不可见的条目与不存在的条目返回相同的 `not_found`，计数与分页不泄露不可见条目。
+远程会话的知识读取 SHALL 只返回白名单 workspace 内的条目与 journal 记录；不属于任何 workspace 的条目、`ws/global` 与未标 workspace 的 journal 记录只有在调用方配置了 `include_global: true` 时才返回；只有 `scope` 恰好为 `work` 的条目才可能返回给远程调用方（`personal`、缺失或非法一律视为个人条目，MUST NOT 返回）。过滤 MUST 在检索与读取之前完成，不可见的条目与不存在的条目返回相同的 `not_found`，计数与分页不泄露不可见条目。
 
 #### Scenario: 检索不会越过白名单
 - **WHEN** `remote:grok` 的白名单只有 `ws/product-res`，它检索一个只在 `ws/xuanxue-saas` 的条目中出现的词

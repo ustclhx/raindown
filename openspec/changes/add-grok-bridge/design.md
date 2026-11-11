@@ -79,6 +79,8 @@
         kind: grok-routine
         webhook: https://api2.cursor.sh/automations/webhook/<id>
         key: secret://grok/webhook-key
+      oauth:                       # 只在 D4 走 OAuth 分支时需要
+        redirect_hosts: [<第 1 组实测得到的回调主机>]
   ```
 
   单个调用方出错只停用该调用方并报告文件与字段；`remote.yaml` 与 roles、policies 一样是提权面，由用户维护（AI 不得经 MCP 修改 config，现有规则已覆盖）。它位于 `config/` 顶层，中枢的密钥引用扫描（`config/*.yaml`）已覆盖它。
@@ -100,12 +102,13 @@
 - **`kb_propose` 的远程约束**：
   - 输入只有 `target`、`content`、`reason`；没有 `file`（中枢进程能读全部状态，`file` 会让远程调用方读到 `state/hub.token` 等任意文件）。
   - **新内容**的归属（`entryScopes(新 frontmatter)`）必须全部落在白名单 workspace 内，不能为空（global）、不能含 `ws/global`，`scope` 不能是 `personal`；否则 `workspace_mismatch`。
-  - **已有条目**的可见性在提交时**不向调用方透露**：目标存在且对该调用方不可见（归属在白名单外、global 而 `include_global: false`、或 `scope: personal`）时，提案照常保存，但标记 `target_hidden: true`；`raindown kb proposals list|diff` 向用户显示"目标对提议者不可见"，接受时返回 `remote_target_hidden`，只能拒绝。这样提交结果与目标是否存在无关，不形成存在性预言机。
+  - **已有条目**的状态在提交时**不向调用方透露**：目标存在且属于以下任一情形——对该调用方不可见（归属在白名单外、global 而 `include_global: false`、`scope` 不是 `work`）、是 `decision` 或 `scope: personal` 条目（本机 `createProposal` 对这两类以 `checkOrdinary(before)` 提前返回 `proposal_forbidden`）、frontmatter 解析失败——时，远程调用**不提前返回**，提案照常保存，标记 `target_hidden: true` 并在内部记录原因（`hidden`、`not_ordinary`、`unparsable`，只给用户看）。`raindown kb proposals list|diff` 向用户显示"目标对提议者不可见或不可提案"。这样提交结果只取决于调用方自己写的内容，与目标是否存在、是什么类型无关，不形成存在性预言机。本机调用方的行为不变（仍然 `proposal_forbidden`）。
+  - **接受被标记的提案**：拒绝在 core 的 `acceptProposals` 中执行，不只在 CLI：按 id 接受时返回 `remote_target_hidden`；`accept --all` 跳过被标记的提案、照常接受其余提案，并在结果中列出跳过的 id 与原因（不让一条被标记的提案拖垮整批）。被标记的提案只能拒绝。
   - 远程响应只返回 `{id, target}`，不返回 `base_hash`；校验失败只返回错误码与字段路径，不带含其他 workspace 名称的说明文字。
 - **可见范围**：`KbVisibility` 从 `{workspace}` 扩展为 `{workspaces, includeGlobal, excludePersonal}`；任务绑定会话取 `{[任务 workspace], true, false}`（行为不变），远程会话取 `{白名单, include_global, true}`。
-  - 条目：归属判定沿用 `entryScopes` 的取严规则（任一归属不可见即不可见；无法判定即不可见）；`includeGlobal: false` 时空归属与 `ws/global` 不可见；`excludePersonal` 时 frontmatter `scope: personal` 的条目一律不可见。
+  - 条目：归属判定沿用 `entryScopes` 的取严规则（任一归属不可见即不可见；无法判定即不可见）；`includeGlobal: false` 时空归属与 `ws/global` 不可见；`excludePersonal` 时只有 frontmatter `scope` 恰好为 `work` 的条目可见（`scope` 是 `baseShape` 的必填字段；缺失、非法或 `personal` 都按个人条目处理，取严）。
   - journal：`filterJournalBody` 中**未标 workspace 的记录视为 global**，只在 `includeGlobal` 时保留（任务绑定会话恒为 true，行为不变）。
-  - **SQL 实现**：现在的 `visibleScopeEncodings` 按可见集合枚举全部子集，是 2^N 个绑定参数，不适合多 workspace。改为在 SQL 中用 `json_each(e.scope)` 判断"每个归属都在可见集合内"（可见集合作为一个 JSON 参数传入）；白名单上限 8 个。`scope: personal` 需要新增索引列 `personal`（0/1），`INDEX_VERSION` 升到 4（首次启动重建索引）。过滤在 SQL 层与读取前完成，不在返回后裁剪，避免分页和计数泄露；不可见条目与不存在同为 `not_found`。
+  - **SQL 实现**：现在的 `visibleScopeEncodings` 按可见集合枚举全部子集，是 2^N 个绑定参数，不适合多 workspace。改为在 SQL 中用 `json_each(e.scope)` 判断"每个归属都在可见集合内"（可见集合作为一个 JSON 参数传入）；白名单上限 8 个。注意空数组（global 条目）对"每个都在集合内"恒为真：`includeGlobal: false` 时必须另加 `json_array_length(e.scope) > 0` 显式排除，并有测试覆盖。个人条目需要新增索引列 `personal`（0/1），按 `scope !== 'work'` 取值（缺失或非法记为 1，fail closed；journal 不适用，记 0），`INDEX_VERSION` 升到 4（首次启动重建索引）。过滤在 SQL 层与读取前完成，不在返回后裁剪，避免分页和计数泄露；不可见条目与不存在同为 `not_found`。
 - **实现路径**：远程会话的 `kb_*` 在中枢进程内调用与 `/v1/kb/*` 路由相同的 core 实现，只是可见范围来自远程绑定，不经过 HTTP 再走一遍 `/v1`。
 - **限额**：每个调用方全部工具调用按 `rate_limit_per_minute` 限流，超额返回可重试的 `rate_limited`；`raindown_report` 另受现有的每派工限额约束。
 
@@ -130,19 +133,22 @@
 
   webhook 地址与 key 放在 `remote.yaml` 的 `dispatch` 中，不放在角色里：key 是 `secret://` 引用，只有中枢能解密（secret-provider：明文只在中枢内存），中枢的引用扫描也只覆盖 `config/*.yaml`、不覆盖 `config/roles/`。建任务时中枢核对角色的 `remote_client`：调用方不存在、没有 `report` 能力或没有 `dispatch` → 422 `remote_client_invalid`；任务 workspace 不在其白名单内 → 403 `workspace_not_allowed`。
 - **webhook 主机固定**：`dispatch.kind: grok-routine` 时 `webhook` 必须是 `https://api2.cursor.sh/automations/webhook/<id>` 形式（主机写在代码常量里，由第 1 组实测确认），否则调用方加载失败。误改配置不会把 key 发到任意主机。
-- **派发由中枢发出**：节点领取任务后，适配器按顺序拼出派工正文：恢复提示（`renderRecoveryPrompt`）、待送达输入（`renderTaskInputs`）、任务来源（`renderWorkerTaskPrompt`）、角色提示词，以及固定的交付说明（任务 id、`dispatch_ref` 占位、调用 `raindown_report` 的要求、调研结论用 `kb_propose` 提交并以 `ready` 交付提案）。节点经新的节点协议接口 `POST /v1/leases/:id/remote-dispatch {body}` 交给中枢；中枢核对租约与角色的 `remote_client`，生成 `dispatch_ref` 填入正文，按已知密钥值与 gitleaks 规则脱敏，解密 key，向 webhook 发出 `POST`（带 `Idempotency-Key: <task id>:<attempt>`），写 `remote.dispatched{task, attempt, client, dispatch_ref_sha256, run_id, status}` 事件，向节点返回结果（不含 `dispatch_ref`）。key 与 `dispatch_ref` 明文都不进账本、活动与日志，节点也拿不到它们。
+- **派发由中枢发出**：节点领取任务后，适配器按顺序拼出派工正文：恢复提示（`renderRecoveryPrompt`）、待送达输入（`renderTaskInputs`）、任务来源（`renderWorkerTaskPrompt`）、角色提示词，以及固定的交付说明（任务 id、`dispatch_ref` 占位、调用 `raindown_report` 的要求、调研结论用 `kb_propose` 提交并以 `ready` 交付提案）。节点经新的节点协议接口 `POST /v1/leases/:id/remote-dispatch {body, lease_token}` 交给中枢。租约接口对 user token 也开放（本机节点就用它），所以这里与其他依赖租约的字段一样，**必须带与该任务未过期活动租约匹配的 `lease_token`**（或由持有该租约的 `node:<id>` 调用），只拿到 `state/hub.token` 的进程不能借此触发 webhook；`lease_token` 不入账。中枢核对租约与角色的 `remote_client`，生成 `dispatch_ref` 填入正文，按已知密钥值与 gitleaks 规则脱敏，解密 key，向 webhook 发出 `POST`（带 `Idempotency-Key: <task id>:<attempt>`），写 `remote.dispatched{task, attempt, client, dispatch_ref_sha256, run_id, status}` 事件，向节点返回结果（不含 `dispatch_ref`）。key 与 `dispatch_ref` 明文都不进账本、活动与日志，节点也拿不到它们。
+- **幂等**：每个租约（即每个 attempt）最多一次远程派发。中枢按 `(task, attempt)` 记录派发；同一租约再次请求时不再调用 webhook，直接返回已有结果——派发仍在进行（中枢在请求内退避重试，节点可能超时后重发）时等待同一个进行中的派发完成后返回同一结果。webhook 的 `Idempotency-Key` 只是额外的一层。
+- **出站请求**：`fetch` 设 `redirect: 'error'`（不跟随跳转，避免 key 随跳转发往别处）、总超时 30 秒，响应体最多读取 64 KiB，超出按 `dispatch_rejected` 处理；只解析其中的运行 id。
 - **结果**：webhook 返回 2xx 时活动记"已派发到 Grok，运行 id 为 …"；非 2xx（429 除外）以 `failed(dispatch_rejected)` 结束并记录状态码；网络错误与 429 由中枢在同一请求内重试（最多 3 次、指数退避），仍失败返回可重试错误，节点在本派工内再试一次后以 `failed(dispatch_unreachable)` 结束；key 解密不到时以 `failed(secret_not_found)` 结束，不发出请求。
 - **dispatch_ref**：中枢在每次远程派发时生成的不透明随机串，只经 webhook 正文给 Grok。它不是凭证（必须配合该调用方自己的 token 才有意义），但仍按秘密对待：账本只存 SHA-256，`task_show`、事件、活动、`raindown task show` 一律不出现它；中枢按摘要核对，重启后照样可用。
 - **等待与消费**：派发后适配器不产生观察；Grok 的上报照常经续约下发给节点，由节点的合并逻辑处理——`ready` / `failed` / `dropped` 结束派工；`question` / `blocked` 时适配器随即报告 idle，任务以 `basis: reported` 卡住；`progress` 视为活动。
 - **长时间没有上报**：超过角色的 `no_progress_minutes` 没有上报时，节点照常判定 `blocked(no_progress)`（`basis: inferred`），消息写明"Grok 在 N 分钟内没有上报"，节点继续持有租约。`no_progress` 不在 `RETRYABLE_BLOCKED_REASONS` 中，`task_retry` 对持有租约的任务返回 `lease_active`，所以此时用户能做的只有回复或取消。为了不丢 Grok 迟到的结果：**off_machine 派工在 `blocked(no_progress)` 期间仍接受当前 `dispatch_ref` 的上报**（中枢只对这一组合放宽"必须 running"）；节点收到 `ready` / `failed` / `dropped` 后先写 `task.unblocked` 再按上报结束派工，收到 `question` / `blocked` 则把卡住换成上报的内容（`basis: reported`），`progress` 只记录、不解除卡住。
 - **回复即重新派发**：Grok 侧的运行无法续接（`resume_session: false`），`deliver` 一律返回 `not_running`，中枢让任务带着回复重新排队；新派工生成新的 `dispatch_ref` 并重新派发，回复与恢复提示放在正文开头，旧 `dispatch_ref` 随之失效。对 `blocked(no_progress)` 的回复同样如此，回复界面提示"回复会重新派发给 Grok，旧运行的结果将被丢弃"。
-- **中断后接管，不重复派发**：节点重启或掉线使任务进入 `crashed` / `node_lost` 后，用户 `task_retry` 产生新派工。适配器请求远程派发时，如果上一次远程派发（同一任务、同一调用方）还没有收到终态上报、派发时间在 `no_progress_minutes` 之内、且这次派工没有新的回复或输入，中枢不再调用 webhook，而是把上一次的 `dispatch_ref` 转给新派工（写 `remote.dispatch_adopted`），Grok 原来那次运行的上报照常生效。否则才重新触发 webhook。
+- **中断期间暂存上报**：节点重启或掉线使任务进入 `blocked(crashed)` / `blocked(node_lost)` 时，Grok 的运行并没有停。off_machine 派工在这两种卡住期间同样接受当前 `dispatch_ref` 的上报（D7 第 2 步），中枢把它作为该派发的未消费上报保存，不改变任务状态；收件箱条目补一句"Grok 已交回结果，重试即可完成"。
+- **中断后接管，不重复派发**：用户 `task_retry` 产生新派工。适配器请求远程派发时，如果上一次远程派发（同一任务、同一调用方）满足：没有被新的派发取代、派发时间在 `no_progress_minutes` 之内或已有暂存的上报、且这次派工没有新的回复或待送达输入，中枢不再调用 webhook，而是把上一次的 `dispatch_ref` 转给新派工（写 `remote.dispatch_adopted`）；已暂存的上报在新租约的第一次续约中下发，节点按常规合并（终态上报直接结束派工），Grok 之后的上报照常生效。`task_retry` 的 `reason` 只是说明重试依据，**不算新的输入**，不触发重新派发；用户要给 Grok 新信息时应当回复，回复一律重新派发。不满足接管条件时才重新触发 webhook。
 - **取消**：任务被取消时适配器停止等待并以 `cancelled` 结束；Grok 侧的运行无法被 Raindown 停止，结果中注明"Grok 侧的运行仍可能继续，其上报将被拒绝"。
 
 ### D7 远程上报的核对：先授权，后状态
 - 远程会话调用 `raindown_report` 与 `task_show` 必须带 `id` 与 `dispatch_ref`（远程 schema 中必填；任务绑定会话不变）。中枢按以下顺序核对，前一步不通过即返回：
   1. **授权**：账本中存在该任务派给本调用方的 `remote.dispatched`（或 `remote.dispatch_adopted`）记录，且调用方仍具备 `report` 能力、任务 workspace 仍在其白名单内。不满足——包括任务不存在、从未派给本调用方、派给的是本机执行器——一律返回同一个 `forbidden`，不区分原因，远程调用方无法借此探测任务是否存在或处于什么状态。
-  2. **派工与状态**：`dispatch_ref` 的摘要等于该任务当前派工的远程派发记录，任务处于 `running`，或处于 `blocked(no_progress)` 且当前派工的执行器声明 `off_machine: true`（D6）。不满足返回 `not_running`（只会发生在本调用方自己的任务上）。
+  2. **派工与状态**：`dispatch_ref` 的摘要等于该任务当前派工的远程派发记录，任务处于 `running`，或处于 `blocked(no_progress)`、`blocked(crashed)`、`blocked(node_lost)` 且该派发来自声明 `off_machine: true` 的执行器（D6；后两种只暂存，等重试接管）。不满足返回 `not_running`（只会发生在本调用方自己的任务上）。
 - 核对通过后与派工令牌的上报走同一条写入路径：同样的输入校验、限额（每派工同时一个、每分钟 10 次、每派工 200 次）、`task.reported` 事件（操作者为 `remote:<id>`）、续约下发与 `report_seq` 消费。
 - `task_show` 的远程投影只含：任务 id、workspace、角色、状态（含卡住原因）、目标、原始指令、当前派工的回复与输入；不含事件、其他派工、产物、节点信息与 `dispatch_ref`。
 - 判定依据是派发记录与适配器声明，不按执行器类型名 `grok-routine` 分支，以后其他 off_machine 执行器可以复用。
@@ -156,7 +162,8 @@
   - `off`：不检查、不标注。
 
 ### D9 交付物：知识库提案
-- `raindown_report ready` 的 `deliverables` 在 GitHub PR 之外接受 `raindown:proposal/<id>`。中枢核对：提案存在、提案记录的 `actor` 为上报者（远程调用方为 `remote:<id>`，本机 worker 为其角色身份）、新内容的归属属于任务的 workspace、`created_at` 不早于本次派工开始（接管的派发按原派发时间）、没有 `target_hidden` 标记。不满足返回 `deliverable_check_failed`，不泄露提案内容。
+- `raindown_report ready` 的 `deliverables` 在 GitHub PR 之外接受 `raindown:proposal/<id>`。中枢核对：提案存在、提案记录的 `actor` 为上报者（远程调用方为 `remote:<id>`，本机 worker 为其角色身份）、新内容的归属属于任务的 workspace、`created_at` 不早于本次派工开始（接管的派发按原派发时间）。不满足返回 `deliverable_check_failed`，不泄露提案内容。
+- **`target_hidden` 不参与核对**：被标记的提案与普通提案一样通过核对、合入产物，产物上带 `target_hidden` 标记（只在用户可见的任务结果、收件箱与 `raindown task show` 中显示"目标对提议者不可见或不可提案，只能拒绝"）。上报结果对 Grok 完全相同，因此 Grok 无法用"提案 + ready"探测某个路径是否是不可见的已有条目。远程 `task_show` 的投影本来就不含产物。
 - 提案此时可以是待确认、已接受或已拒绝（用户可能在 `ready` 之前就处理了它）；交付物记录提案当时的状态，已拒绝的在任务结果中标明。
 - 一个上报中 PR 与提案可以混用，总数仍不超过 5。提案引用合入任务结果的产物列表（`kind: proposal`）。
 - 只有一段文字结论、没有可交付物的调研，Grok 把结论写进 summary（受 `PROTOCOL_MESSAGE_MAX` 限制），或用 `kb_propose` 提交一条新条目后交付。

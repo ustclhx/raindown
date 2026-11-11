@@ -5,7 +5,7 @@
 ### Requirement: 上报工具
 系统 SHALL 提供 worker 可调用的 `raindown_report` 操作，输入为状态之一：`progress`、`question`、`ready`、`blocked`、`failed`、`dropped`，以及一句话摘要。调用者身份 MUST 绑定到当前持有租约的任务与派工，不能为其他任务上报；任务不在运行中时返回 `not_running`。绑定有两种来源：
 - 本机 worker 使用本次派工的派工令牌；
-- 不在本机运行的 harness（适配器声明 `off_machine: true`）经远程入口上报，MUST 带任务 id 与本次派发的 `dispatch_ref`。中枢 MUST 先核对授权：该任务有派给本调用方的远程派发记录，且调用方仍有 `report` 能力、任务 workspace 仍在其白名单内；不满足（含任务不存在、派给本机执行器）一律返回同一个 `forbidden`。授权通过后再核对 `dispatch_ref` 是当前派发、任务处于 `running`（或 off_machine 派工处于 `blocked(no_progress)`），不满足返回 `not_running`。
+- 不在本机运行的 harness（适配器声明 `off_machine: true`）经远程入口上报，MUST 带任务 id 与本次派发的 `dispatch_ref`。中枢 MUST 先核对授权：该任务有派给本调用方的远程派发记录，且调用方仍有 `report` 能力、任务 workspace 仍在其白名单内；不满足（含任务不存在、派给本机执行器）一律返回同一个 `forbidden`。授权通过后再核对 `dispatch_ref` 是当前派发、任务处于 `running`（或 off_machine 派工处于 `blocked(no_progress)`、`blocked(crashed)`、`blocked(node_lost)`；后两种只暂存，等重试接管时下发），不满足返回 `not_running`。
 
 两种来源的上报使用同一套输入校验、限额与事件，上报事件的操作者为实际调用方。
 
@@ -26,7 +26,7 @@
 - **THEN** 返回 `not_running`，当前派工不受影响
 
 ### Requirement: 完成、受阻与无需处理
-`ready` 表示交付物已就绪可以审阅，MUST 附 1–5 个交付物引用，由系统核对：GitHub PR 地址按任务登记的仓库与分支核对；知识库提案引用（`raindown:proposal/<id>`）核对提案存在、提案的 `actor` 为上报者、新内容属于任务的 workspace、提交于本次派工开始之后、且未被标记为目标不可见。提案可以处于待确认、已接受或已拒绝，结果中记录其状态。`blocked` MUST 写明缺少的前提与已尝试的办法；`failed` 表示无法完成；`dropped` 表示经核实无需处理。`dropped` 的任务以 `done` 结束且不推送通知。
+`ready` 表示交付物已就绪可以审阅，MUST 附 1–5 个交付物引用，由系统核对：GitHub PR 地址按任务登记的仓库与分支核对；知识库提案引用（`raindown:proposal/<id>`）核对提案存在、提案的 `actor` 为上报者、新内容属于任务的 workspace、提交于本次派工开始之后。提案可以处于待确认、已接受或已拒绝，结果中记录其状态；提案是否被标记为目标不可提案 MUST NOT 影响核对结果与返回给上报者的内容，该标记只记录在用户可见的产物上。`blocked` MUST 写明缺少的前提与已尝试的办法；`failed` 表示无法完成；`dropped` 表示经核实无需处理。`dropped` 的任务以 `done` 结束且不推送通知。
 
 #### Scenario: 无需处理
 - **WHEN** worker 核实问题无法复现后上报 `dropped`
@@ -35,6 +35,10 @@
 #### Scenario: 以提案交付
 - **WHEN** 调研任务的 worker 在本次派工中提交了一个本 workspace 的提案，然后上报 `ready`，交付物为该提案引用
 - **THEN** 核对通过，提案及其当前状态作为产物合入任务结果
+
+#### Scenario: 交付目标不可提案的提案
+- **WHEN** Grok 提交了一个被标记为目标不可提案的提案，然后上报 `ready` 并以它为交付物
+- **THEN** 上报被接受，返回给 Grok 的结果与普通提案相同；任务结果中该产物带"只能拒绝"的标记供用户查看
 
 #### Scenario: 交付别人的提案
 - **WHEN** worker 上报 `ready`，交付物引用一个由用户或其他身份提交的提案
