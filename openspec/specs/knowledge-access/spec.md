@@ -88,12 +88,19 @@ AI 操作者 MUST NOT 直接修改 `decision` 条目和 `scope: personal` 的条
 - **THEN** 修改直接写入并提交，`log.md` 中记录该操作
 
 ### Requirement: 依赖中枢的操作
-操作注册表 SHALL 包含任务操作：`task_create`、`task_list`、`task_show`、`task_cancel`，CLI 与 MCP 都自动获得对应入口。这些操作通过本机中枢的 API 执行；中枢不可用时 MUST 返回可重试的错误 `hub_unavailable`（CLI 退出码 3），并提示用 `raindown daemon status` 检查。知识库操作不依赖中枢，行为不变。
+操作注册表 SHALL 包含任务操作：`task_create`、`task_list`、`task_show`、`task_cancel`，CLI 与 MCP 都自动获得对应入口。这些操作通过本机中枢的 API 执行；中枢不可用时 MUST 返回可重试的错误 `hub_unavailable`（CLI 退出码 3），并提示用 `raindown daemon status` 检查。CLI 与无任务绑定的 MCP 会话的知识库操作不依赖中枢，行为不变；任务绑定会话的知识库读取经中枢（见"任务绑定会话经中枢读取"）。
 
 #### Scenario: 中枢未运行时建任务
 - **WHEN** 中枢未运行，此时 agent 调用 `task_create`
 - **THEN** 返回 `hub_unavailable`，且 `retryable` 为 true
 
 #### Scenario: 中枢未运行时检索知识库
-- **WHEN** 中枢未运行，此时 agent 调用 `kb_search`
+- **WHEN** 中枢未运行，此时未绑定任务的 agent 调用 `kb_search`
 - **THEN** 检索照常返回结果
+
+### Requirement: 任务绑定会话经中枢读取
+任务绑定的 MCP 会话（使用派工令牌）的只读知识操作（检索、读取、结构化查询）SHALL 经中枢执行，worker 侧进程 MUST NOT 需要直接读取 raindown-home。结果与 CLI、无绑定 MCP 的同名操作一致（输入、输出与排序相同），可见范围不超过该任务所属 workspace 可见的条目。
+
+#### Scenario: 隔离下检索
+- **WHEN** 隔离下的 worker 调用 `kb_search`，worker 进程无法读取 raindown-home
+- **THEN** 检索结果与用户运行 `raindown kb search` 同一查询词、限于该 workspace 可见条目的结果一致

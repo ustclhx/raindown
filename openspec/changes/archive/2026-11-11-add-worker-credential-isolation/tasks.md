@@ -97,9 +97,10 @@
   - **未验证**（交给真实验收，命令见 `docs/executors.md`「`native`」）：`codex exec` / TUI 只传 `-c default_permissions` 时是否使用该 profile、
     CODEX_HOME 整体拒绝只放行 `tmp/` 时 arg0 别名（`apply_patch`）是否正常。
   - 已实测（supervisor，2026-11-10，codex-cli 0.167.0）：`codex sandbox` 的 `-c` 内联 profile 与 `-c default_permissions` 生效（hub.token、auth.json 链接与源文件拒绝，
-    令牌可读，workspace 可写、read-only 不可写）；`:workspace` 缺省允许写 `.git/hooks`、`.git/config`，加 `"read"` 条目后拒绝写，git 日常操作正常。
+    令牌可读，workspace 可写、read-only 不可写）；`.git/hooks`、`.git/info` 加 `"read"` 条目后拒绝写。
+    更正（2026-11-11）：`:workspace` 下工作目录内的 `.git` 整体只读（hooks、config、objects、index.lock 均 EPERM），此前"缺省可写、git 日常操作正常"的结论是在 `/tmp`（本身为可写根）下测得的误判；因此 native workspace-write 角色不能在沙箱内 commit，需要 commit 的写类角色用 danger-full-access + 外层 seatbelt。
 - [ ] 5.2 （仅在用户同意独立用户方案后）实现 `separate_user` 施加层与安装/卸载命令。验证：安装命令的 dry-run 测试与真实验收
-  - native 可靠，独立系统用户方案暂不需要，待用户决定。
+  - 不做（用户决定，2026-11-11）：外层 seatbelt 与 native 两层已实测可靠，独立系统用户需要新建用户与改 sudoers，管理成本过高。保持未勾选。
 
 ## 6. 角色要求与文档
 

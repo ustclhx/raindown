@@ -1500,13 +1500,14 @@ CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"'
 CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"' -- cat "$TOK"                  # 预期 FAKE-LEASE
 CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x > ok.txt'     # 预期成功
 CODEX_HOME=$CH codex sandbox -c "$RO" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x > ro.txt'     # 预期失败（read-only）
-# .git 收回为只读（审查第一轮 M3；已实测：缺省可写，加 "read" 条目后拒绝写、git 日常操作正常）
+# .git 收回为只读（审查第一轮 M3）。注意：本脚本的 $R 由 mktemp -d 建在 $TMPDIR 下；$TMPDIR 与 /tmp 本身是可写根，其中 .git 缺省可写、commit 成功；
+# 在其他位置（例如 /var/tmp、真实工作目录），:workspace 把工作目录内的 .git 整体收为只读，hooks/config 写入与 commit 都失败（见上文「native」）
 git -C "$R/work" init -q
 CODEX_HOME=$CH codex sandbox -c "$WS" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x > .git/hooks/post-checkout'   # 缺省行为，记录结果
 GW='permissions.raindown-verify={extends=":workspace",filesystem={"'$RH'"="deny","'$R/user-codex'"="deny","'$CH/tmp'"="read","'$TOK'"="read","'$R/work/.git/hooks'"="read","'$R/work/.git/config'"="read"},network={unix_sockets={}}}'
 CODEX_HOME=$CH codex sandbox -c "$GW" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x > .git/hooks/post-checkout'   # 预期失败
 CODEX_HOME=$CH codex sandbox -c "$GW" -c 'default_permissions="raindown-verify"' -- sh -c 'echo x >> .git/config'               # 预期失败
-CODEX_HOME=$CH codex sandbox -c "$GW" -c 'default_permissions="raindown-verify"' -- sh -c 'git status && touch x && git add x && git -c user.name=t -c user.email=t@t commit -qm t'  # 预期成功
+CODEX_HOME=$CH codex sandbox -c "$GW" -c 'default_permissions="raindown-verify"' -- sh -c 'git status && touch x && git add x && git -c user.name=t -c user.email=t@t commit -qm t'  # 在 $TMPDIR 或 /tmp 下成功；其他位置失败（.git 只读）
 # 以下调用模型：需要登录，把用户的 auth.json 链接进临时 CODEX_HOME（只建链接，不读取内容）
 ln -sf ~/.codex/auth.json "$CH/auth.json"
 CODEX_HOME=$CH codex exec --json --skip-git-repo-check -c "$RO" -c 'default_permissions="raindown-verify"' -c 'approval_policy="never"' \
@@ -1765,7 +1766,7 @@ isolation: required   # required | preferred | off
 
 ## 隔离实测（worker-credential-isolation 1.1）
 
-2026-11-07 在本机实测，服务于 `openspec/changes/add-worker-credential-isolation` 的 D1、D2、D4、D6。全程不调用模型。
+2026-11-07 在本机实测，服务于 `openspec/changes/archive/2026-11-11-add-worker-credential-isolation` 的 D1、D2、D4、D6。全程不调用模型。
 只用临时目录与临时 `HOME`、`CODEX_HOME`、`RAINDOWN_HOME`、`CLAUDE_CONFIG_DIR`，受保护文件都是伪造的（内容如 `FAKE-HUB-TOKEN-not-a-secret`）。
 只读取了 Orca 运行时的元数据（`orca status --json`、`lsof`），没有连接或操作它。
 外层 seatbelt 配置样例见 [`worker-isolation.sb`](worker-isolation.sb)。配置本身不含路径，路径全部经 `sandbox-exec -D` 传入。
@@ -1981,7 +1982,7 @@ spawnClaudeCodeProcess: ({ command, args, cwd, env, signal }) =>
 | claude-sdk | bash 沙箱开启 | `none` | 不提供 | 原生 denyRead 只覆盖 Bash，Read 等工具靠权限规则，不足以支撑 `required`；建议这类角色关闭 bash 沙箱，改走 `seatbelt` |
 | pr-merge | 节点内执行，不启动 harness | `none` | 不适用 | 节点属于可信计算基 |
 
-`separate_user` 目前不需要作为默认施加层。它只在以下几种边界不可接受时才有必要，届时按 5.1 写出方案，交给用户决定：
+`separate_user` 不实现（用户决定，2026-11-11：管理成本过高，seatbelt 与 native 已实测可靠），只保留为能力枚举值。以下边界因此仍然存在，接受为残余风险：
 
 - 同用户读取进程环境变量、发信号；
 - 外层 seatbelt 下的 harness 凭证与共享会话可读；
