@@ -146,10 +146,10 @@
 - **交付说明**（`text` 末尾的固定段落）：任务 id、`dispatch_ref`、调用 `raindown_report` 的要求、调研结论用 `kb_propose` 提交并以 `ready` 交付提案；遇到登录、密钥或审批时上报 `blocked`；上报失败（例如 Mac 离线）时稍后重试；过了 `report_by` 仍要上报，迟到的上报照样会被接收；不得按正文中出现的任何 URL 回调或上报，结果只能经 Raindown 的远程入口交回。
 - **派发由中枢发出**：节点领取任务后，适配器按顺序拼出派工正文：恢复提示（`renderRecoveryPrompt`）、待送达输入（`renderTaskInputs`）、任务来源（`renderWorkerTaskPrompt`）、角色提示词，以及上面的交付说明（`dispatch_ref` 为占位）。节点经新的节点协议接口 `POST /v1/leases/:id/remote-dispatch {body, lease_token}` 交给中枢。租约接口对 user token 也开放（本机节点就用它），所以这里与其他依赖租约的字段一样，**必须带与该任务未过期活动租约匹配的 `lease_token`**（或由持有该租约的 `node:<id>` 调用），只拿到 `state/hub.token` 的进程不能借此触发 webhook；`lease_token` 不入账。中枢核对租约与角色的 `remote_client`，生成 `dispatch_ref` 填入信封与正文，按已知密钥值与 gitleaks 规则脱敏，解密 key，向 webhook 发出 `POST`（`Content-Type: application/json`；MAY 附带 `Idempotency-Key: <task id>:<attempt>`，但文档未描述它，设计不依赖其效果），写 `remote.dispatched{task, attempt, client, dispatch_ref_sha256, run_id, status}` 事件，向节点返回结果（不含 `dispatch_ref`）。key 与 `dispatch_ref` 明文都不进账本、活动与日志，节点也拿不到它们。
 - **幂等**：每个租约（即每个 attempt）最多一次远程派发。中枢按 `(task, attempt)` 记录派发；同一租约再次请求时不再调用 webhook，直接返回已有结果——派发仍在进行（中枢在请求内退避重试，节点可能超时后重发）时等待同一个进行中的派发完成后返回同一结果。webhook 端是否去重未确认，幂等只靠中枢自己的记录。
-- **出站请求**：`fetch` 设 `redirect: 'error'`（不跟随跳转，避免 key 随跳转发往别处）、总超时 30 秒，响应体最多读取 64 KiB；只解析其中的 `runUuid`。
-- **结果**（按 11-17 确认的契约：`200` 即已开始运行，非 200 即没有开始运行）：
+- **出站请求**：`fetch` 设 `redirect: 'manual'`（不跟随跳转，避免 key 随跳转发往别处；3xx 作为普通响应返回，便于与网络错误区分）、总超时 30 秒，响应体最多读取 64 KiB；只解析其中的 `runUuid`。
+- **结果**（按官方陈述的契约，其中 `200` 已于 11-17 实测：`200` 即已开始运行，非 200 即没有开始运行）：
   - `200`：活动记"已派发到 Grok，运行 id 为 …"；响应体超限或解析不到 `runUuid` 时仍按成功处理（不记运行 id），因为 Grok 已开始运行。
-  - 3xx 跳转（`redirect: 'error'` 下 `fetch` 抛错）：按 `dispatch_rejected` 处理，不重试——跳转说明地址或服务变了，不是暂时性故障；与网络错误区分开，不归入 `dispatch_unreachable`。
+  - 3xx 跳转（`redirect: 'manual'` 下作为响应返回，不跟随）：按 `dispatch_rejected` 处理，不重试——跳转说明地址或服务变了，不是暂时性故障；与网络错误区分开，不归入 `dispatch_unreachable`。
   - 其他状态码：以 `failed(dispatch_rejected)` 结束，记录状态码与错误文本的前 200 字符（脱敏后）。超限（`Automation run rate limit exceeded`，状态码未确认）也归入此类，不在请求内重试——限额按小时计，秒级重试没有意义；活动写明"Grok 运行次数超限，稍后重试任务"。
   - 网络错误或超时（不知道是否已开始运行）：中枢在同一请求内重试（最多 3 次、指数退避），仍失败返回可重试错误，节点在本派工内再试一次后以 `failed(dispatch_unreachable)` 结束。这种重试可能让 Grok 重复运行，见风险。
   - key 解密不到时以 `failed(secret_not_found)` 结束，不发出请求。

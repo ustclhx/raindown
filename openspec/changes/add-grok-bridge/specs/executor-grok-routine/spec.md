@@ -37,7 +37,7 @@
 
 #### Scenario: webhook 返回跳转
 - **WHEN** webhook 返回 302 指向另一个地址
-- **THEN** 中枢不跟随跳转、不重试，key 不发往跳转地址，任务以 `failed(dispatch_rejected)` 结束并记录状态码
+- **THEN** 中枢不跟随跳转、不重试，key 不发往跳转地址，任务以 `failed(dispatch_rejected)` 结束，记录状态码
 
 #### Scenario: 成功但响应体超限
 - **WHEN** webhook 返回 200，但响应体超过大小上限
