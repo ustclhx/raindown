@@ -2,22 +2,23 @@
 
 ## Context
 
-**调研与实测**（2026-11-11 调研取代 10-25 的结论；2026-11-14 至 11-17 在用户账号中实测，证据为临时 ping 服务的请求日志与本机 `tailscale status` / `whois`）。证据等级：**实测**、**现场确认**（在产品界面上看到）、**官方陈述**（文档或官方论坛）、**待验证**。
+**调研与实测**（2026-11-11 调研取代 10-25 的结论；11-14 在 Mac 上自测发布链路，11-17 在用户账号中由 Grok 发起实测；证据为临时 ping 服务的请求日志、supervisor 本机的时间戳与 `tailscale status` / `whois`）。证据等级：**实测**、**现场确认**（在产品界面上看到）、**官方陈述**（文档或官方论坛）、**待验证**。
 
 涉及三个分开的位置：Bot 的云电脑（Linux 沙箱，能跑 `curl`）、远程 MCP 连接器的后端（xAI 侧，发起自定义 MCP 调用）、用户的 Mac（中枢所在）。"云电脑能进 tailnet"不等于"连接器后端能进"。
 
 - **网络**：
   - 官方 Tailscale 插件 11-09 正式发布，经 OAuth apps 授权（官方陈述）。在云电脑上自己装 tailscaled 每次更新、恢复或重置都会被清掉（cursor/plugins#774），不作为方案。
   - Bot 的云电脑以完整 Linux 节点加入用户的 tailnet，节点名形如 `grokbot-user-<n>`，**归属用户本人、默认没有 tag**；用户迁移过一次 Grok Bot 账号后出现了新节点（IP 也变了），旧节点离线残留（实测）。
-  - Mac 用 `tailscale serve --https=443 http://127.0.0.1:<port>`（只对 tailnet）发布的测试服务，云电脑上的 `curl/8.14.1` 经**聊天、定时 routine、webhook 触发的 routine** 三条路径都访问成功并拿到 nonce，来源为 Grok 节点的 tailnet IP，`Host` 为 Mac 的 `<mac>.<tailnet>.ts.net`（实测）。
+  - Mac 用 `tailscale serve --https=443 http://127.0.0.1:<port>`（只对 tailnet）发布的测试服务，云电脑上的 `curl/8.14.1` 经**聊天、定时 routine、webhook 触发的 routine** 三条路径都访问成功并拿到 nonce，来源为 Grok 节点的 tailnet IP，`Host` 为 Mac 的 `<mac>.<tailnet>.ts.net`（实测，11-17）。这些请求都是不带 `Authorization`、没有请求体的 `GET`；带认证头的 `POST` 与 SSE 响应能否原样经过 `serve` 待验证（1.4）。
   - **自定义 MCP 连接器的调用来自 xAI 后端，后端是否在 tailnet 内仍待验证**（第 1 组头号剩余项）。
-  - `tailscale serve` 会给转发的请求注入 `Tailscale-User-Login`、`Tailscale-User-Name` 等身份头；因 Grok 节点归属用户本人，这些头显示的是用户本人（实测）。
-  - 首次发布 HTTPS 时证书签发约 1 分钟，期间 TLS 握手挂起（实测）。Mac 与 Grok 节点之间经 DERP 中继、未直连，延迟 0.25–2.3 秒（实测）。
-- **MCP 传输与认证**：远程 MCP 支持 streamable HTTP 和 SSE；连接器界面能填固定请求头（现场确认，11-11）。初始化、复用、重连时请求头是否都被带上待验证；官方论坛 11-06 称已修复复用会话时漏发协议版本头的问题（官方陈述）。OAuth 支持预注册的客户端 id 与 scopes（官方陈述）。
-- **反方向（webhook）**（实测 + docs.x.ai/grok-bot/skills-routines-and-automations）：
-  - `POST https://api2.cursor.sh/automations/webhook/<uuid>`，`Authorization: Bearer <key>`，`Content-Type: application/json`，请求体可选。
-  - `200` 返回 `{"success":true,"runUuid":"…"}`，只表示已接受、已开始运行；非 200 表示没有开始运行。从触发到 routine 回连 Mac 约 48 秒。
-  - 限额：所有 routine 合计每小时 300 次、单个 routine 每小时 200 次；超限报 `Automation run rate limit exceeded`，不自动重试。
+  - `tailscale serve` 会给转发的请求注入 `Tailscale-User-Login`、`Tailscale-User-Name` 等身份头；因 Grok 节点归属用户本人，这些头显示的是用户本人（实测，11-14 本机自测与 11-17）。
+  - 首次发布 HTTPS 时证书签发约 1 分钟，期间 TLS 握手挂起（实测，11-14）。Mac 与 Grok 节点之间经 DERP 中继、未直连，延迟 0.25–2.3 秒（实测，11-17）。
+- **MCP 传输与认证**：远程 MCP 支持 streamable HTTP 和 SSE；连接器界面有固定请求头的填写项（现场确认，11-11）；连接器实际是否发送、初始化/复用/重连时是否都带上待验证（1.5）；官方论坛 11-06 称已修复复用会话时漏发协议版本头的问题（官方陈述）。OAuth 支持预注册的客户端 id 与 scopes（官方陈述）。
+- **反方向（webhook）**（官方陈述来自 docs.x.ai/grok-bot/skills-routines-and-automations）：
+  - `POST https://api2.cursor.sh/automations/webhook/<uuid>`，`Authorization: Bearer <key>`，`Content-Type: application/json`，请求体可选（官方陈述；11-17 按此调用成功）。
+  - `200` 返回 `{"success":true,"runUuid":"…"}`，触发后 routine 回连了 Mac（实测，11-17；从触发到回连约 48 秒，依据 supervisor 本机时间戳，不在请求日志里）。`200` 只表示已接受、已开始运行（官方陈述）。
+  - 非 200 表示没有开始运行（官方陈述，未实测）。D6 对非 200 不重试，依据的就是这条官方陈述。
+  - 限额：所有 routine 合计每小时 300 次、单个 routine 每小时 200 次；超限报 `Automation run rate limit exceeded`，不自动重试（均为官方陈述，未实测）。
   - 文档没有描述 webhook 的自动重试、签名、`Idempotency-Key`，也没有给出超限时的状态码——这些按**未确认**处理，设计不依赖它们。请求体在 routine 中如何呈现（`webhook_event`）与大小限制待验证。
   - 没有接口可以往已有对话里发消息，也没有"运行结束后回调任意 URL"的原生保证。
 - **出口 IP**：没有稳定的出口 IP 列表，账号迁移也会换 IP。不做 IP 或主机名白名单。
@@ -51,7 +52,7 @@
 - 中枢进程内再起一个 Hono 应用，监听 `127.0.0.1:7478`（`config/hub.yaml` 的 `remote.port`，可关闭），只挂 `/mcp`。用户用 `tailscale serve --bg --https=443 http://127.0.0.1:7478` 发布，tailnet 里只看得到这个端口。
 - **随配置开关**：`config/remote.yaml` 刷新（2 秒有效期，与角色缓存一致）后，有至少一个有效调用方而端口未监听时开始监听；一个也没有时关闭监听，正在处理的请求以 401 结束。中枢启动时同理。
 - **请求入口检查**（在鉴权之前）：带 `Tailscale-Funnel-Request` 头的请求一律 403 `funnel_denied`（纵深防御，即使 Funnel 被误开也不服务）；`Host` 必须是配置的 tailnet 主机名（`config/hub.yaml` 的 `remote.allowed_hosts`，即 Mac 的 `<mac>.<tailnet>.ts.net`，11-17 实测 `tailscale serve` 转发时保留这个 `Host`）或 `127.0.0.1:<端口>`，否则 421；MCP SDK 传输层同时打开 DNS rebinding 保护并设同样的 `allowedHosts`。
-- **不信任 Tailscale 身份头**：`tailscale serve` 注入的 `Tailscale-User-*` 头反映的是节点归属者，Grok 节点归属用户本人，头里就是用户本人。中枢 MUST NOT 用它们做认证、授权或决定操作者身份，操作者只由 D3 的 token 决定；`remote.call` 审计 MAY 记录 `Tailscale-User-Login` 作参考，并标明不作判定依据。
+- **不信任 Tailscale 身份头**：`tailscale serve` 注入的 `Tailscale-User-*` 头反映的是节点归属者，Grok 节点归属用户本人，头里就是用户本人。中枢完全忽略这些头：不用于认证、授权、操作者身份，也不写入审计或日志；操作者只由 D3 的 token 决定。另一个理由：本机任何进程直接请求 `127.0.0.1:7478` 都能伪造这些头和 tailnet 的 `Host`，所以它们本来就不可信。测试覆盖伪造的 `Tailscale-User-*` 头不改变任何结果。
 - **为什么放在中枢内**：凭证校验、可见范围、审计入账、远程派发与上报的核对本来就在中枢；中枢本来就持有 raindown-home 与解密后的密钥，远程会话的操作在中枢进程内执行，不需要额外进程。代价是远程输入在一个能读全部状态的进程里被处理，所以远程会话可用的操作必须逐个审查输入（见 D5：去掉一切读本地文件的参数）。
 - **备选**：在 7477 上加 `/mcp` 路径，再用 `tailscale serve` 只代理这个路径。没有采用：路径级代理一旦配错，`/v1` 就会暴露；分端口的隔离更直观，也便于 doctor 检查。7478 早已被策略当作中枢端口识别，worker 命令直接访问它会按 `shell.opaque` 处理。
 
@@ -71,9 +72,9 @@
 - **为什么不另做凭证**：hub-auth 的绑定 token 已经提供签发一次、只存摘要、立即撤销、最近使用时间；远程入口只需要在它上面加"属于哪个调用方"的判定。
 
 ### D4 认证：Bearer 是唯一路径
-- 认证只用 D3 的 remote token，以 `Authorization: Bearer` 携带：走连接器时填进 Grok MCP 连接器的固定请求头（11-11 现场确认可填）；走 D12 的云电脑路径时由云电脑上的调用方带上。本变更不实现 OAuth，远程端口不挂 `/.well-known/oauth-*`、`/oauth/*`。
+- 认证只用 D3 的 remote token，以 `Authorization: Bearer` 携带：走连接器时填进 Grok MCP 连接器的固定请求头（连接器界面可填固定请求头，现场确认；实际是否在初始化/复用/重连时发送待 1.5 验证；无状态模式下漏发即每次 401，届时按下面的备用条件处理）；走 D12 的云电脑路径时由云电脑上的调用方带上。本变更不实现 OAuth，远程端口不挂 `/.well-known/oauth-*`、`/oauth/*`。
 - **OAuth 只是备用条件**：第 1 组实测发现某条调用路径（初始化、复用或重连）不带请求头时，另开变更做 OAuth，用预注册客户端（固定 client id 与 scopes），不做动态客户端注册；回调地址按那时的实测填写，不预先写死。
-- **为什么**：动态注册、短码确认、在 Mac 上确认 iPhone 发起的授权等都会多出安全面；Bearer 已经现场确认可用，D2 的无状态模式让每个请求独立认证，复用会话漏发头的问题影响也小。
+- **为什么**：动态注册、短码确认、在 Mac 上确认 iPhone 发起的授权等都会多出安全面；连接器已有固定请求头的填写项，D2 的无状态模式让每个请求独立认证，漏发会表现为明确的 401，不会出现部分请求以错误身份通过的情况。
 
 ### D5 远程调用方、`remote` 绑定与可见范围
 - `config/remote.yaml`：
@@ -141,13 +142,14 @@
 
   webhook 地址与 key 放在 `remote.yaml` 的 `dispatch` 中，不放在角色里：key 是 `secret://` 引用，只有中枢能解密（secret-provider：明文只在中枢内存），中枢的引用扫描也只覆盖 `config/*.yaml`、不覆盖 `config/roles/`。建任务时中枢核对角色的 `remote_client`：调用方不存在、没有 `report` 能力或没有 `dispatch` → 422 `remote_client_invalid`；任务 workspace 不在其白名单内 → 403 `workspace_not_allowed`。
 - **webhook 主机固定**：`dispatch.kind: grok-routine` 时 `webhook` 必须是 `https://api2.cursor.sh/automations/webhook/<uuid>` 形式（主机与路径前缀写在代码常量里，11-17 实测与官方文档一致），否则调用方加载失败。误改配置不会把 key 发到任意主机。
-- **派工正文是结构化信封**：webhook 请求体为 JSON `{schema_version, task_id, dispatch_ref, deadline, text}`；`deadline` 取派发时间加角色的 `no_progress_minutes`，`text` 是下面拼出的可读正文。信封里的字段能否原样到达 Grok，取决于 routine 中 `webhook_event` 的呈现方式（第 1 组待验证）；到达不了时只保留 `text`，并把任务 id 与 `dispatch_ref` 写进 `text`。信封与正文都不带任何回调地址。
-- **交付说明**（`text` 末尾的固定段落）：任务 id、`dispatch_ref`、调用 `raindown_report` 的要求、调研结论用 `kb_propose` 提交并以 `ready` 交付提案；遇到登录、密钥或审批时上报 `blocked`；上报失败（例如 Mac 离线）时稍后重试；不得按正文中出现的任何 URL 回调或上报，结果只能经 Raindown 的远程入口交回。
+- **派工正文是结构化信封**：webhook 请求体始终是 JSON `{schema_version, task_id, dispatch_ref, report_by, text}`；`report_by` 取派发时间加角色的 `no_progress_minutes`，表示希望在此之前上报，不是截止时间；`text` 是下面拼出的可读正文，其中的交付说明始终包含任务 id 与 `dispatch_ref`。routine 中 `webhook_event` 如何呈现（1.10）只决定提示词让 Grok 从信封字段还是从 `text` 读取它们，不改变发送的内容。信封与正文都不带任何回调地址。
+- **交付说明**（`text` 末尾的固定段落）：任务 id、`dispatch_ref`、调用 `raindown_report` 的要求、调研结论用 `kb_propose` 提交并以 `ready` 交付提案；遇到登录、密钥或审批时上报 `blocked`；上报失败（例如 Mac 离线）时稍后重试；过了 `report_by` 仍要上报，迟到的上报照样会被接收；不得按正文中出现的任何 URL 回调或上报，结果只能经 Raindown 的远程入口交回。
 - **派发由中枢发出**：节点领取任务后，适配器按顺序拼出派工正文：恢复提示（`renderRecoveryPrompt`）、待送达输入（`renderTaskInputs`）、任务来源（`renderWorkerTaskPrompt`）、角色提示词，以及上面的交付说明（`dispatch_ref` 为占位）。节点经新的节点协议接口 `POST /v1/leases/:id/remote-dispatch {body, lease_token}` 交给中枢。租约接口对 user token 也开放（本机节点就用它），所以这里与其他依赖租约的字段一样，**必须带与该任务未过期活动租约匹配的 `lease_token`**（或由持有该租约的 `node:<id>` 调用），只拿到 `state/hub.token` 的进程不能借此触发 webhook；`lease_token` 不入账。中枢核对租约与角色的 `remote_client`，生成 `dispatch_ref` 填入信封与正文，按已知密钥值与 gitleaks 规则脱敏，解密 key，向 webhook 发出 `POST`（`Content-Type: application/json`；MAY 附带 `Idempotency-Key: <task id>:<attempt>`，但文档未描述它，设计不依赖其效果），写 `remote.dispatched{task, attempt, client, dispatch_ref_sha256, run_id, status}` 事件，向节点返回结果（不含 `dispatch_ref`）。key 与 `dispatch_ref` 明文都不进账本、活动与日志，节点也拿不到它们。
 - **幂等**：每个租约（即每个 attempt）最多一次远程派发。中枢按 `(task, attempt)` 记录派发；同一租约再次请求时不再调用 webhook，直接返回已有结果——派发仍在进行（中枢在请求内退避重试，节点可能超时后重发）时等待同一个进行中的派发完成后返回同一结果。webhook 端是否去重未确认，幂等只靠中枢自己的记录。
 - **出站请求**：`fetch` 设 `redirect: 'error'`（不跟随跳转，避免 key 随跳转发往别处）、总超时 30 秒，响应体最多读取 64 KiB；只解析其中的 `runUuid`。
 - **结果**（按 11-17 确认的契约：`200` 即已开始运行，非 200 即没有开始运行）：
   - `200`：活动记"已派发到 Grok，运行 id 为 …"；响应体超限或解析不到 `runUuid` 时仍按成功处理（不记运行 id），因为 Grok 已开始运行。
+  - 3xx 跳转（`redirect: 'error'` 下 `fetch` 抛错）：按 `dispatch_rejected` 处理，不重试——跳转说明地址或服务变了，不是暂时性故障；与网络错误区分开，不归入 `dispatch_unreachable`。
   - 其他状态码：以 `failed(dispatch_rejected)` 结束，记录状态码与错误文本的前 200 字符（脱敏后）。超限（`Automation run rate limit exceeded`，状态码未确认）也归入此类，不在请求内重试——限额按小时计，秒级重试没有意义；活动写明"Grok 运行次数超限，稍后重试任务"。
   - 网络错误或超时（不知道是否已开始运行）：中枢在同一请求内重试（最多 3 次、指数退避），仍失败返回可重试错误，节点在本派工内再试一次后以 `failed(dispatch_unreachable)` 结束。这种重试可能让 Grok 重复运行，见风险。
   - key 解密不到时以 `failed(secret_not_found)` 结束，不发出请求。
@@ -190,7 +192,6 @@
 
 ### D11 发布与 tailnet 访问策略
 - **发布检查**：`raindown doctor` 在启用远程入口时运行 `tailscale serve status --json`，检查三点：只有远程端口被代理；`AllowFunnel` 为空；7477 没有出现在任何代理目标中。找不到 `tailscale` 命令时，只给出警告。测试注入假的 `tailscale` 二进制与 fixture 输出。
-- **证书等待**：首次发布 HTTPS 时证书签发约 1 分钟，期间 TLS 握手挂起。doctor 与 `docs/grok.md` 提示"刚发布时请等一分钟再测试"，不把这段时间的连接失败当成配置错误。
 - **访问策略按 tag，不按 IP 或主机名**：Grok 的 IP 不可控（账号迁移会换节点和 IP），所以不绑定 Grok 的 IP 或节点名；身份只认 Raindown 的 token。tailnet 策略用 grants，示例（写进 `docs/grok.md`）：
 
   ```json
@@ -208,7 +209,7 @@
   - **保留 `autogroup:member` 全通**，以免改策略时把用户自己的设备锁在外面。
   - **Grok 节点必须打 `tag:grokbot`**：它默认归属用户本人、没有 tag，会命中 `autogroup:member` 全通规则，能访问用户的全部设备。打 tag 后节点不再归属用户，只受第二条 grant 约束。迁移残留的旧节点同样归属用户，要在管理台删除。打 tag 后插件是否仍工作、新节点能否自动带 tag，第 1 组待验证。
   - grants 按源、目标、端口限定不需要付费；按设备状态区分才是付费功能（官方陈述）。
-- **doctor 不读 tailnet 策略**：中枢不持有、也不读取用户的 Tailscale API 凭据，所以 doctor 只输出文字提示（删全放行、Grok 节点打 tag、只放行 Mac:443），不做自动校验。
+- **doctor 的文字提示**（唯一出处，spec 与 tasks 引用这里）：中枢不持有、也不读取用户的 Tailscale API 凭据，所以 doctor 不校验 tailnet 策略，只在启用远程入口时输出：① 删除默认全放行；② Grok 节点打 `tag:grokbot`，删除残留旧节点；③ grants 只放行 `tag:grokbot → Mac:443`；④ 首次发布 HTTPS 时证书签发约 1 分钟，期间 TLS 握手挂起，等一分钟再测试。`docs/grok.md` 用同样的内容。
 - **撤权**：在 Tailscale 管理台移除 Grok 节点或撤销插件授权，Grok 立即连不到远程入口；与 `raindown hub token revoke` 一起写进回滚步骤。
 
 ### D12 远程调用从哪里发起，以及降级路径
@@ -224,8 +225,8 @@
 - **[风险] Grok 被提示注入，滥用它有的权限。** 对策：写入只能走提案，必须经用户接受才生效；不开放 `capture` 与 journal，避免把未确认的内容写进会被本机 AI 读取的 raw 与 brain；上报只能针对派给它的当前派工；最坏情况是交回一份质量差的结果，或在提问里诱导用户（与本机 worker 的提问风险相同）。
 - **[风险] Tailscale 插件或 webhook 行为变化**（新发布的功能，webhook 的重试、签名、超限状态码都没有文档）。对策：第 1 组在用户账号里实测，结论写进 `docs/grok.md`；webhook 的非 200 返回和超时都按失败或卡住处理，不会把任务卡死。
 - **[风险] Grok 被重复运行。** webhook 端是否按 `Idempotency-Key` 去重未确认。网络错误后的重试、以及中枢在派发进行中重启（内存中的幂等记录丢失，节点重发）都可能让 Grok 多跑一次。后果是多耗一次运行额度、可能多出一份提案；多出的运行拿到的是同一个或已失效的 `dispatch_ref`，上报照常按 D7 核对，不会写错任务。
-- **[风险] Grok 节点默认归属用户本人。** 没打 tag 时它命中 `autogroup:member` 全通规则，能访问用户 tailnet 里的全部设备；`Tailscale-User-*` 身份头也显示为用户本人。对策：打 `tag:grokbot` 是上线前提（D11），身份头一律不作判定依据（D1）。如果打 tag 后插件不能工作，网络层就无法隔离，需要用户决定是否继续。
-- **[风险] remote token 泄露。** 持有者只能在该调用方的白名单和能力内操作，并受每分钟限额约束；`raindown hub token revoke` 立即生效；tailnet 策略只放行 `tag:grokbot → Mac:443`，tailnet 外拿到 token 也连不到远程端口。走 D12 云电脑分支时 token 放在云电脑上，暴露面更大。
+- **[风险] Grok 节点默认归属用户本人。** 没打 tag 时它命中 `autogroup:member` 全通规则，能访问用户 tailnet 里的全部设备；`Tailscale-User-*` 身份头也显示为用户本人。对策：打 `tag:grokbot` 是上线前提（D11），身份头一律忽略（D1）。如果打 tag 后插件不能工作，网络层就无法隔离，需要用户决定是否继续。
+- **[风险] remote token 泄露。** 持有者只能在该调用方的白名单和能力内操作，并受每分钟限额约束；`raindown hub token revoke` 立即生效；tailnet 策略只放行 `tag:grokbot → Mac:443`（前提：1.6/1.7 通过；在此之前未打 tag 的 Grok 节点能访问用户的全部设备），tailnet 外拿到 token 也连不到远程端口。走 D12 云电脑分支时 token 放在云电脑上，暴露面更大。
 - **[风险] Mac 离线或休眠。** Grok 的调用与上报会失败（经 DERP 中继本来就有 0.25–2.3 秒延迟）。交付说明要求 Grok 稍后重试上报；迟到的上报按 D6、D7 仍可接收；一直没有上报时由 `no_progress` 兜底。
 - **[风险] 后台运行卡在审批。** 定时或 webhook 触发的运行中，工具调用可能等待用户审批或被拒。第 1 组验证能否把 Raindown 的工具预先设为放行；不能时任务由 `no_progress` 兜底，并写进 `docs/grok.md`。
 - **[风险] 不做 IP 白名单。** Grok 没有稳定的出口 IP，账号迁移也会换 IP；身份只靠 tailnet 的 tag 与 Raindown token。

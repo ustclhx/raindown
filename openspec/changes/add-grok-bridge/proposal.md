@@ -4,10 +4,11 @@
 
 用户在用 Grok Bot：SpaceXAI 的常驻 AI 智能体，每个 Bot 有自己的云端电脑，能跑定时任务（routine），有 iPhone 端。用户希望它也能成为 Raindown 的一个"干活的 AI"，与 Codex、Claude 并列：能查 Raindown 的知识库，能接 Raindown 派的活，干完把结果交回来。
 
-2026-11-11 的调研与 2026-11-14 至 11-17 的实测（详见 design 的 Context，每条标了证据等级）：
-- Grok Bot 不能连本机或 localhost 上的 MCP，只能连远程 MCP（streamable HTTP / SSE），连接器界面可以填固定请求头。官方 Tailscale 插件 11-09 正式发布；实测中 Bot 的云电脑以完整 Linux 节点加入用户的 tailnet，节点归属用户本人、默认没有 tag。
-- 传输方式定为 A：Mac 用 `tailscale serve` 只对 tailnet 发布。实测中 Bot 云电脑上的 `curl` 在聊天、定时 routine、webhook 触发的 routine 三条路径上都访问成功。**自定义 MCP 连接器的调用来自 xAI 后端，后端能否进 tailnet 仍未验证**，这是第 1 组剩余的头号验证项；不能时改由 Bot 云电脑调用远程入口（design D12）。
-- 外部系统没有 API 往 Bot 的对话里发消息；但 routine 可以由 webhook 触发（`POST https://api2.cursor.sh/automations/webhook/<uuid>` 加 Bearer key），`200` 只表示已开始运行，结果写进 Bot 的聊天。
+2026-11-11 的调研与 2026-11-17 Grok 发起的实测（证据等级与细节见 design 的 Context）：
+- Grok Bot 只能连远程 MCP，连接器界面有固定请求头的填写项。
+- Bot 的云电脑经官方 Tailscale 插件以归属用户本人、默认无 tag 的节点加入 tailnet。
+- 云电脑上的 `curl` 经聊天、定时、webhook 三条路径都访问到了 `tailscale serve` 发布的服务；连接器后端能否进 tailnet 仍未验证（第 1 组头号项）。
+- routine 可由 webhook 触发，`200` 只表示已开始运行，没有往对话发消息或运行结束回调的接口。
 
 Grok Bot 运行在第三方云上，提示词和数据会发送给 xAI 及其模型提供商。因此本变更的前提是：**Grok 只能以远程 AI 身份接入，只能读被授权的 workspace、写提案、为派给它的任务上报，永远不能代用户审批或回复任务**。
 
@@ -21,8 +22,8 @@ Grok Bot 运行在第三方云上，提示词和数据会发送给 xAI 及其模
 - **远程身份命名空间**：远程调用方的 actor 固定为 `remote:<调用方 id>`（例如 `remote:grok`），与 `node:*` 一样成为保留前缀（不区分大小写）：只有带 `remote` 标注、且 actor 为小写 `remote:<id>` 的绑定 token 能得到它；user token 降级、`raindown mcp --actor`、CLI 的 `--actor` 与 `RAINDOWN_ACTOR` 都不能声明 `remote:*`。`--remote` 不再接受其他形式的 actor。
 - **远程 MCP 入口**：中枢新增一个独立的本机监听端口（默认 `127.0.0.1:7478`），只提供 MCP（streamable HTTP，路径 `/mcp`），不暴露 `/v1` API、Web 页面和事件流。用户用 `tailscale serve` 把它发布到 tailnet 内，绝不使用 Funnel；带 Funnel 请求头的请求一律拒绝，`Host` 受限。没有远程调用方时不监听，随配置增删开关。
 - **远程调用方（remote client）**：`config/remote.yaml` 定义每个远程调用方的 `id`、workspace 白名单、是否包含 global、能力集合（`read`、`propose`、`report`）、每分钟调用上限，以及接派工用的 `dispatch`（webhook 地址与 `secret://` key）。远程会话是继任务绑定（`task`）、唤醒绑定（`wake`）之后的第三种 MCP 会话绑定（`remote`），工具按能力白名单裁剪：`read` 只有 `kb_search`、`kb_get`、`kb_query`、`ws_list`；`propose` 只有 `kb_propose`（远程 schema 去掉 `file`，归属必须在白名单内，不透露目标是否存在）；`report` 为 `raindown_report` 与受限的 `task_show`。`ws_brief`、`capture`、`kb_journal` 不开放。知识读取复用中枢已有的按 workspace 可见范围，扩展为"多个 workspace + 可选 global + 排除 `scope: personal`"，未标 workspace 的 journal 记录按 global 处理。
-- **认证方式**：只用固定 Bearer token（即上面的 remote token）。Raindown 绝不用 Tailscale 注入的身份头（`Tailscale-User-Login` 等）做认证或授权：Grok 节点归属用户本人，这些头显示的是用户本人。不实现 OAuth；只有实测发现某条调用路径不带请求头时，才另开变更、用预注册客户端做 OAuth。
-- **网络访问规则**：不绑定 Grok 的 IP 或主机名（IP 不可控，账号迁移会换节点）。tailnet 访问策略按 tag 写 grants：Grok 节点打 `tag:grokbot`，只能访问 Mac 的 443；身份只认 Raindown 自己的 token。
+- **认证方式**：只用固定 Bearer token（即上面的 remote token）。Raindown 完全忽略 Tailscale 注入的身份头（`Tailscale-User-Login` 等）：Grok 节点归属用户本人，这些头显示的是用户本人，本机进程也能伪造它们。不实现 OAuth；只有实测发现某条调用路径不带请求头时，才另开变更、用预注册客户端做 OAuth。
+- **网络访问规则**：不绑定 Grok 的 IP 或主机名（IP 不可控，账号迁移会换节点）。tailnet 访问策略按 tag 写 grants：Grok 节点打 `tag:grokbot`，只能访问 Mac 的 443（前提：1.6/1.7 通过；在此之前未打 tag 的节点能访问用户的全部设备）；身份只认 Raindown 自己的 token。
 - **派活给 Grok**：新增执行器 `grok-routine`。节点用 core 已有的模板渲染派工正文（原始指令、supervisor 补充、恢复提示、待送达输入），经新的节点协议接口交给中枢；**中枢**生成本次派发的 `dispatch_ref`、脱敏、解密 webhook key，以结构化 JSON 信封调用 routine webhook（key 只在中枢内存，webhook 主机固定为 `api2.cursor.sh`）。正文不带任何回调地址，结果只能经远程入口交回。Grok 经远程入口调用 `raindown_report` 上报；中枢先核对授权（任务确实派给了本调用方，否则一律 `forbidden`），再核对 `dispatch_ref` 与任务状态，之后按现有流程入账、由节点经续约消费。无上报超时进入 `blocked(no_progress)` 时仍接受当前派发的迟到结果；节点重启后的重试接管原派发，不重复触发 Grok。
 - **适配器声明**：能力声明新增 `off_machine`（harness 不在节点本机运行）。`grok-routine` 声明 `off_machine: true`、`raindown_mcp: false`（不加载本机任务绑定 MCP）、`credential_isolation` 一律为 `none`（沙箱设置 `off-machine`，没有本机 worker 进程可隔离）。`isolation: required` 的角色不能使用 grok-routine（角色加载按执行器名报错，fail closed）；`preferred` 下不标注"未隔离"，改标"外部执行"。
 - **交付物**：`raindown_report ready` 的交付物在 GitHub PR 之外，新增知识库提案引用（`raindown:proposal/<id>`），中枢核对提案的 `actor` 是上报者、在本次派工期间提交、属于任务的 workspace。调研类任务以提案作为交付物。
