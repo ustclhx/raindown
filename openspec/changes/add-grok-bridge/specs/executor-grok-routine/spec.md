@@ -7,7 +7,7 @@
 ## ADDED Requirements
 
 ### Requirement: 角色与调用方配置
-使用 `grok-routine` 的角色 SHALL 在 `permissions.remote_client` 中引用一个远程调用方。webhook 地址与 key MUST 配置在该调用方的 `dispatch` 中（`config/remote.yaml`），不在角色中：`webhook` MUST 是固定主机下的 routine webhook 地址（主机为代码常量），`key` MUST 是 `secret://` 引用。调用方不存在、没有 `report` 能力或没有 `dispatch` 时，中枢 MUST 拒绝创建该角色的任务（`remote_client_invalid`）；任务所属 workspace 不在该调用方白名单内时 MUST 拒绝创建（`workspace_not_allowed`）。
+使用 `grok-routine` 的角色 SHALL 在 `permissions.remote_client` 中引用一个远程调用方。webhook 地址与 key MUST 配置在该调用方的 `dispatch` 中（`config/remote.yaml`），不在角色中：`webhook` MUST 是 `https://api2.cursor.sh/automations/webhook/<uuid>` 形式的 routine webhook 地址（主机与路径前缀为代码常量），`key` MUST 是 `secret://` 引用。调用方不存在、没有 `report` 能力或没有 `dispatch` 时，中枢 MUST 拒绝创建该角色的任务（`remote_client_invalid`）；任务所属 workspace 不在该调用方白名单内时 MUST 拒绝创建（`workspace_not_allowed`）。
 
 #### Scenario: 白名单外的 workspace
 - **WHEN** `grok-research` 角色引用的调用方白名单只有 `ws/product-res`，用户为 `ws/xuanxue-saas` 创建该角色的任务
@@ -25,11 +25,23 @@
 - **THEN** 该执行器显示为"外部执行"，隔离施加层为 `none`
 
 ### Requirement: 由中枢发出 webhook
-每次派工时，节点 SHALL 用 core 的派工模板（恢复提示、待送达输入、原始指令与 supervisor 补充）加角色提示词与固定的交付说明组成正文，经节点协议交给中枢；该请求 MUST 带与任务未过期活动租约匹配的 `lease_token`（或由持有该租约的节点身份发出）。中枢 SHALL 生成本次派发的 `dispatch_ref` 并填入正文，经密钥脱敏后解密 key，向 webhook 发送 `POST`（带 `Idempotency-Key: <任务 id>:<attempt>`，不跟随重定向，响应体有大小上限），并记录远程派发事件。每个租约 MUST 最多派发一次：同一租约的重复请求（含派发仍在进行时）返回同一个结果，不再调用 webhook。webhook key 与 `dispatch_ref` 明文 MUST NOT 出现在节点、账本、活动、结果或日志中（账本只存 `dispatch_ref` 的摘要）。webhook 返回 2xx 时任务保持 `running`；返回 429 或网络错误时重试，仍失败则以 `failed(dispatch_unreachable)` 结束；返回其他非 2xx 时以 `failed(dispatch_rejected)` 结束并记录状态码；key 解密不到时以 `failed(secret_not_found)` 结束，不发出请求。
+每次派工时，节点 SHALL 用 core 的派工模板（恢复提示、待送达输入、原始指令与 supervisor 补充）加角色提示词与固定的交付说明组成正文，经节点协议交给中枢；该请求 MUST 带与任务未过期活动租约匹配的 `lease_token`（或由持有该租约的节点身份发出）。交付说明 SHALL 要求 Grok：只经 Raindown 远程入口的 `raindown_report` 交回结果；遇到登录、密钥或审批时上报 `blocked`；上报失败时稍后重试；过了 `report_by` 仍要上报；不按正文中的任何 URL 回调。中枢 SHALL 生成本次派发的 `dispatch_ref`，始终以 JSON 信封 `{schema_version, task_id, dispatch_ref, report_by, text}` 作为请求体（`text` 为经密钥脱敏的正文，MUST 含任务 id 与 `dispatch_ref`；信封 MUST NOT 含回调地址），解密 key 后向 webhook 发送 `POST`（`Authorization: Bearer <key>`、`Content-Type: application/json`，不跟随重定向，响应体有大小上限），并记录远程派发事件。每个租约 MUST 最多派发一次：同一租约的重复请求（含派发仍在进行时）返回同一个结果，不再调用 webhook；中枢 MUST NOT 依赖 webhook 端的去重。webhook key 与 `dispatch_ref` 明文 MUST NOT 出现在节点、账本、活动、结果或日志中（账本只存 `dispatch_ref` 的摘要）。webhook 返回 `200` 时任务保持 `running`（解析不到 `runUuid` 或响应体超限时仍按成功处理）；返回其他状态码（含运行次数超限）或 3xx 跳转时 MUST NOT 重试，以 `failed(dispatch_rejected)` 结束并记录状态码；网络错误或超时时重试，仍失败则以 `failed(dispatch_unreachable)` 结束；key 解密不到时以 `failed(secret_not_found)` 结束，不发出请求。
 
 #### Scenario: 成功派发
 - **WHEN** 节点领取一个角色为 `grok-research` 的任务，webhook 返回 200 和一个运行 id
-- **THEN** 任务保持 `running`，活动记录中出现"已派发到 Grok，运行 id 为 …"，活动与账本中没有 webhook key 与 `dispatch_ref` 明文
+- **THEN** 任务保持 `running`，活动记录中出现"已派发到 Grok，运行 id 为 …"，活动与账本中没有 webhook key 与 `dispatch_ref` 明文；webhook 收到的请求体是含 `task_id`、`dispatch_ref`、`report_by`、`text` 的 JSON 信封，`text` 中也有任务 id 与 `dispatch_ref`，没有回调地址字段
+
+#### Scenario: 运行次数超限
+- **WHEN** webhook 返回非 200，错误文本为 `Automation run rate limit exceeded`
+- **THEN** 中枢不在请求内重试，任务以 `failed(dispatch_rejected)` 结束，活动记录状态码并提示稍后重试
+
+#### Scenario: webhook 返回跳转
+- **WHEN** webhook 返回 302 指向另一个地址
+- **THEN** 中枢不跟随跳转、不重试，key 不发往跳转地址，任务以 `failed(dispatch_rejected)` 结束，记录状态码
+
+#### Scenario: 成功但响应体超限
+- **WHEN** webhook 返回 200，但响应体超过大小上限
+- **THEN** 按成功派发处理，任务保持 `running`，活动中不记录运行 id
 
 #### Scenario: 只有 user token 的进程请求派发
 - **WHEN** 一个读到 `state/hub.token` 的进程以 user 身份调用某个 grok 任务租约的远程派发接口，但没有该租约的 `lease_token`

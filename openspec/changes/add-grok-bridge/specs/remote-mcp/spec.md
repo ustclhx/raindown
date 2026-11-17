@@ -7,7 +7,7 @@
 ## ADDED Requirements
 
 ### Requirement: 独立的远程监听端口
-中枢 SHALL 在一个独立的本机回环端口（默认 `127.0.0.1:7478`，可在 `config/hub.yaml` 中配置或关闭）上提供远程 MCP 入口，使用 MCP streamable HTTP 传输，路径为 `/mcp`。该端口 MUST NOT 提供中枢的 `/v1` API、`/ui` 页面或事件流。`config/remote.yaml` 中没有任何有效的远程调用方时，该端口 MUST NOT 监听；调用方增删后，中枢 SHALL 在不重启的情况下开始或停止监听。带 `Tailscale-Funnel-Request` 请求头的请求 MUST 被拒绝（403 `funnel_denied`），`Host` 不在允许列表内的请求 MUST 被拒绝（421），二者都在鉴权之前判定。
+中枢 SHALL 在一个独立的本机回环端口（默认 `127.0.0.1:7478`，可在 `config/hub.yaml` 中配置或关闭）上提供远程 MCP 入口，使用 MCP streamable HTTP 传输，路径为 `/mcp`。该端口 MUST NOT 提供中枢的 `/v1` API、`/ui` 页面或事件流。`config/remote.yaml` 中没有任何有效的远程调用方时，该端口 MUST NOT 监听；调用方增删后，中枢 SHALL 在不重启的情况下开始或停止监听。带 `Tailscale-Funnel-Request` 请求头的请求 MUST 被拒绝（403 `funnel_denied`），`Host` 不在允许列表（`remote.allowed_hosts`，即 Mac 的 tailnet 主机名，以及 `127.0.0.1:<端口>`）内的请求 MUST 被拒绝（421），二者都在鉴权之前判定。
 
 #### Scenario: 远程端口不暴露中枢 API
 - **WHEN** 向 `127.0.0.1:7478/v1/tasks` 发送带合法远程凭证的请求
@@ -26,14 +26,14 @@
 - **THEN** 返回 403 `funnel_denied`，不执行任何工具
 
 ### Requirement: 远程调用方配置
-每个远程调用方 SHALL 在 `config/remote.yaml` 中定义：`id`（其操作者身份为 `remote:<id>`）、`workspaces`（可访问的 workspace 白名单，默认空，最多 8 个）、`include_global`（默认 false）、`capabilities`（`read`、`propose`、`report` 的子集）、`rate_limit_per_minute`（默认 60）、接派工所需的 `dispatch`（见 executor-grok-routine），以及 OAuth 分支下的 `oauth.redirect_hosts`（允许的回调主机）。配置不合法时 MUST 报告文件和字段，并只停用出错的调用方。修改后 MUST 在不重启中枢的情况下生效。
+每个远程调用方 SHALL 在 `config/remote.yaml` 中定义：`id`（其操作者身份为 `remote:<id>`）、`workspaces`（可访问的 workspace 白名单，默认空，最多 8 个）、`include_global`（默认 false）、`capabilities`（`read`、`propose`、`report` 的子集）、`rate_limit_per_minute`（默认 60），以及接派工所需的 `dispatch`（见 executor-grok-routine）。配置不合法时 MUST 报告文件和字段，并只停用出错的调用方。修改后 MUST 在不重启中枢的情况下生效。
 
 #### Scenario: 单个调用方配置错误
 - **WHEN** `remote.yaml` 中有两个调用方，其中一个的 `capabilities` 含未知值 `admin`
 - **THEN** 出错的调用方不被加载，`raindown doctor` 报告文件与字段，另一个调用方照常可用
 
 ### Requirement: 远程认证
-远程 MCP 入口的每个请求 MUST 携带有效凭证，凭证 SHALL 是 actor 为 `remote:<id>`、带 `remote` 标注且未撤销的绑定 token（或在 OAuth 分支下经用户本机确认后签发的、同样绑定 `remote:<id>` 的访问令牌），且 `<id>` 是已加载的远程调用方。请求的操作者身份由凭证决定，请求自报的身份一律忽略。其他凭证（user token、`node:*` token、派工令牌、唤醒令牌）以及缺失、无效或已撤销的凭证 MUST 返回 401。
+远程 MCP 入口的每个请求 MUST 携带有效凭证，凭证 SHALL 是 actor 为 `remote:<id>`、带 `remote` 标注且未撤销的绑定 token，以 `Authorization: Bearer` 携带，且 `<id>` 是已加载的远程调用方；远程入口不提供 OAuth 端点。请求的操作者身份由凭证决定，请求自报的身份一律忽略；`Tailscale-User-*` 身份头（`Tailscale-User-Login`、`Tailscale-User-Name` 等）MUST 被完全忽略：不用于认证、授权或决定操作者身份，也不写入审计或日志（本机进程直接请求回环端口即可伪造它们）。其他凭证（user token、`node:*` token、派工令牌、唤醒令牌）以及缺失、无效或已撤销的凭证 MUST 返回 401。
 
 #### Scenario: 用 user token 访问远程入口
 - **WHEN** 用 `state/hub.token` 的值作为 Bearer token 请求远程入口
@@ -43,13 +43,17 @@
 - **WHEN** 用户从 `remote.yaml` 中删除 `grok`（另有其他调用方，端口仍在监听），之后 Grok 继续用原来的 token 请求远程入口
 - **THEN** 返回 401，不执行任何工具
 
-#### Scenario: OAuth 授权需要用户本人确认
-- **WHEN** 远程调用方发起 OAuth 授权
-- **THEN** 只有在用户本人于本机 `/ui` 页面上确认（页面显示调用方、授权范围与回调主机）后才签发令牌，令牌绑定的身份为 `remote:<id>`，并出现在 `raindown hub token list` 中、可以撤销
+#### Scenario: 只有 Tailscale 身份头
+- **WHEN** 一个请求经 `tailscale serve` 到达远程入口，带有显示用户本人的 `Tailscale-User-Login`，但没有 Bearer token 或 token 无效
+- **THEN** 返回 401，不执行任何工具
 
-#### Scenario: OAuth 回调地址不在白名单
-- **WHEN** 动态客户端注册请求的 redirect_uri 主机不在该调用方的 `oauth.redirect_hosts` 中
-- **THEN** 注册被拒绝，不签发任何凭证
+#### Scenario: 身份头与 token 不一致
+- **WHEN** 用 `remote:grok` 的 token 请求远程入口，同时带有显示用户本人的 `Tailscale-User-Login`
+- **THEN** 该调用的 `remote.call` 事件的 actor 为 `remote:grok`，事件中没有身份头的内容；在同一请求条件下调用 `task_reply` 仍返回 `forbidden`
+
+#### Scenario: 本机进程伪造身份头
+- **WHEN** 本机进程直接请求 `127.0.0.1:7478/mcp`，自行加上 `Tailscale-User-Login`（用户本人）与 tailnet 主机名的 `Host`，并带 `remote:grok` 的 token 或不带 token
+- **THEN** 结果与不带该身份头时完全相同：带 token 时操作者为 `remote:grok`、权限不变，不带 token 时返回 401
 
 ### Requirement: 按调用方裁剪工具
 远程会话的工具列表 SHALL 只包含其 `capabilities` 允许的操作：`read` 对应 `kb_search`、`kb_get`、`kb_query`、`ws_list`；`propose` 对应 `kb_propose`；`report` 对应 `raindown_report` 与 `task_show`（只限派给该调用方的任务，见 executor-grok-routine）。其余操作——包括 workspace 简报、随手记、写 journal、建任务、列出任务、取消或重试任务、回复任务、代答、处理收件箱、接受或驳回提案、转移资源、读取事件与读取密钥——MUST NOT 对远程调用方开放：工具列表中不出现，直接调用返回 `forbidden`。新增的操作在显式加入映射之前 MUST NOT 对远程调用方开放。远程工具的输入 MUST NOT 含读取本地路径的参数。
@@ -134,7 +138,7 @@
 - **THEN** 账本没有新增事件，日志中只有有限条数的记录
 
 ### Requirement: 发布方式检查
-`raindown doctor` SHALL 在启用远程入口时检查 Tailscale 的发布配置：远程端口 MUST 只经 `tailscale serve` 发布到 tailnet 内，MUST NOT 开启 Funnel，中枢的 `/v1` 端口 MUST NOT 被发布。检测到违规时报错并给出修正命令；找不到 `tailscale` 命令时只给出警告。
+`raindown doctor` SHALL 在启用远程入口时检查 Tailscale 的发布配置：远程端口 MUST 只经 `tailscale serve` 发布到 tailnet 内，MUST NOT 开启 Funnel，中枢的 `/v1` 端口 MUST NOT 被发布。检测到违规时报错并给出修正命令；找不到 `tailscale` 命令时只给出警告。doctor MUST NOT 读取用户的 Tailscale API 凭据，tailnet 访问策略只以文字提示给出（内容见 design D11）。
 
 #### Scenario: 误开了 Funnel
 - **WHEN** 用户对远程端口执行了 `tailscale funnel`
