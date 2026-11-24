@@ -314,6 +314,51 @@ describe('raindown doctor', () => {
     ).toBe(true)
   })
 
+  test('节点 plist 的 PATH 中缺少执行器依赖的 gh 时报错，按 plist 而不是当前 shell 的 PATH 查找', async () => {
+    const home = tempHome('raindown-doctor-node-path-')
+    await initRaindownHome(home)
+    const directory = join(home, 'LaunchAgents')
+    mkdirSync(directory)
+    const bin = join(home, 'bin & <tools>')
+    mkdirSync(bin)
+    const touchExecutable = (name: string) => {
+      writeFileSync(join(bin, name), '#!/bin/sh\n')
+      chmodSync(join(bin, name), 0o755)
+    }
+    touchExecutable('git')
+    writeFileSync(join(home, 'main.ts'), '')
+    writeFileSync(
+      join(directory, 'dev.raindown.node.plist'),
+      generatePlist({
+        label: 'dev.raindown.node',
+        bunPath: process.execPath,
+        cliPath: join(home, 'main.ts'),
+        command: ['node', 'start'],
+        home,
+        logPath: join(home, 'node.log'),
+        path: bin,
+      }),
+    )
+    const pathChecks = async () =>
+      reportOf(await runDoctor(home, 'RAINDOWN_HOME')).checks.filter((c) =>
+        c.id.startsWith('daemon.dev.raindown.node.path.'),
+      )
+
+    const before = await pathChecks()
+    expect(before.find((c) => c.id.endsWith('.git'))?.ok).toBe(true)
+    const gh = before.find((c) => c.id === 'daemon.dev.raindown.node.path.gh')
+    expect(gh).toMatchObject({ ok: false, severity: 'error' })
+    expect(gh?.message).toContain('merger')
+    expect(gh?.hint).toContain('raindown daemon install')
+
+    touchExecutable('gh')
+    const after = await pathChecks()
+    expect(after.find((c) => c.id === 'daemon.dev.raindown.node.path.gh')).toMatchObject({
+      ok: true,
+      message: expect.stringContaining(join(bin, 'gh')),
+    })
+  })
+
   test('损坏的 plist 不会静默跳过，未安装的服务不要求安装', async () => {
     const home = tempHome('raindown-doctor-')
     mkdirSync(join(home, 'LaunchAgents'), { recursive: true })

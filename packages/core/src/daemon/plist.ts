@@ -72,17 +72,30 @@ export function parsePlistPaths(xml: string): { bunPath: string; cliPath: string
   const array = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(xml)?.[1]
   if (!array || array.replace(/<string>[^<]*<\/string>/g, '').trim()) return null
   const args = [...array.matchAll(/<string>([^<]*)<\/string>/g)].map((match) =>
-    (match[1] ?? '').replace(/&(#x[\da-f]+|#\d+|amp|lt|gt|quot|apos);/gi, (entity, key: string) => {
-      if (key.startsWith('#')) {
-        const code =
-          key[1]?.toLowerCase() === 'x' ? Number.parseInt(key.slice(2), 16) : Number(key.slice(1))
-        return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : entity
-      }
-      return { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }[key] ?? entity
-    }),
+    decodeXmlText(match[1] ?? ''),
   )
   const parsed = executablePaths.safeParse(args)
   return parsed.success ? { bunPath: parsed.data[0], cliPath: parsed.data[1] } : null
+}
+
+const decodeXmlText = (text: string): string =>
+  text.replace(/&(#x[\da-f]+|#\d+|amp|lt|gt|quot|apos);/gi, (entity, key: string) => {
+    if (key.startsWith('#')) {
+      const code =
+        key[1]?.toLowerCase() === 'x' ? Number.parseInt(key.slice(2), 16) : Number(key.slice(1))
+      return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : entity
+    }
+    return { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }[key] ?? entity
+  })
+
+/**
+ * 提取 plist `EnvironmentVariables` 中的 PATH：launchd 服务（以及它 spawn 的执行器）只能在这个 PATH 里找外部命令，
+ * 它取自 `raindown daemon install` 时的环境，与运行 doctor 的 shell 可能不同。没有该项或无法解析时返回 null。
+ */
+export function parsePlistEnvPath(xml: string): string | null {
+  const vars = /<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/.exec(xml)?.[1]
+  const value = vars ? /<key>PATH<\/key>\s*<string>([^<]*)<\/string>/.exec(vars)?.[1] : undefined
+  return value ? decodeXmlText(value) : null
 }
 
 export interface PlistCheck {
@@ -93,6 +106,8 @@ export interface PlistCheck {
   cliPath: string | null
   bunExists: boolean
   cliExists: boolean
+  /** plist 中服务的 PATH；未安装、无法解析或没有设置时为 null。 */
+  envPath: string | null
   error?: string
 }
 
@@ -119,14 +134,17 @@ export function checkDaemonPlists(
       cliPath: null,
       bunExists: false,
       cliExists: false,
+      envPath: null,
     }
     if (!check.installed) return check
     try {
-      const paths = parsePlistPaths(readFileSync(plistPath, 'utf8'))
+      const xml = readFileSync(plistPath, 'utf8')
+      const paths = parsePlistPaths(xml)
       if (!paths) return { ...check, error: '无法解析 plist 的绝对路径参数' }
       return {
         ...check,
         ...paths,
+        envPath: parsePlistEnvPath(xml),
         bunExists: isFile(paths.bunPath),
         cliExists: isFile(paths.cliPath),
       }

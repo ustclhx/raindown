@@ -188,6 +188,52 @@ async function checkTool(
   return { bin, check: { id, ok: true, message: `${name} ${version}（${bin}）${suffix}` } }
 }
 
+const NODE_DAEMON_LABEL = 'dev.raindown.node'
+
+/**
+ * 节点服务 spawn 执行器时用的外部命令，以及依赖它的执行器。
+ * gh：codex-orca 结束时确认 PR、pr-merge 合并与流水线确认、claude-sdk 审查前准备。
+ */
+const NODE_SERVICE_TOOLS: readonly { name: string; executors: readonly string[] | 'all' }[] = [
+  { name: 'git', executors: 'all' },
+  { name: 'gh', executors: ['codex-orca', 'pr-merge', 'claude-sdk'] },
+  { name: 'codex', executors: ['codex-orca', 'codex-exec'] },
+  { name: 'orca', executors: ['codex-orca'] },
+]
+
+/**
+ * 按节点 plist 中的 PATH 检查执行器依赖的外部命令（而不是运行 doctor 的 shell 的 PATH）：
+ * plist 的 PATH 取自安装时的环境，缺少 gh 时 codex-orca 无法确认已开出的 PR，任务被误判为 crashed。
+ */
+function nodeServicePathChecks(
+  envPath: string,
+  roles: Role[],
+  find: typeof findExecutable,
+): DoctorCheck[] {
+  const checks: DoctorCheck[] = []
+  for (const tool of NODE_SERVICE_TOOLS) {
+    const usedBy = roles
+      .filter((r) => tool.executors === 'all' || tool.executors.includes(r.executor))
+      .map((r) => r.name)
+    if (usedBy.length === 0) continue
+    const bin = find(tool.name, { PATH: envPath })
+    const id = `daemon.${NODE_DAEMON_LABEL}.path.${tool.name}`
+    const roleList = `角色：${usedBy.join('、')}`
+    checks.push(
+      bin
+        ? { id, ok: true, message: `节点服务的 PATH 中有 ${tool.name}（${bin}）` }
+        : {
+            id,
+            ok: false,
+            severity: 'error',
+            message: `节点服务的 PATH 中找不到 ${tool.name}（${roleList}）`,
+            hint: `plist 的 PATH 取自安装时的环境：在能找到 ${tool.name} 的 shell 中重新运行 raindown daemon install`,
+          },
+    )
+  }
+  return checks
+}
+
 const orcaTerminals = z.object({
   ok: z.literal(true),
   result: z.object({ terminals: z.array(z.object({})) }),
@@ -515,6 +561,9 @@ export async function runDoctor(
         `${plist.label}：bun ${plist.bunExists ? '有效' : '失效'}（${plist.bunPath}），入口 ${plist.cliExists ? '有效' : '失效'}（${plist.cliPath}）`,
       hint: '重新运行 raindown daemon install 更新 plist 中的路径',
     })
+    if (plist.label === NODE_DAEMON_LABEL && !plist.error && plist.envPath !== null) {
+      checks.push(...nodeServicePathChecks(plist.envPath, roles.ok ? roles.data.roles : [], find))
+    }
   }
 
   for (const plist of checkDaemonPlists(
