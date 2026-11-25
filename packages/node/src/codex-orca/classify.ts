@@ -511,21 +511,27 @@ export function classifyCodexOrca(snapshot: StuckSnapshot): StuckVerdict | null 
 }
 
 /**
- * 终端是否停在 Codex 的普通输入框上：最后的非空行必须是输入框（以 `›` 开头）及其下方最多两行状态行，
- * 且最后一行不是 shell 提示符。只在整段末尾里找到过输入框不算（滚动历史中残留的输入框，Codex 已退出时）。
+ * 终端是否停在 Codex 的普通输入框上：最后的非空行必须是输入框（以 `›` 开头）及其下方的状态行，
+ * 且最后一行不是 shell 提示符。输入框下方通常最多两行；终端标题较长时 Codex 页脚会折行，
+ * 此时允许最多四行，但末行必须是 Codex 页脚（快捷键提示等），避免把输入框之后的任意输出也算进来。只在整段末尾里找到过输入框不算（滚动历史中残留的输入框，Codex 已退出时）。
  * 任何会敲进文字的送达（PR 输入、恢复提示、文字回复）都先过这一关，避免把文字敲进 shell。
  */
 const BARE_PROMPT_RE = /[$%#❯]\s*$/
 /** Codex 输入框下方的状态与页脚行（快捷键提示、发送提示、上下文余量等）。 */
 const CODEX_STATUS_RE = /\? for shortcuts|⏎|context left|tab to |esc to |ctrl\+|·/
+/** 输入框下方状态区的最大行数（页脚因终端标题过长折行时可达四行）。 */
+const MAX_FOOTER_LINES = 4
 
 export function composerReady(tail: readonly string[]): boolean {
   const lines = tail.map((l) => l.trimEnd()).filter((l) => l.trim() !== '')
   const last = lines.at(-1)
   if (last === undefined || SHELL_PROMPT_RE.test(last.trim())) return false
-  const tailLines = lines.slice(-3)
+  const tailLines = lines.slice(-(MAX_FOOTER_LINES + 1))
   const at = tailLines.findLastIndex((l) => /^›(?:\s|$)/.test(l.trim()))
   if (at < 0) return false
+  const below = tailLines.length - at - 1
+  // 超过两行时只接受以 Codex 页脚收尾的折行状态区。
+  if (below > 2 && !CODEX_STATUS_RE.test(last)) return false
   // 输入框之后的行：shell 提示符，或不是 Codex 状态行、只剩裸提示符（`$`、`%`、`#`、`❯` 结尾）的行都不行。
   // 输入框本身与状态行不做裸提示符判断（例如输入了"fix #"，或状态行以百分比结尾）。
   return tailLines
