@@ -760,4 +760,23 @@ describe('composerReady：只有最后几行是 Codex 输入框才能敲入文�
     expect(composerReady(['› fix #'])).toBe(true)
     expect(composerReady(['› Ask Codex', '$ '])).toBe(false)
   })
+  test('终端标题过长、Codex 页脚折成三行时仍可敲入（2026-11-25 实测）', () => {
+    const wrappedFooter = [
+      '  Worked for 1m 6s • 22:14',
+      '› Ask Codex to do anything',
+      '  GPT-6.1-Sol high · ~/raindown-home/run/tasks/t-20261124-141125-dcc9b6/repo · Raindown 任务 t-20261124-141125-dcc9b6',
+      '  workspace：ws/product-r…',
+      '  ← for agents · ? for shortcuts                                         ⚠ 1 warning · f2 to view',
+    ]
+    expect(composerReady(wrappedFooter)).toBe(true)
+    // 多于两行时末行必须是 Codex 页脚；输入框之后跟任意输出仍不算。
+    expect(composerReady(['› Ask Codex', '  a · b', '  c', '  d'])).toBe(false)
+    expect(composerReady(['› Ask Codex', '  a', '  b', '  c', '  ? for shortcuts', '  e'])).toBe(
+      false,
+    )
+    // 输入框离末尾超过四行：不算。
+    expect(composerReady(['› Ask Codex', 'a', 'b', 'c', 'd', '  ? for shortcuts'])).toBe(false)
+    // 折行页脚之后出现 shell 提示符：Codex 已退出。
+    expect(composerReady([...wrappedFooter, 'user@host repo %'])).toBe(false)
+  })
 })
